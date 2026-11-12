@@ -1,0 +1,13 @@
+# 二进制
+/relay-server
+/relay-client
+*.exe
+
+# 本地测试产物
+*.pem
+*.key
+*.tgz
+
+# 日志与统计（运行时落在 ~/.rfc9842-reply，不在此）
+*.jsonl
+*-stats.json
