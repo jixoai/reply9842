@@ -1,6 +1,6 @@
 module github.com/jixoai/rfc9842-reply
 
-go 1.26.0
+go 1.27
 
 require (
 	github.com/klauspost/compress v1.20.4

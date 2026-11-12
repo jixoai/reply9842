@@ -2,14 +2,15 @@
 //
 // 正交意图（3 个，2026-11-12 kzf 需求：「QUIC 和 TCP+TLS 两路同时做，但我记得
 // QUIC 是可以优雅回退成 TCP 传输层才对啊」）：
-//   1. 统一 Conn 抽象：QUIC stream 与 TCP 连接在帧层面等价
-//   2. auto 模式：客户端先试 QUIC（1s 超时），失败降级 TCP+TLS，并记住结果
-//   3. 自签/系统根证书双模式（观察期用自签，正式环境用真证书）
+//  1. 统一 Conn 抽象：QUIC stream 与 TCP 连接在帧层面等价
+//  2. auto 模式：客户端先试 QUIC（1s 超时），失败降级 TCP+TLS，并记住结果
+//  3. 自签/系统根证书双模式（观察期用自签，正式环境用真证书）
 //
 // 关于「QUIC 优雅回退」的事实澄清：
-//   HTTP/3 的回退是「HTTP 协议族」的能力（浏览器用 Alt-Svc 探测，失败退回
-//   HTTP/2 over TCP），**不是 QUIC 传输层自带**。quic-go 连不上就是连不上。
-//   因此回退逻辑必须在本层实现——即下面的 DialAuto。
+//
+//	HTTP/3 的回退是「HTTP 协议族」的能力（浏览器用 Alt-Svc 探测，失败退回
+//	HTTP/2 over TCP），**不是 QUIC 传输层自带**。quic-go 连不上就是连不上。
+//	因此回退逻辑必须在本层实现——即下面的 DialAuto。
 package transport
 
 import (
@@ -17,6 +18,7 @@ import (
 	"crypto/tls"
 	"errors"
 	"fmt"
+	"io"
 	"net"
 	"sync/atomic"
 	"time"
@@ -38,22 +40,22 @@ const ALPN = "rfc9842-reply/1"
 
 // Dialer 客户端连接工厂
 type Dialer struct {
-	Addr      string // host:port
-	ServerName string // TLS SNI；留空则从 Addr 推导
-	Insecure  bool   // 跳过证书校验（自签观察期）
-	Mode      Kind   // auto / quic / tcp
-	QuicProbe time.Duration // auto 模式下 QUIC 探测超时，默认 1s
+	Addr       string        // host:port
+	ServerName string        // TLS SNI；留空则从 Addr 推导
+	Insecure   bool          // 跳过证书校验（自签观察期）
+	Mode       Kind          // auto / quic / tcp
+	QuicProbe  time.Duration // auto 模式下 QUIC 探测超时，默认 1s
 
 	// auto 模式的粘性记忆：一旦某模式成功，后续优先该模式
-	prefer atomic.Value // Kind
+	prefer   atomic.Value // Kind
 	lastKind atomic.Value // Kind
 }
 
 // Conn 统一连接抽象
 type Conn struct {
-	kind   Kind
-	send   func([]byte) error
-	recv   func() ([]byte, error)
+	kind    Kind
+	send    func([]byte) error
+	recv    func() ([]byte, error)
 	closeFn func() error
 }
 
@@ -149,6 +151,11 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 		InsecureSkipVerify: d.Insecure,
 		MinVersion:         tls.VersionTLS13,
 	}
+	// quic-go v0.65 的 *quic.Conn 内部 ctx 派生自 DialAddr 的入参 ctx
+	// （connection.go: context.WithCancelCause(context.WithoutCancel(ctx))
+	// → 实际用 WithoutCancel 脱钩，但 OpenStreamSync/AcceptStream 等仍吃传进去的 ctx）。
+	// 这里 dial 用调用方 ctx（auto 模式的 1s 探测超时），但 stream 操作必须
+	// 用连接自身生命周期 ctx，否则探测超时一到就把已建立的连接判死。
 	qc, err := quic.DialAddr(ctx, d.Addr, tlsCfg, &quic.Config{
 		HandshakeIdleTimeout: 5 * time.Second,
 		MaxIdleTimeout:       120 * time.Second,
@@ -157,14 +164,18 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("quic dial: %w", err)
 	}
-	st, err := qc.OpenStreamSync(ctx)
+	// 建连成功后必须脱钩 dial ctx：auto 模式的 ctx 只带 1s 探测超时，
+	// 拿它去做后续 stream 操作会把已建立的连接误判为超时。qc.Context()
+	// 是连接自身的生命周期 ctx（quic-go 内部用 context.WithoutCancel
+	// 派生，仅在连接关闭时 cancel），既不受探测超时影响，也不会永久悬挂。
+	st, err := qc.OpenStreamSync(qc.Context())
 	if err != nil {
 		qc.CloseWithError(1, "open stream")
 		return nil, fmt.Errorf("quic stream: %w", err)
 	}
 	return &Conn{
 		kind: KindQUIC,
-		send: func(b []byte) error { _, err := st.Write(b); return err },
+		send: func(b []byte) error { return writeAll(st, b) },
 		recv: func() ([]byte, error) { return readFrame(st) },
 		closeFn: func() error {
 			st.Close()
@@ -191,9 +202,9 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 		return nil, fmt.Errorf("tcp tls: %w", err)
 	}
 	return &Conn{
-		kind: KindTCP,
-		send: func(b []byte) error { _, err := tc.Write(b); return err },
-		recv: func() ([]byte, error) { return readFrame(tc) },
+		kind:    KindTCP,
+		send:    func(b []byte) error { return writeAll(tc, b) },
+		recv:    func() ([]byte, error) { return readFrame(tc) },
 		closeFn: tc.Close,
 	}, nil
 }
@@ -258,21 +269,31 @@ func (s *Server) Listen(ctx context.Context) (<-chan Accept, error) {
 			if err != nil {
 				return
 			}
-			// 一条 QUIC 连接可承载多个 stream；每个 stream 处理一次请求
+			// 一条 QUIC 连接可承载多个 stream；每个 stream 处理一次请求。
+			// 每条连接用自己的生命周期 ctx：AcceptStream 不能被 listener ctx
+			// 提前掐断，也不该让某条连接的退出影响其它连接。
 			go func(qc *quic.Conn) {
+				connCtx, connCancel := context.WithCancel(ctx)
+				defer connCancel()
+				// 连接被对端关闭时，AcceptStream 会返回错误而退出循环
 				defer qc.CloseWithError(0, "done")
 				for {
-					st, err := qc.AcceptStream(ctx)
+					st, err := qc.AcceptStream(connCtx)
 					if err != nil {
 						return
 					}
 					go func(st *quic.Stream) {
-						out <- Accept{Kind: KindQUIC, Conn: &Conn{
-							kind: KindQUIC,
-							send: func(b []byte) error { _, err := st.Write(b); return err },
-							recv: func() ([]byte, error) { return readFrame(st) },
+						c := &Conn{
+							kind:    KindQUIC,
+							send:    func(b []byte) error { return writeAll(st, b) },
+							recv:    func() ([]byte, error) { return readFrame(st) },
 							closeFn: func() error { st.Close(); return nil },
-						}}
+						}
+						select {
+						case out <- Accept{Kind: KindQUIC, Conn: c}:
+						case <-connCtx.Done():
+							st.Close()
+						}
 					}(st)
 				}
 			}(qc)
@@ -292,12 +313,18 @@ func (s *Server) Listen(ctx context.Context) (<-chan Accept, error) {
 				return
 			}
 			go func(c net.Conn) {
-				out <- Accept{Kind: KindTCP, Conn: &Conn{
-					kind: KindTCP,
-					send: func(b []byte) error { _, err := c.Write(b); return err },
-					recv: func() ([]byte, error) { return readFrame(c) },
+				// 与 QUIC 侧对称：用 send/recv 闭包封装，避免半包写入
+				cc := &Conn{
+					kind:    KindTCP,
+					send:    func(b []byte) error { return writeAll(c, b) },
+					recv:    func() ([]byte, error) { return readFrame(c) },
 					closeFn: c.Close,
-				}}
+				}
+				select {
+				case out <- Accept{Kind: KindTCP, Conn: cc}:
+				case <-ctx.Done():
+					c.Close()
+				}
 			}(tc)
 		}
 	}()
@@ -312,9 +339,16 @@ func (s *Server) Listen(ctx context.Context) (<-chan Accept, error) {
 }
 
 // readFrame 读一个长度前缀帧（4 字节大端长度 + payload）
-func readFrame(r interface{ Read([]byte) (int, error) }) ([]byte, error) {
+//
+// 必须用 io.ReadFull，不能手写「循环 Read，遇 err 立即返回」的等价物：
+// io.Reader 允许**同时**返回数据和 io.EOF，QUIC 的 ReceiveStream 在对端
+// 写完数据即 FIN 时的最后一帧正是 (n>0, io.EOF)。手写循环遇到 err != nil
+// 立刻返回，会把这一次刚读到的 n 字节整段丢掉——这正是 QUIC 回环「服务端
+// 明明 write 成功、客户端却读到 EOF」的根因。io.ReadFull 在恰好读满目标
+// 长度时忽略 EOF，语义才是「读满或失败」。
+func readFrame(r io.Reader) ([]byte, error) {
 	var lb [4]byte
-	if _, err := readFull(r, lb[:]); err != nil {
+	if _, err := io.ReadFull(r, lb[:]); err != nil {
 		return nil, err
 	}
 	n := uint32(lb[0])<<24 | uint32(lb[1])<<16 | uint32(lb[2])<<8 | uint32(lb[3])
@@ -322,31 +356,36 @@ func readFrame(r interface{ Read([]byte) (int, error) }) ([]byte, error) {
 		return nil, fmt.Errorf("transport: frame too large: %d", n)
 	}
 	buf := make([]byte, n)
-	if _, err := readFull(r, buf); err != nil {
+	if _, err := io.ReadFull(r, buf); err != nil {
 		return nil, err
 	}
 	return buf, nil
 }
 
-func readFull(r interface{ Read([]byte) (int, error) }, b []byte) (int, error) {
-	got := 0
-	for got < len(b) {
-		n, err := r.Read(b[got:])
-		got += n
+// writeAll 完整写入 b：io.Writer 允许返回 (n < len(b), nil)，只看 err 会把
+// 半包当成功。QUIC stream 在设置写 deadline 时就会走这条路径。
+func writeAll(w io.Writer, b []byte) error {
+	for len(b) > 0 {
+		n, err := w.Write(b)
+		b = b[n:]
 		if err != nil {
-			return got, err
+			return err
+		}
+		if n == 0 {
+			return io.ErrShortWrite
 		}
 	}
-	return got, nil
+	return nil
 }
 
 // WriteFrame 写长度前缀帧（meta.WriteFrame 之外的传输层封装）
+//
+// 头与 payload 合成一次写入：分两次 Write 在对端看来可能落在不同 QUIC
+// STREAM 帧里，虽然流内有序不影响正确性，但多一次 syscall/帧开销。
 func WriteFrame(c *Conn, payload []byte) error {
-	var lb [4]byte
 	n := len(payload)
-	lb[0], lb[1], lb[2], lb[3] = byte(n>>24), byte(n>>16), byte(n>>8), byte(n)
-	if err := c.Send(lb[:]); err != nil {
-		return err
-	}
-	return c.Send(payload)
+	buf := make([]byte, 4+n)
+	buf[0], buf[1], buf[2], buf[3] = byte(n>>24), byte(n>>16), byte(n>>8), byte(n)
+	copy(buf[4:], payload)
+	return c.Send(buf)
 }

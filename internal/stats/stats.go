@@ -2,8 +2,8 @@
 //
 // 正交意图（2 个，2026-11-12 kzf 需求：「你要做好统计，比如数据包压缩前后的
 // 体积，传输速度等等，请求的时间等等」）：
-//   1. 逐请求记录（jsonl 追加），字段够细可回溯
-//   2. 汇总快照（json 覆盖写），供 watch 实时看
+//  1. 逐请求记录（jsonl 追加），字段够细可回溯
+//  2. 汇总快照（json 覆盖写），供 watch 实时看
 package stats
 
 import (
@@ -23,13 +23,13 @@ type Record struct {
 	Status    int     `json:"status"`
 	Encoding  string  `json:"enc"`
 	BaseHit   bool    `json:"base_hit"`
-	UpRaw     int64   `json:"up_raw"`      // 明文请求体
-	UpWire    int64   `json:"up_wire"`     // 隧道上实际传输（编码后）
+	UpRaw     int64   `json:"up_raw"`  // 明文请求体
+	UpWire    int64   `json:"up_wire"` // 隧道上实际传输（编码后）
 	DownRaw   int64   `json:"down_raw"`
 	DownWire  int64   `json:"down_wire"`
 	MsTotal   int64   `json:"ms_total"`
 	MsEncode  int64   `json:"ms_encode"`
-	MsWire    int64   `json:"ms_wire"`     // 隧道往返
+	MsWire    int64   `json:"ms_wire"` // 隧道往返
 	MsDecode  int64   `json:"ms_decode"`
 	MsUpstrm  int64   `json:"ms_upstream"` // 上游 TTFB
 	UpBps     float64 `json:"up_bps"`
@@ -40,35 +40,35 @@ type Record struct {
 
 // Agg 汇总视图
 type Agg struct {
-	StartedAt  string       `json:"started_at"`
-	UpdatedAt  string       `json:"updated_at"`
-	Requests   int64        `json:"requests"`
-	Errors     int64        `json:"errors"`
-	BaseHits   int64        `json:"base_hits"`
-	UpRaw      int64        `json:"up_raw"`
-	UpWire     int64        `json:"up_wire"`
-	DownRaw    int64        `json:"down_raw"`
-	DownWire   int64        `json:"down_wire"`
-	UpRatio    float64      `json:"up_ratio"` // wire/raw
-	P50Ms      int64        `json:"p50_ms"`
-	P90Ms      int64        `json:"p90_ms"`
-	P50Wire    int64        `json:"p50_wire_ms"`
-	P90Wire    int64        `json:"p90_wire_ms"`
-	P50TTFB    int64        `json:"p50_ttfb_ms"`
-	P90TTFB    int64        `json:"p90_ttfb_ms"`
-	AvgUpBps   float64      `json:"avg_up_bps"`
-	AvgDownBps float64      `json:"avg_down_bps"`
-	Statuses   map[int]int64 `json:"statuses"`
+	StartedAt  string           `json:"started_at"`
+	UpdatedAt  string           `json:"updated_at"`
+	Requests   int64            `json:"requests"`
+	Errors     int64            `json:"errors"`
+	BaseHits   int64            `json:"base_hits"`
+	UpRaw      int64            `json:"up_raw"`
+	UpWire     int64            `json:"up_wire"`
+	DownRaw    int64            `json:"down_raw"`
+	DownWire   int64            `json:"down_wire"`
+	UpRatio    float64          `json:"up_ratio"` // wire/raw
+	P50Ms      int64            `json:"p50_ms"`
+	P90Ms      int64            `json:"p90_ms"`
+	P50Wire    int64            `json:"p50_wire_ms"`
+	P90Wire    int64            `json:"p90_wire_ms"`
+	P50TTFB    int64            `json:"p50_ttfb_ms"`
+	P90TTFB    int64            `json:"p90_ttfb_ms"`
+	AvgUpBps   float64          `json:"avg_up_bps"`
+	AvgDownBps float64          `json:"avg_down_bps"`
+	Statuses   map[int]int64    `json:"statuses"`
 	Encodings  map[string]int64 `json:"encodings"`
 	Transport  map[string]int64 `json:"transport"`
 }
 
 // Collector 采集器
 type Collector struct {
-	mu      sync.Mutex
-	agg     *Agg
-	recent  []*Record
-	logPath string
+	mu        sync.Mutex
+	agg       *Agg
+	recent    []*Record
+	logPath   string
 	statsPath string
 
 	logFile *os.File
@@ -87,10 +87,10 @@ func New(logPath, statsPath string) (*Collector, error) {
 	}
 	return &Collector{
 		agg: &Agg{
-			StartedAt:  time.Now().Format(time.RFC3339),
-			Statuses:   map[int]int64{},
-			Encodings:  map[string]int64{},
-			Transport:  map[string]int64{},
+			StartedAt: time.Now().Format(time.RFC3339),
+			Statuses:  map[int]int64{},
+			Encodings: map[string]int64{},
+			Transport: map[string]int64{},
 		},
 		logPath:   logPath,
 		statsPath: statsPath,
@@ -151,7 +151,12 @@ func (c *Collector) Observe(r *Record) {
 	for _, x := range c.recent {
 		totals = append(totals, x.MsTotal)
 		wires = append(wires, x.MsWire)
-		ttfbs = append(ttfbs, x.MsUpstrm)
+		// TTFB 为 0 表示「没测到首字节」（如 401、请求在写响应前就失败），
+		// 属于缺失样本而非「0 毫秒」。混进分位会把 p50 拉成 0——这正是
+		// 线上 p50_ttfb_ms/p90_ttfb_ms 恒为 0 的成因之一。
+		if x.MsUpstrm > 0 {
+			ttfbs = append(ttfbs, x.MsUpstrm)
+		}
 		if x.UpBps > 0 {
 			sumUp += x.UpBps
 			nUp++

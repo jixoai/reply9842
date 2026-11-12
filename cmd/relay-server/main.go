@@ -1,14 +1,15 @@
-// relay-server — 隧道服务端 + 上游转发
+// relay-server — 隧道服务端 + 上游转发 + 幂等断点续传
 //
-// 职责（2026-11-12 kzf 需求：「最后由 relay-server 代理转发」）：
-//   1. 接受 QUIC/TCP 隧道连接
-//   2. 解帧、按 base 哈希从内容寻址 store 取字典、解 dcz/zstd
-//   3. 校验 ResultHash（防静默损坏，这是本方案最关键的安全网）
-//   4. 转发到上游（默认 127.0.0.1:3431，同机直连，不出网卡）
-//   5. 把上游响应回传；把本次 body 存入 store 供后续请求当基线
+// 职责（2026-11-13 kzf 需求整合）：
+//  1. 接受 QUIC/TCP 隧道连接，解帧、解 dcz/zstd、校验 ResultHash
+//  2. 转发上游（默认 127.0.0.1:3431，同机回环，不出网卡）
+//  3. 流式 spool 双写：上游 chunk 边收边落盘，客户端从文件按偏移拉取
+//  4. 断线提升：客户端断开 → tmp→idem rename，上游继续接收
+//  5. 重连续传：客户端带 IdemKey + ResumeFrom/EventID 重连 → 重放 + 挂末尾
 //
-// 关键设计（勿改）：store 是纯内容寻址，无会话状态、无目录、无版本号。
-// base 未命中即回 DeltaMiss，客户端重发全量——这是唯一的一致性协商路径。
+// 关键架构（勿改）：pump goroutine（上游→文件）与 client writer（文件→客户端）
+// 完全解耦。pump 的 ctx 用 context.WithoutCancel 派生，客户端断开不会取消上游。
+// 这是「请求能续上」的全部前提。
 package main
 
 import (
@@ -26,37 +27,45 @@ import (
 
 	"github.com/jixoai/rfc9842-reply/internal/codec"
 	"github.com/jixoai/rfc9842-reply/internal/meta"
+	"github.com/jixoai/rfc9842-reply/internal/spool"
 	"github.com/jixoai/rfc9842-reply/internal/stats"
 	"github.com/jixoai/rfc9842-reply/internal/store"
 	"github.com/jixoai/rfc9842-reply/internal/transport"
 )
 
 type cfg struct {
-	listen     string
-	upstream   string
-	upHost     string
-	cert       string
-	key        string
-	cacheMB    int64
-	logPath    string
-	statsPath  string
-	maxRetries int
+	listen         string
+	upstream       string
+	upHost         string
+	cert           string
+	key            string
+	cacheMB        int64
+	spoolDir       string
+	tmpMB          int64
+	idemMB         int64
+	upstreamTimout time.Duration
+	logPath        string
+	statsPath      string
 }
 
 func main() {
 	c := cfg{}
-	flag.StringVar(&c.listen, "listen", "0.0.0.0:9000", "隧道监听（QUIC 与 TCP 同端口）")
+	flag.StringVar(&c.listen, "listen", "0.0.0.0:28443", "隧道监听（QUIC 与 TCP 同端口）")
 	flag.StringVar(&c.upstream, "upstream", "http://127.0.0.1:3431", "上游 base URL（同机回环最优）")
 	flag.StringVar(&c.upHost, "uphost", "magpie.aiweb.xin", "转发时覆盖的 Host 头")
 	flag.StringVar(&c.cert, "cert", "", "TLS 证书（fullchain）")
 	flag.StringVar(&c.key, "key", "", "TLS 私钥")
-	flag.Int64Var(&c.cacheMB, "cache-mb", 512, "基版本缓存上限（MB）")
+	flag.Int64Var(&c.cacheMB, "cache-mb", 256, "基版本缓存上限（MB，内存）")
+	flag.StringVar(&c.spoolDir, "spool-dir", "/var/lib/rfc9842-reply/spool", "流式 spool 根目录")
+	flag.Int64Var(&c.tmpMB, "tmp-mb", 512, "活跃区字节预算（MB）")
+	flag.Int64Var(&c.idemMB, "idem-mb", 2048, "幂等区字节预算（MB）")
+	flag.DurationVar(&c.upstreamTimout, "upstream-timeout", 10*time.Minute, "上游请求超时")
 	flag.StringVar(&c.logPath, "log", "", "逐请求日志")
 	flag.StringVar(&c.statsPath, "stats", "", "汇总统计")
 	flag.Parse()
 
 	if c.cert == "" || c.key == "" {
-		log.Fatalf("必须提供 -cert 与 -key（自签可用 openssl 生成）")
+		log.Fatalf("必须提供 -cert 与 -key")
 	}
 	home, _ := os.UserHomeDir()
 	if c.logPath == "" {
@@ -73,18 +82,26 @@ func main() {
 	}
 	defer col.Close()
 
-	st := store.New(c.cacheMB << 20)
+	sp, err := spool.New(spool.Options{
+		Dir: c.spoolDir, TmpBudget: c.tmpMB << 20, IdemBudget: c.idemMB << 20,
+	})
+	if err != nil {
+		log.Fatalf("spool: %v", err)
+	}
+	defer sp.Close()
 
 	log.Printf("relay-server 启动")
 	log.Printf("  隧道监听    %s（QUIC + TCP/TLS 同端口）", c.listen)
 	log.Printf("  上游        %s (Host: %s)", c.upstream, c.upHost)
-	log.Printf("  基版本缓存  %d MB", c.cacheMB)
+	log.Printf("  基版本缓存  %d MB（内存，内容寻址）", c.cacheMB)
+	log.Printf("  spool       %s（tmp %dMB / idem %dMB）", c.spoolDir, c.tmpMB, c.idemMB)
+	log.Printf("  上游超时    %s（不随客户端断开取消）", c.upstreamTimout)
 	log.Printf("  日志        %s", c.logPath)
 
 	s := &server{
-		c: &c, store: st, col: col,
+		c: &c, store: store.New(c.cacheMB << 20), spool: sp, col: col,
 		client: &http.Client{
-			Timeout: 0, // SSE 流式需要无超时；由 ctx 控制
+			Timeout: 0,
 			Transport: &http.Transport{
 				MaxIdleConns:        200,
 				MaxIdleConnsPerHost: 50,
@@ -112,32 +129,38 @@ func main() {
 type server struct {
 	c      *cfg
 	store  *store.Store
+	spool  *spool.Manager
 	client *http.Client
 	col    *stats.Collector
 }
 
 func (s *server) serve(a transport.Accept) {
 	defer a.Conn.Close()
-	rec := &stats.Record{Transport: string(a.Kind)}
 	start := time.Now()
+	rec := &stats.Record{Transport: string(a.Kind)}
 
-	log.Printf("[%s] 新连接", a.Kind)
 	raw, err := a.Conn.Recv()
 	if err != nil {
 		log.Printf("[%s] recv err: %v", a.Kind, err)
 		return
 	}
-	log.Printf("[%s] 收到 %d 字节", a.Kind, len(raw))
 	ft, payload, err := meta.ReadFrame(bytes.NewReader(raw))
 	if err != nil {
-		log.Printf("[%s] meta.ReadFrame err: %v (raw %d bytes, head=%x)", a.Kind, err, len(raw), raw[:min(12,len(raw))])
-		s.fail(a.Conn, "bad frame: "+err.Error())
+		log.Printf("[%s] meta.ReadFrame err: %v", a.Kind, err)
 		return
 	}
-	if ft != meta.FrameRequest {
+
+	switch ft {
+	case meta.FrameResume:
+		s.handleResume(a, payload, rec, start)
+		return
+	case meta.FrameRequest:
+		// 继续新请求路径
+	default:
 		log.Printf("[%s] unexpected frame type %d", a.Kind, ft)
 		return
 	}
+
 	reqHead, hdrRaw, bodyWire, err := meta.DecodeRequest(payload)
 	if err != nil {
 		s.fail(a.Conn, "decode request: "+err.Error())
@@ -151,12 +174,10 @@ func (s *server) serve(a transport.Accept) {
 	body, encName, miss, err := s.decodeBody(reqHead, bodyWire)
 	rec.MsDecode = time.Since(decStart).Milliseconds()
 	if miss {
-		// base 未命中：告知客户端重发全量
-		if f, e := wrapFrame(meta.FrameDeltaMiss, nil); e == nil {
+		if f, e := meta.WrapFrame(meta.FrameDeltaMiss, nil); e == nil {
 			transport.WriteFrame(a.Conn, f)
 		}
-		rec.Encoding, rec.BaseHit = "delta-miss", false
-		rec.Status = 409
+		rec.Encoding, rec.Status = "delta-miss", 409
 		rec.MsTotal = time.Since(start).Milliseconds()
 		s.col.Observe(rec)
 		return
@@ -168,13 +189,13 @@ func (s *server) serve(a transport.Accept) {
 		s.col.Observe(rec)
 		return
 	}
-	rec.Encoding, rec.BaseHit = encName, reqHead.Encoding == meta.EncDcz
+	rec.Encoding = encName
+	rec.BaseHit = reqHead.Encoding == meta.EncDcz
 	rec.UpRaw = int64(len(body))
 
-	// ---- 防静默损坏：校验 ResultHash ----
+	// ---- 防静默损坏 ----
 	if !reqHead.ResultHash.IsZero() {
-		got := codec.Sum(body)
-		if convertHash(got) != reqHead.ResultHash {
+		if convertHash(codec.Sum(body)) != reqHead.ResultHash {
 			s.fail(a.Conn, "result hash mismatch (silent corruption guard)")
 			rec.Status, rec.Err = 422, "result hash mismatch"
 			rec.MsTotal = time.Since(start).Milliseconds()
@@ -183,46 +204,271 @@ func (s *server) serve(a transport.Accept) {
 		}
 	}
 
-	// ---- 转发上游 ----
-	upStart := time.Now()
-	status, respHdr, respBody, err := s.forward(reqHead, hdrRaw, body)
-	rec.MsUpstrm = time.Since(upStart).Milliseconds()
+	// ---- 幂等键 ----
+	key := reqHead.IdemKey
+	if key.IsZero() {
+		// 客户端未提供（旧客户端）：服务端按内容派生，需补齐 Authorization 上下文
+		key = meta.Hash{}
+		log.Printf("warn: request without IdemKey, falling back to path-only key")
+	}
+
+	var keyArr [32]byte
+	copy(keyArr[:], key[:])
+
+	// ---- 取得 spool 条目 ----
+	entry, existing, err := s.spool.Acquire(keyArr)
 	if err != nil {
-		s.fail(a.Conn, "upstream: "+err.Error())
-		rec.Status, rec.Err = 502, err.Error()
+		s.fail(a.Conn, "spool: "+err.Error())
+		rec.Status, rec.Err = 500, err.Error()
 		rec.MsTotal = time.Since(start).Milliseconds()
 		s.col.Observe(rec)
 		return
 	}
 
-	// ---- 存入 store（供后续请求当基线）----
-	s.store.Put(body)
-
-	// ---- 响应帧 ----
-	rh := &meta.ResponseHead{Status: status, Encoding: meta.EncIdentity,
-		BodyLen: int64(len(respBody)), HeaderLen: int32(len(respHdr))}
-	out, err := meta.EncodeResponse(rh, respHdr, respBody)
-	if err != nil {
-		s.fail(a.Conn, "encode response: "+err.Error())
-		return
-	}
-	frame, err := wrapFrame(meta.FrameResponse, out)
-	if err != nil {
-		s.fail(a.Conn, "wrap: "+err.Error())
-		return
-	}
-	if err := transport.WriteFrame(a.Conn, frame); err != nil {
-		return
+	if !existing {
+		s.startPump(entry, reqHead, hdrRaw, body)
+	} else {
+		log.Printf("同 key 请求复用已有条目（existing）key=%x written=%d",
+			keyArr[:4], entry.Written())
 	}
 
-	rec.Status = status
-	rec.DownRaw = int64(len(respBody))
-	rec.DownWire = rec.DownRaw
+	status := s.streamToClient(a.Conn, entry, 0, start, rec)
+	if status != 0 {
+		rec.Status = status
+	}
 	rec.MsTotal = time.Since(start).Milliseconds()
-	if d := float64(rec.MsWire) / 1000; d > 0 {
-		rec.UpBps = float64(rec.UpWire) / d
+	s.col.Observe(rec)
+}
+
+// streamToClient 从 entry 的 from 偏移开始把 body 推给客户端。
+// 客户端断开时不取消上游（pump 独立），只把条目 Detach 到幂等区。
+//
+// 正常推完后必须发 FrameDone：客户端靠它区分「上游完成」与「连接断了」。
+// 不发的话客户端只能把正常结束当 recv EOF 记成错误，并被迫重连去确认状态。
+func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64,
+	start time.Time, rec *stats.Record) int {
+
+	// 等响应头就绪
+	for {
+		if st, hdrs, ok := e.Head(); ok {
+			rh := &meta.ResponseHead{
+				Status: st, Encoding: meta.EncIdentity,
+				BodyLen: -1, HeaderLen: int32(len(hdrs)),
+			}
+			out, err := meta.EncodeResponse(rh, hdrs, nil)
+			if err != nil {
+				s.fail(conn, "encode head: "+err.Error())
+				return 500
+			}
+			if f, err := meta.WrapFrame(meta.FrameResponse, out); err == nil {
+				if err := transport.WriteFrame(conn, f); err != nil {
+					s.detachOnDisconnect(e)
+					return 0
+				}
+			}
+			rec.Status = st
+			rec.MsUpstrm = time.Since(start).Milliseconds()
+			break
+		}
+		if e.IsComplete() {
+			msg := "upstream finished without headers"
+			if err := e.Err(); err != nil {
+				msg = err.Error()
+			}
+			s.fail(conn, msg)
+			return 502
+		}
+		if !e.WaitMore(nil, e.Gen()) {
+			s.detachOnDisconnect(e)
+			return 0
+		}
 	}
-	log.Printf("[%s] 完成 status=%d up=%d down=%d", a.Kind, rec.Status, rec.UpRaw, rec.DownRaw)
+
+	// 推 body：按偏移拉取，空闲时等通知
+	off := from
+	var down int64
+	for {
+		buf, err := e.ReadFrom(off, 32*1024)
+		if err != nil {
+			s.fail(conn, "spool read: "+err.Error())
+			return 500
+		}
+		if len(buf) > 0 {
+			// Status=0 表示「续片」，客户端按序拼接
+			chunkHead := &meta.ResponseHead{
+				Status: 0, Encoding: meta.EncIdentity,
+				BodyLen: int64(len(buf)), HeaderLen: 0,
+			}
+			out, _ := meta.EncodeResponse(chunkHead, nil, buf)
+			f, err := meta.WrapFrame(meta.FrameResponse, out)
+			if err != nil {
+				return 500
+			}
+			if err := transport.WriteFrame(conn, f); err != nil {
+				s.detachOnDisconnect(e)
+				return 0
+			}
+			off += int64(len(buf))
+			down += int64(len(buf))
+			continue
+		}
+		if e.IsComplete() {
+			if err := e.Err(); err != nil {
+				s.fail(conn, "upstream: "+err.Error())
+				return 502
+			}
+			// 终止帧：告诉客户端「这是完整响应的结尾，别当成断线」
+			if f, ferr := meta.WrapFrame(meta.FrameDone, nil); ferr == nil {
+				if werr := transport.WriteFrame(conn, f); werr != nil {
+					s.detachOnDisconnect(e)
+					return 0
+				}
+			}
+			rec.DownRaw = down
+			rec.DownWire = down
+			return 200
+		}
+		if !e.WaitMore(nil, e.Gen()) {
+			s.detachOnDisconnect(e)
+			return 0
+		}
+	}
+}
+
+// detachOnDisconnect 客户端断开：把条目提升到幂等区，上游继续。
+func (s *server) detachOnDisconnect(e *spool.Entry) {
+	if e.IsComplete() {
+		return
+	}
+	if err := s.spool.Detach(e); err != nil {
+		log.Printf("detach err: %v", err)
+	} else {
+		log.Printf("客户端断开，条目转入幂等区 key=%x written=%d", e.Key[:4], e.Written())
+	}
+}
+
+// startPump 上游请求 → 流式落盘。ctx 用 WithoutCancel 派生，客户端断开不影响。
+func (s *server) startPump(e *spool.Entry, h *meta.RequestHead, hdrRaw, body []byte) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(context.Background()), s.c.upstreamTimout)
+
+	go func() {
+		defer cancel()
+
+		u := strings.TrimSuffix(s.c.upstream, "/") + h.Path
+		req, err := http.NewRequestWithContext(ctx, h.Method, u, bytes.NewReader(body))
+		if err != nil {
+			e.Finish(err)
+			return
+		}
+		for k, vs := range meta.DecodeHeaders(hdrRaw) {
+			if isHopByHop(k) {
+				continue
+			}
+			for _, v := range vs {
+				req.Header.Add(k, v)
+			}
+		}
+		req.Header.Set("Host", s.c.upHost)
+		req.Host = s.c.upHost
+		req.Header.Del("Accept-Encoding")
+		req.ContentLength = int64(len(body))
+
+		resp, err := s.client.Do(req)
+		if err != nil {
+			e.Finish(err)
+			return
+		}
+		defer resp.Body.Close()
+
+		e.SetHead(resp.StatusCode, meta.EncodeHeaders(resp.Header))
+
+		buf := make([]byte, 32*1024)
+		for {
+			n, rerr := resp.Body.Read(buf)
+			if n > 0 {
+				if werr := e.Append(buf[:n]); werr != nil {
+					e.Finish(werr)
+					return
+				}
+			}
+			if rerr == io.EOF {
+				break
+			}
+			if rerr != nil {
+				e.Finish(rerr)
+				return
+			}
+			if ctx.Err() != nil {
+				e.Finish(ctx.Err())
+				return
+			}
+		}
+		e.Finish(nil)
+		s.store.Put(body)
+	}()
+}
+
+// handleResume 处理续传：按 key 找条目，回元信息，从偏移继续推。
+func (s *server) handleResume(a transport.Accept, payload []byte, rec *stats.Record, start time.Time) {
+	rq, err := meta.DecodeResumeReq(payload)
+	if err != nil {
+		s.fail(a.Conn, "decode resume: "+err.Error())
+		return
+	}
+	rec.Method, rec.Path = "RESUME", fmt.Sprintf("key=%x", rq.IdemKey[:4])
+
+	entry, existing, err := s.spool.Acquire(rq.IdemKey)
+	if err != nil {
+		s.fail(a.Conn, "spool: "+err.Error())
+		return
+	}
+	if !existing {
+		// 没有对应条目 → 让客户端重新发完整请求
+		if f, e := meta.WrapFrame(meta.FrameDeltaMiss, nil); e == nil {
+			transport.WriteFrame(a.Conn, f)
+		}
+		rec.Status, rec.Encoding = 409, "resume-miss"
+		rec.MsTotal = time.Since(start).Milliseconds()
+		s.col.Observe(rec)
+		return
+	}
+
+	from := rq.From
+	if rq.EventID != "" {
+		if off := entry.EventOffset(rq.EventID); off >= 0 {
+			from = off
+		}
+	}
+	if from < 0 {
+		from = 0
+	}
+	if w := entry.Written(); from > w {
+		from = w
+	}
+
+	st, hdrs, ok := entry.Head()
+	info := &meta.ResumeInfo{
+		Status: st, Written: entry.Written(), Complete: entry.IsComplete(),
+		Headers: hdrs,
+	}
+	if err := entry.Err(); err != nil {
+		info.UpstreamErr = err.Error()
+	}
+	if !ok {
+		info.Status = 0
+	}
+	if f, e := meta.WrapFrame(meta.FrameResumeInfo, meta.EncodeResumeInfo(info)); e == nil {
+		if err := transport.WriteFrame(a.Conn, f); err != nil {
+			return
+		}
+	}
+
+	status := s.streamToClient(a.Conn, entry, from, start, rec)
+	if status != 0 {
+		rec.Status = status
+	}
+	rec.Encoding = "resume"
+	rec.MsTotal = time.Since(start).Milliseconds()
 	s.col.Observe(rec)
 }
 
@@ -231,29 +477,22 @@ func (s *server) decodeBody(h *meta.RequestHead, wire []byte) (body []byte, encN
 	switch h.Encoding {
 	case meta.EncIdentity:
 		return wire, "identity", false, nil
-
 	case meta.EncZstd:
 		b, e := codec.Decompress(wire, nil)
 		return b, "zstd", false, e
-
 	case meta.EncGzip:
-		// 兼容阶段 0（客户端仍可能发 gzip）；用 zstd 库解不了，交给上层 415
 		return nil, "gzip", false, fmt.Errorf("gzip decoding not enabled on server")
-
 	case meta.EncDcz:
-		// 先看头里的哈希，再从 store 精确取字典
 		declared, e := codec.PeekDczHash(wire)
 		if e != nil {
 			return nil, "dcz", false, e
 		}
 		dict, ok := s.store.Get(declared)
 		if !ok {
-			return nil, "dcz", true, nil // → DeltaMiss
+			return nil, "dcz", true, nil
 		}
 		b, e := codec.DecodeDcz(wire, dict)
 		if e != nil {
-			// 字典在但解不开：可能是字典内容被替换（哈希碰撞或 store 损坏）
-			// 保守处理：当作 miss，让客户端重发全量
 			return nil, "dcz", true, nil
 		}
 		return b, "dcz", false, nil
@@ -261,51 +500,10 @@ func (s *server) decodeBody(h *meta.RequestHead, wire []byte) (body []byte, encN
 	return nil, "unknown", false, fmt.Errorf("unknown encoding %d", h.Encoding)
 }
 
-// forward 转发到上游，返回 status/headers/body
-func (s *server) forward(h *meta.RequestHead, hdrRaw, body []byte) (int, []byte, []byte, error) {
-	u := strings.TrimSuffix(s.c.upstream, "/") + h.Path
-	req, err := http.NewRequest(h.Method, u, bytes.NewReader(body))
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	// 复制客户端 headers（跳过 hop-by-hop）
-	for k, vs := range meta.DecodeHeaders(hdrRaw) {
-		if isHopByHop(k) {
-			continue
-		}
-		for _, v := range vs {
-			req.Header.Add(k, v)
-		}
-	}
-	req.Header.Set("Host", s.c.upHost)
-	req.Host = s.c.upHost
-	req.Header.Del("Accept-Encoding") // 由本程序如实接收
-	req.ContentLength = int64(len(body))
-
-	resp, err := s.client.Do(req)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	defer resp.Body.Close()
-	respBody, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return 0, nil, nil, err
-	}
-	outHdr := meta.EncodeHeaders(resp.Header)
-	return resp.StatusCode, outHdr, respBody, nil
-}
-
 func (s *server) fail(c *transport.Conn, msg string) {
-	frame, _ := wrapFrame(meta.FrameError, []byte(msg))
-	transport.WriteFrame(c, frame)
-}
-
-func wrapFrame(ft meta.FrameType, payload []byte) ([]byte, error) {
-	var buf bytes.Buffer
-	if err := meta.WriteFrame(&buf, ft, payload); err != nil {
-		return nil, err
+	if f, err := meta.WrapFrame(meta.FrameError, []byte(msg)); err == nil {
+		transport.WriteFrame(c, f)
 	}
-	return buf.Bytes(), nil
 }
 
 func isHopByHop(k string) bool {
@@ -321,11 +519,4 @@ func convertHash(h codec.Hash) meta.Hash {
 	var out meta.Hash
 	copy(out[:], h[:])
 	return out
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }
