@@ -1,0 +1,43 @@
+# reply9842-server —— 隧道服务端的一键部署镜像
+#
+# 设计要点：
+#   - 三阶段构建，最终 scratch 镜像（~12MB）。server 是纯 Go 静态二进制，
+#     CGO_ENABLED=0，无 libc 依赖，scratch 足够。
+#   - 非 root 运行（65532，与项目其他镜像一致）。
+#   - 隧道监听 8443、健康检查监听 8080（都是非特权端口），证书通过 volume 挂载。
+#   - 健康检查走 /healthz 路由 —— scratch 无 shell，不能 exec 型探活。
+
+# ---- 构建 ----
+FROM golang:1.27-alpine AS build
+WORKDIR /src
+# 依赖层单独缓存：源码变更不重编依赖
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+ARG VERSION=dev
+RUN CGO_ENABLED=0 GOOS=linux go build \
+      -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
+      -o /out/reply9842-server ./cmd/server
+
+# ---- 运行 ----
+FROM scratch
+COPY --from=build /out/reply9842-server /reply9842-server
+# 时区数据（日志时间戳需要）
+COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
+ENV TZ=Asia/Shanghai
+# 证书与 spool 目录
+VOLUME ["/certs", "/var/lib/reply9842"]
+USER 65532:65532
+# 8443 = 隧道（QUIC/TCP + TLS）；8080 = 健康检查（明文，仅内网）
+EXPOSE 8443 8080
+# scratch 无 shell、无 curl，用二进制自身的 --health-probe 模式探活
+# （它 GET 自己的 /healthz，成功 exit 0，失败 exit 1）
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD ["/reply9842-server", "--health-probe", "-health-addr", "127.0.0.1:8080"]
+ENTRYPOINT ["/reply9842-server"]
+# 默认参数：证书从 /certs 读，spool 落 volume
+CMD ["-listen", "0.0.0.0:8443", \
+     "-health-addr", "0.0.0.0:8080", \
+     "-cert", "/certs/fullchain.pem", \
+     "-key", "/certs/privkey.pem", \
+     "-spool-dir", "/var/lib/reply9842/spool"]

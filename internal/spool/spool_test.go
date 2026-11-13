@@ -227,7 +227,7 @@ func timeoutAfter(sec int) <-chan struct{} {
 
 // ---- 回归测试：2026-11-13 线上 bug ----
 
-// 线上现象：/var/lib/rfc9842-reply/spool/idem 为空，三个已完成响应全在 tmp/。
+// 线上现象：/var/lib/reply9842/spool/idem 为空，三个已完成响应全在 tmp/。
 // 根因：迁移只由 Detach（客户端断开）触发，正常请求从不 Detach。
 func TestCompletePromotesToIdem(t *testing.T) {
 	dir := t.TempDir()

@@ -14,8 +14,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/meta"
-	"github.com/jixoai/rfc9842-reply/internal/transport"
+	"github.com/jixoai/reply9842/internal/meta"
+	"github.com/jixoai/reply9842/internal/transport"
 )
 
 // selfSigned 生成自签证书（transport.Dialer 走 DNS 名之外的 TLS 握手）。

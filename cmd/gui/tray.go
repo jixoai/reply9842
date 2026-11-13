@@ -19,7 +19,7 @@
 //	──────
 //	复制 ANTHROPIC_BASE_URL
 //	──────
-//	退出 rfc9842-reply
+//	退出 reply9842
 //
 // 三条状态行是**禁用**的菜单项而不是 disabled 菜单：macOS 的禁用项会自动
 // 变灰、也不会在键盘导航里被选中，正好是「只读摘要」该有的行为。用独立
@@ -32,8 +32,8 @@ import (
 
 	"github.com/egoist/mygo"
 
-	"github.com/jixoai/rfc9842-reply/internal/autostart"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
+	"github.com/jixoai/reply9842/internal/autostart"
+	"github.com/jixoai/reply9842/internal/stats"
 )
 
 // trayIcon 是打包好的模板图标（纯黑 + 透明 + 2×2「9842」）。
@@ -104,7 +104,7 @@ func (a *app) initTray() {
 		// 唯一「一眼可见」的成效指标，比图标本身更有信息量。
 		// 初值留空：还没数据时显示「0×」是误导，等有数了再出现。
 		Title:   "",
-		ToolTip: "rfc9842-reply · 按内容寻址压缩上行带宽",
+		ToolTip: "reply9842 · 按内容寻址压缩上行带宽",
 		Menu:    menu,
 	})
 	if err != nil {
@@ -187,7 +187,7 @@ func (t *trayUI) buildMenu() *mygo.Menu {
 
 	items = append(items,
 		mygo.Separator(),
-		&mygo.MenuItem{ID: itemQuit, Label: "退出 rfc9842-reply", Click: func(*mygo.MenuItem, *mygo.Window) {
+		&mygo.MenuItem{ID: itemQuit, Label: "退出 reply9842", Click: func(*mygo.MenuItem, *mygo.Window) {
 			// 唯一的真退出路径。Quit 会在主线程跑完 OnBeforeQuit（停监听）
 			// 与 OnWillQuit（收托盘），然后结束事件循环。
 			mygo.App.Quit()
@@ -307,9 +307,9 @@ func (t *trayUI) refresh() {
 	}
 
 	// tooltip 带上最有用的一条事实：没跑时说怎么开始，跑起来说监听在哪
-	tip := "rfc9842-reply · 已停止"
+	tip := "reply9842 · 已停止"
 	if a.running() {
-		tip = "rfc9842-reply · 监听 " + a.runner.Addr()
+		tip = "reply9842 · 监听 " + a.runner.Addr()
 	}
 	t.tray.SetToolTip(tip)
 }

@@ -1,4 +1,4 @@
-# rfc9842-reply
+# reply9842
 
 **基于内容寻址基版本的增量压缩隧道，把 AI Agent 的上行带宽砍掉 99.8%。**
 
@@ -153,7 +153,7 @@ go build -o relay-client ./cmd/relay-client
 | `-max-resume` | `3` | 断线后最大续传重试次数（`0` = 不续传）|
 | `-capture-dir` | 空 | 采样目录：把请求体原样落盘供离线分析 |
 | `-capture-n` | `30` | 最多采样多少条 |
-| `-log` / `-stats` | `~/.rfc9842-reply/` | 日志与统计路径 |
+| `-log` / `-stats` | `~/.reply9842/` | 日志与统计路径 |
 
 ### 服务端参数
 
@@ -164,7 +164,7 @@ go build -o relay-client ./cmd/relay-client
 | `-uphost` | `magpie.aiweb.xin` | 转发时覆盖的 Host 头 |
 | `-cert` / `-key` | 必填 | TLS 证书 |
 | `-cache-mb` | `256` | 基版本缓存上限（内存，内容寻址 LRU）|
-| `-spool-dir` | `/var/lib/rfc9842-reply/spool` | 流式响应 spool 根目录 |
+| `-spool-dir` | `/var/lib/reply9842/spool` | 流式响应 spool 根目录 |
 | `-tmp-mb` | `512` | 活跃区字节预算 |
 | `-idem-mb` | `2048` | 幂等区字节预算 |
 | `-upstream-timeout` | `10m` | 上游请求超时（不随客户端断开取消）|
@@ -269,7 +269,7 @@ RFC 9842 之所以存活，是把「字典老化」转成了 HTTP 缓存问题�
 
 ## 观测
 
-### `~/.rfc9842-reply/client-stats.json`（每次请求后覆盖）
+### `~/.reply9842/client-stats.json`（每次请求后覆盖）
 
 ```json
 {
@@ -286,14 +286,14 @@ RFC 9842 之所以存活，是把「字典老化」转成了 HTTP 缓存问题�
 }
 ```
 
-### `~/.rfc9842-reply/client-<date>.jsonl`（逐请求追加）
+### `~/.reply9842/client-<date>.jsonl`（逐请求追加）
 
 字段：`t` `method` `path` `status` `enc` `base_hit` `up_raw` `up_wire`
 `down_raw` `down_wire` `ms_total` `ms_encode` `ms_wire` `ms_decode`
 `ms_upstream` `up_bps` `down_bps` `transport` `err`
 
 ```bash
-tail -f ~/.rfc9842-reply/client-$(date +%F).jsonl | \
+tail -f ~/.reply9842/client-$(date +%F).jsonl | \
   jq -c '{path,status,enc,up_raw,up_wire,ms_total}'
 ```
 
@@ -361,7 +361,7 @@ internal/
 ## 官网与部署
 
 官网源码在 [`site/`](./site)（纯 HTML + CSS，无框架、无外部字体、无图片资源），
-线上地址 <https://rfc9842-reply.jixoai.com>。
+线上地址 <https://reply9842.jixoai.com>。
 
 `site/` 目录：
 
@@ -369,20 +369,11 @@ internal/
 site/
 ├── index.html     单页落地页（内核数字 / 原理图 / 实测表 / 快速开始）
 ├── style.css      全部样式（OKLCH 单品牌色，响应式，含 reduced-motion）
-└── CNAME          rfc9842-reply.jixoai.com
+└── CNAME          reply9842.jixoai.com
 ```
 
 推送 `main` 且 `site/**` 有变更时，`.github/workflows/pages.yml` 自动构建并发布到
 GitHub Pages（也可在 Actions 页手动 `workflow_dispatch`）。
 
-### 首次启用需要手动做两步
-
-1. **仓库 Settings → Pages → Source** 选择 **GitHub Actions**。
-   不选这一步，`deploy-pages` 会报 `Get Pages site failed`。
-2. **DNS**：在 `jixoai.com` 的解析里加一条记录
-   - 类型 `CNAME`，主机记录 `rfc9842`，记录值 `<owner>.github.io`（如 `jixoai.github.io`）
-   - 若走 Cloudflare 代理，需将这条记录设为 **DNS only（灰云）**，
-     否则 Pages 的证书签发会因代理层而失败
-
-两步完成后首次 push 触发部署；生效时间取决于 DNS TTL（通常几分钟）。
-`site/CNAME` 已写好目标域名，Pages 会据此绑定自定义域并自动申请 TLS 证书。
+DNS 侧 `rfc9842.jixoai.com` 已 CNAME 到 `jixoai.github.io`（Cloudflare、DNS only），
+`site/CNAME` 已写好目标域名，Pages 据此绑定自定义域并自动申请 TLS。

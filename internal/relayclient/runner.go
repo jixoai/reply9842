@@ -26,13 +26,13 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/basefind"
-	"github.com/jixoai/rfc9842-reply/internal/clientstream"
-	"github.com/jixoai/rfc9842-reply/internal/codec"
-	"github.com/jixoai/rfc9842-reply/internal/idem"
-	"github.com/jixoai/rfc9842-reply/internal/meta"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
-	"github.com/jixoai/rfc9842-reply/internal/transport"
+	"github.com/jixoai/reply9842/internal/basefind"
+	"github.com/jixoai/reply9842/internal/clientstream"
+	"github.com/jixoai/reply9842/internal/codec"
+	"github.com/jixoai/reply9842/internal/idem"
+	"github.com/jixoai/reply9842/internal/meta"
+	"github.com/jixoai/reply9842/internal/stats"
+	"github.com/jixoai/reply9842/internal/transport"
 )
 
 // 默认值集中在一处：CLI 的 flag 默认值、GUI 的输入框初值都从这里取，
@@ -49,18 +49,20 @@ const (
 
 // Config 一次运行所需的全部配置（与 CLI flag 一一对应）
 type Config struct {
-	Listen     string // 本地 HTTP 监听，如 127.0.0.1:18899
-	Server     string // relay-server 地址 host:port
-	ServerName string // TLS SNI，留空自动推导
-	Transport  string // auto | quic | tcp
-	Insecure   bool   // 跳过服务端证书校验（自签观察期）
-	MinDelta   int    // 小于此字节数的请求体不做 delta
-	HistoryMB  int64  // 基线历史总字节预算（MB）
-	CaptureDir string // 采样目录，留空不采
-	CaptureN   int    // 最多采样多少条
-	MaxResume  int    // 断线后最大续传重试次数（0=不续传）
-	LogPath    string // 逐请求日志
-	StatsPath  string // 汇总统计
+	Listen     string        // 本地 HTTP 监听，如 127.0.0.1:18899
+	Server     string        // relay-server 地址 host:port
+	ServerName string        // TLS SNI，留空自动推导
+	Transport  string        // auto | quic | tcp
+	Insecure   bool          // 跳过服务端证书校验（自签观察期）
+	MinDelta   int           // 小于此字节数的请求体不做 delta
+	HistoryMB  int64         // 基线历史总字节预算（MB）
+	CaptureDir string        // 采样目录，留空不采
+	CaptureN   int           // 最多采样多少条
+	MaxResume  int           // 断线后最大续传重试次数（0=不续传）
+	LogPath    string        // 逐请求日志
+	StatsPath  string        // 汇总统计
+	Retain     time.Duration // 日志保留时长（磁盘），同时是重启重建的扫描范围
+	Window     time.Duration // 图表显示区间（横轴跨度）
 }
 
 // Normalize 补齐默认值与派生路径（幂等，可反复调用）
@@ -92,6 +94,15 @@ func (c *Config) Normalize() {
 	if c.StatsPath == "" {
 		c.StatsPath = filepath.Join(filepath.Dir(c.LogPath), "client-stats.json")
 	}
+	if c.Retain <= 0 {
+		c.Retain = DefaultRetain
+	}
+	if c.Window <= 0 {
+		c.Window = DefaultWindow
+	}
+	if c.Window > c.Retain {
+		c.Window = c.Retain
+	}
 }
 
 // DefaultDir 运行时数据目录（日志与统计同放这里）
@@ -100,7 +111,7 @@ func DefaultDir() string {
 	if err != nil {
 		home = "."
 	}
-	return filepath.Join(home, ".rfc9842-reply")
+	return filepath.Join(home, ".reply9842")
 }
 
 // DefaultLogPath 当日日志路径（按日期滚动，便于 jq 直读）
@@ -125,6 +136,10 @@ type Runner struct {
 	running   bool
 	startedAt time.Time
 	lastErr   error
+
+	// statsErr 统计器打开失败的原因。统计是观测功能，它起不来不该拖住转发，
+	// 但也不能静默——GUI 会把它显示在提示行。
+	statsErr error
 
 	// Logger 运行日志出口；为 nil 时用 log.Default()（CLI 走标准输出，
 	// GUI 没有终端，因此 GUI 会把它设成一个环状缓冲，供界面显示）。
@@ -161,6 +176,15 @@ func (r *Runner) SetConfig(c Config) error {
 	defer r.mu.Unlock()
 	if r.running {
 		return errors.New("运行中不能改配置，请先停止")
+	}
+	// 路径或时间跨度变了，旧统计器就指向了错的文件/错的窗口，必须重建。
+	// 重建 = 关掉旧的、置 nil，下次 Stats() 时按新配置重新流式读盘。
+	if c.LogPath != r.c.LogPath || c.StatsPath != r.c.StatsPath ||
+		c.Retain != r.c.Retain || c.Window != r.c.Window {
+		if r.col != nil {
+			r.col.Close()
+			r.col = nil
+		}
 	}
 	r.c = c
 	return nil
@@ -213,7 +237,7 @@ func (r *Runner) Start() error {
 	logger := r.logger
 	r.mu.Unlock()
 
-	col, err := stats.New(c.LogPath, c.StatsPath)
+	col, err := r.stats()
 	if err != nil {
 		r.mu.Lock()
 		r.lastErr = fmt.Errorf("stats: %w", err)
@@ -225,7 +249,6 @@ func (r *Runner) Start() error {
 	switch mode {
 	case transport.KindQUIC, transport.KindTCP, transport.KindAuto:
 	default:
-		col.Close()
 		err := fmt.Errorf("未知传输方式 %q（可选 auto|quic|tcp）", c.Transport)
 		r.mu.Lock()
 		r.lastErr = err
@@ -237,7 +260,6 @@ func (r *Runner) Start() error {
 	// 状态栏能直接显示原因
 	ln, err := net.Listen("tcp", c.Listen)
 	if err != nil {
-		col.Close()
 		err = fmt.Errorf("listen %s: %w", c.Listen, err)
 		r.mu.Lock()
 		r.lastErr = err
@@ -291,15 +313,18 @@ func (r *Runner) Start() error {
 }
 
 // Stop 停止监听并落盘统计。未运行时是 no-op（GUI 上「停止」按钮可以随便按）。
+//
+// 统计器**不在这里关闭**：它还持有磁盘上的历史聚合，停止后 GUI 仍要显示
+// 「今天一共省了多少」。关掉它等于把界面上唯一的长期数字清零。
 func (r *Runner) Stop(ctx context.Context) error {
 	r.mu.Lock()
 	if !r.running {
 		r.mu.Unlock()
 		return nil
 	}
-	srv, col := r.srv, r.col
+	srv := r.srv
 	r.running = false
-	r.srv, r.col, r.ln = nil, nil, nil
+	r.srv, r.ln = nil, nil
 	r.mu.Unlock()
 
 	if ctx == nil {
@@ -310,23 +335,99 @@ func (r *Runner) Stop(ctx context.Context) error {
 	err := srv.Shutdown(ctx)
 	// Shutdown 之后仍有在途请求，Close 兜底
 	_ = srv.Close()
-	if col != nil {
-		col.Close()
-	}
 	r.logf("已停止监听")
 	r.notify()
 	return err
 }
 
-// Snapshot 进程内统计快照。未运行时返回零值 Agg（GUI 显示全 0 而不是上次残留）。
-func (r *Runner) Snapshot() stats.Agg {
+// stats 取（或惰性创建）统计器。
+//
+// 为什么统计器的生命周期比一次 Start/Stop 长（2026-11-13 改造的核心）：
+// 统计的事实来源是磁盘日志，与「监听是否在跑」无关。启动时就流式读一遍
+// 历史，停止后继续保留，GUI 才能答「今天到底省了多少」——这正是用户要求
+// 的「重启不丢」的另一半：重启不丢、停止也不丢。
+func (r *Runner) stats() (*stats.Collector, error) {
 	r.mu.Lock()
-	col := r.col
+	if r.col != nil {
+		col := r.col
+		r.mu.Unlock()
+		return col, nil
+	}
+	c := r.c
 	r.mu.Unlock()
-	if col == nil {
+
+	col, err := stats.Open(stats.Options{
+		LogPath:   c.LogPath,
+		StatsPath: c.StatsPath,
+		Retain:    c.Retain,
+		Window:    c.Window,
+	})
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if err != nil {
+		r.statsErr = err
+		return nil, err
+	}
+	r.statsErr = nil
+	// 竞态：两个 goroutine 同时进来时保留先到的那个，后到的关掉自己
+	if r.col != nil {
+		col.Close()
+		return r.col, nil
+	}
+	r.col = col
+	return col, nil
+}
+
+// StatsErr 统计器打不开的原因（nil 表示正常）。
+func (r *Runner) StatsErr() error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.statsErr
+}
+
+// Snapshot 进程内统计快照。
+//
+// 未运行时**不再返回零值**：统计从磁盘重建，停止状态下也有真实历史。
+// 只有「一份日志都没有」的新用户看到全 0。
+func (r *Runner) Snapshot() stats.Agg {
+	col, err := r.stats()
+	if err != nil || col == nil {
 		return stats.Agg{}
 	}
 	return col.Snapshot()
+}
+
+// SetStatsSettings 应用两个时间跨度偏好（保留时长 / 显示区间）。
+//
+// 运行中也能改：这两项不碰监听、不碰在途请求，只影响读盘范围与分桶粒度，
+// 所以不必要求用户先停止。改完立刻重算，界面下一帧就是新窗口的数据。
+func (r *Runner) SetStatsSettings(retain, window time.Duration) error {
+	r.mu.Lock()
+	r.c.Retain, r.c.Window = retain, window
+	r.c.Normalize()
+	col := r.col
+	r.mu.Unlock()
+
+	if col == nil {
+		// 还没打开过：留到第一次 Snapshot/Start 时按新配置建
+		_, err := r.stats()
+		return err
+	}
+	col.SetRange(retain, window)
+	r.notify()
+	return nil
+}
+
+// Close 释放统计器（CLI 退出、单实例让位时调用）。
+func (r *Runner) Close() error {
+	r.mu.Lock()
+	col := r.col
+	r.col = nil
+	r.mu.Unlock()
+	if col != nil {
+		return col.Close()
+	}
+	return nil
 }
 
 func (r *Runner) logf(format string, args ...any) {

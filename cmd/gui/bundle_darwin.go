@@ -8,7 +8,7 @@
 // 是 bundle 的 Info.plist + Contents/Resources/AppIcon.icns。
 //
 // 解法（与 mygo 的 macos-bundle 参考实现一致）：首次 GUI 启动时在
-// ~/Applications/rfc9842-reply.app 现场拼一个最小 bundle，把图标、Info.plist
+// ~/Applications/reply9842.app 现场拼一个最小 bundle，把图标、Info.plist
 // 和当前二进制的副本写进去，然后 re-exec 副本。产物仍是「一个可执行文件」——
 // bundle 是运行时在用户磁盘上生成的，不参与分发，不需要签名或公证。
 package main
@@ -32,10 +32,10 @@ import (
 var appIcon []byte
 
 const (
-	bundleID = "dev.jixoai.rfc9842-reply"
+	bundleID = "dev.jixoai.reply9842"
 	// execName 是 bundle 内的可执行文件名（= CFBundleExecutable）。
 	// 用固定名字而不是 os.Args[0]，避免用户把二进制改成任意名字时 bundle 跟着变形。
-	execName = "rfc9842-reply"
+	execName = "reply9842"
 	// envBundled 标记「本进程已经是 bundle 副本」，防止无限 re-exec。
 	envBundled = "RFC9842_BUNDLED"
 )
@@ -217,8 +217,8 @@ func infoPlist(version string) string {
 <plist version="1.0">
 <dict>
   <key>CFBundleIdentifier</key><string>` + bundleID + `</string>
-  <key>CFBundleName</key><string>rfc9842-reply</string>
-  <key>CFBundleDisplayName</key><string>rfc9842-reply</string>
+  <key>CFBundleName</key><string>reply9842</string>
+  <key>CFBundleDisplayName</key><string>reply9842</string>
   <key>CFBundleExecutable</key><string>` + execName + `</string>
   <key>CFBundleIconFile</key><string>AppIcon</string>
   <key>CFBundlePackageType</key><string>APPL</string>

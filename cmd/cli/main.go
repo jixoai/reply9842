@@ -21,8 +21,8 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/relayclient"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
+	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/stats"
 )
 
 // version 由 -ldflags "-X main.version=..." 注入（Makefile / release workflow）
@@ -60,7 +60,7 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprintf(os.Stderr, `relay-cli — rfc9842-reply 客户端（本地中转 + 增量压缩隧道）
+	fmt.Fprintf(os.Stderr, `relay-cli — reply9842 客户端（本地中转 + 增量压缩隧道）
 
 用法:
   relay-cli [flags]             启动转发（等价于 relay-cli serve）
@@ -89,7 +89,7 @@ func newServeFlags(c *relayclient.Config) *flag.FlagSet {
 	fs.StringVar(&c.CaptureDir, "capture-dir", "", "采样目录：把请求体原样落盘供离线分析（留空不采）")
 	fs.IntVar(&c.CaptureN, "capture-n", c.CaptureN, "最多采样多少条")
 	fs.IntVar(&c.MaxResume, "max-resume", c.MaxResume, "断线后最大续传重试次数（0=不续传）")
-	fs.StringVar(&c.LogPath, "log", "", "逐请求日志（默认 ~/.rfc9842-reply/client-<date>.jsonl）")
+	fs.StringVar(&c.LogPath, "log", "", "逐请求日志（默认 ~/.reply9842/client-<date>.jsonl）")
 	fs.StringVar(&c.StatsPath, "stats", "", "汇总统计（默认同目录 client-stats.json）")
 	return fs
 }

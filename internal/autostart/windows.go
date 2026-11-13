@@ -3,7 +3,7 @@
 // Windows 的登录项：交给 mygo 的 HKCU Run 条目。
 //
 // 这里刻意只有两行委托——mygo v0.9.0 已经把 Windows 侧的所有细节做对了：
-//   - 值名用 App.Name()（main 里 SetName("rfc9842-reply")），写在
+//   - 值名用 App.Name()（main 里 SetName("reply9842")），写在
 //     HKCU\Software\Microsoft\Windows\CurrentVersion\Run 下
 //   - 数据是 `"<绝对路径>" --mygo-opened-at-login`（路径经过符号链接解析并加引号）
 //   - OpenAtLogin 只有在该值与当前可执行文件一致、且 StartupApproved 没标记为

@@ -1,4 +1,4 @@
-# rfc9842-reply — 交叉编译入口
+# reply9842 — 交叉编译入口
 #
 # 设计（2026-11-13 kzf 需求：CLI 全平台 + GUI darwin/windows）：
 #   - 纯 Go、CGO_ENABLED=0，任何机器都能编出所有平台的产物

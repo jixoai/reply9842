@@ -1,4 +1,4 @@
-// relay-gui — rfc9842-reply 客户端的图形界面（mygo native UI + solid-glass 材质）
+// relay-gui — reply9842 客户端的图形界面（mygo native UI + solid-glass 材质）
 //
 // 产品形态（2026-11-13 kzf 需求「托盘才是本体，窗口可以随时关闭」）：
 //
@@ -38,10 +38,10 @@ import (
 	"github.com/egoist/mygo"
 	"github.com/egoist/mygo/ui"
 
-	"github.com/jixoai/rfc9842-reply/internal/autostart"
-	"github.com/jixoai/rfc9842-reply/internal/glass"
-	"github.com/jixoai/rfc9842-reply/internal/relayclient"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
+	"github.com/jixoai/reply9842/internal/autostart"
+	"github.com/jixoai/reply9842/internal/glass"
+	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/stats"
 )
 
 // version 由 -ldflags "-X main.version=..." 注入
@@ -105,7 +105,11 @@ type app struct {
 	// 每次切换都写 OS 再读回，界面只显示 OS 的实际状态。
 	autoStart bool
 
-	// 最近一次统计快照（每秒刷新）
+	// 最近一次统计快照（每秒刷新）。
+	//
+	// 这份数据的事实来源是磁盘日志（stats 包在 Open 时流式重建），所以
+	// 「重启后数字还在」不需要 GUI 做任何恢复动作——它只是把一个已经算好的
+	// 视图读出来。
 	agg stats.Agg
 	// snap 统计来源。正常运行时就是 runner.Snapshot；测试与自动化截图
 	// 需要在不启监听的前提下喂数据，所以留一个可替换的接口（nil 时走 Runner）。
@@ -115,14 +119,20 @@ type app struct {
 	fakeRun *bool
 	fakeErr error
 
+	// 两个时间跨度偏好（持久化在 settings.json，重启后保持）。
+	//
+	// 用「档位下标」而不是裸 Duration 当界面状态：下拉框的可选项是固定的
+	// 6 档（relayclient.RetainOptions / WindowOptions），下标是唯一能无歧义
+	// 表达「用户选了哪一项」的形式，也让「吸附到最近档位」变成一次比较。
+	retainIdx int
+	windowIdx int
+	// settingsPath 偏好文件路径（测试可换到临时目录）
+	settingsPath string
+	// settingsErr 上次保存偏好失败的原因（nil 表示正常）
+	settingsErr error
+
 	// quitting 已进入退出流程。托盘/Dock 的「显示窗口」在退出途中不该再建窗。
 	quitting bool
-
-	// history 上一次会话的统计（从 client-stats.json 读回）。
-	//
-	// 用途只有一个：空态时告诉回访用户「上次效果如何」。新用户看不到这一行
-	// （history 为 nil），看到的是「本次会话还没有请求」。
-	history *stats.Agg
 
 	// 一次性操作反馈（复制成功/失败），与启动失败的错误分开显示，
 	// 避免同一个原因在状态区与提示行各喊一遍
@@ -144,7 +154,7 @@ func main() {
 
 	// 登录项标记必须赶在 flag.Parse 之前摘掉：--autostart 不是用户开关，
 	// 而是 launchd 告诉我们「这次是登录启动」；交给 flag 解析会变成 unknown flag。
-	openedAtLogin := takeLoginMarker()
+	openedAtLogin := loginAtLaunch()
 
 	// 允许用 flag 覆盖初值：多实例并存（换端口）、自动化截图都需要
 	// 「不改界面就能换参数」。不带参数时仍用 relayclient 的默认值。
@@ -162,13 +172,20 @@ func main() {
 	// 「启动后立即转发」）。登录项用的是双横线 --autostart，两者互不干扰。
 	startAlias := flag.Bool("autostart", false, "与 -start 相同（旧名字，保留兼容）")
 	light := flag.Bool("light", false, "使用亮色玻璃（默认深色）")
+	// 时间跨度覆盖（自动化截图、临时放大窗口用）。0 = 用 settings.json 里的值；
+	// 时间跨度覆盖（自动化截图、临时放大窗口用）。0 = 用 settings.json 里的值。
+	//
+	// 非 0 时按「最近档位」吸附（手敲 40m 不会造出第 7 档），且**只对本次运行生效**：
+	// 不写回 settings.json——截图脚本不该顺手改掉用户真实的设置页选择。
+	retain := flag.Duration("retain", 0, "本次运行的日志保留时长（覆盖设置页：30m|1h|6h|24h|168h|720h）")
+	window := flag.Duration("window", 0, "本次运行的图表显示区间（覆盖设置页：1m|5m|30m|1h|6h|24h）")
 	flag.Parse()
 	if *printVersion {
 		fmt.Printf("relay-gui %s\n", version)
 		return
 	}
 	// macOS：裸二进制没有 bundle，Dock 只会显示通用黑色方块。首次 GUI 启动时
-	// 在 ~/Applications/rfc9842-reply.app 拼出 bundle（二进制副本 + Info.plist
+	// 在 ~/Applications/reply9842.app 拼出 bundle（二进制副本 + Info.plist
 	// + 内嵌 icns），再 re-exec 副本取回图标与进程名。返回 true 表示子进程已起，
 	// 本进程应当退出。其他平台是空实现。
 	//
@@ -185,23 +202,34 @@ func main() {
 		pal = glass.Light()
 	}
 
+	// 两个时间跨度偏好：settings.json 是唯一信源（flag 只用于自动化/多实例）。
+	// 读不到就用默认值——偏好读不出来是可恢复降级，不该让 GUI 起不来。
+	settingsPath := relayclient.SettingsPath()
+	st := relayclient.LoadSettings(settingsPath)
+	if *retain != 0 {
+		st.RetainSec = int64(relayclient.RetainOptions[relayclient.OptionIndex(*retain, relayclient.RetainOptions)] / time.Second)
+	}
+	if *window != 0 {
+		st.WindowSec = int64(relayclient.WindowOptions[relayclient.OptionIndex(*window, relayclient.WindowOptions)] / time.Second)
+	}
+	st.Normalize()
+	cfg.Retain, cfg.Window = st.Retain(), st.Window()
+
 	a := &app{
-		logs:       logRing,
-		listen:     cfg.Listen,
-		server:     cfg.Server,
-		transport:  cfg.Transport,
-		serverName: cfg.ServerName,
-		insecure:   cfg.Insecure,
-		pal:        pal,
+		logs:         logRing,
+		listen:       cfg.Listen,
+		server:       cfg.Server,
+		transport:    cfg.Transport,
+		serverName:   cfg.ServerName,
+		insecure:     cfg.Insecure,
+		pal:          pal,
+		retainIdx:    relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
+		windowIdx:    relayclient.OptionIndex(st.Window(), relayclient.WindowOptions),
+		settingsPath: settingsPath,
 	}
 	a.runner = relayclient.New(cfg)
 	a.runner.SetLogger(logger)
 	a.runner.OnEvent = a.onRunnerEvent
-	// 上次会话的成绩：只有「本次会话还没有请求」时才会显示，用来回答
-	// 回访用户最关心的问题（上次到底省了多少）。
-	if prev, err := stats.ReadAgg(cfg.StatsPath); err == nil && prev != nil && prev.Requests > 0 {
-		a.history = prev
-	}
 	// 开机自启的初值来自 OS（不是我们的配置）：用户可能在系统设置里改过
 	if autostart.Available() {
 		if on, err := autostart.Open(); err == nil {
@@ -211,7 +239,7 @@ func main() {
 
 	// SetName 必须早于 RequestSingleInstanceLock：单实例锁、Windows 的 Run
 	// 值、用户数据目录都按这个名字派生，改名的代价是全部错位。
-	mygo.App.SetName("rfc9842-reply")
+	mygo.App.SetName("reply9842")
 
 	// 单实例：第二次启动把 argv 交给第一个实例然后退出。
 	// 于是「再点一次图标」= 把已有窗口叫到前面，而不是起第二个服务抢端口。
@@ -286,6 +314,23 @@ func main() {
 	}
 }
 
+// envLogin 把「本次是登录启动」这个事实传给 bundle 副本。
+//
+// 为什么必须用环境变量：macOS 上裸二进制会先 relaunch 进 ~/Applications 的
+// .app（见 bundle_darwin.go），而那次 re-exec 只转发 os.Args——argv 里的
+// --autostart 已经被 takeLoginMarker 摘掉了。结果就是「登录启动」这个事实在
+// 交接时丢失，副本以为自己是普通启动，照样弹出一个窗口（实测如此）。
+// 环境变量随 exec 继承，正好补上这条缝。
+const envLogin = "RFC9842_OPENED_AT_LOGIN"
+
+// loginAtLaunch 报告本次是否由登录项拉起（argv 或环境变量任一为真）。
+func loginAtLaunch() bool {
+	if os.Getenv(envLogin) == "1" {
+		return true
+	}
+	return takeLoginMarker()
+}
+
 // takeLoginMarker 从 os.Args 里摘掉登录项标记，并报告本次是否来自登录启动。
 //
 // 只认双横线的 `--autostart`：它与用户可见的 `-autostart`（"启动后立即转发"
@@ -304,6 +349,10 @@ func takeLoginMarker() bool {
 		args = append(args, arg)
 	}
 	os.Args = args
+	if found {
+		// 传下去给可能的 bundle 副本
+		os.Setenv(envLogin, "1")
+	}
 	return found
 }
 
@@ -391,7 +440,7 @@ func (a *app) showWindow() {
 // createWindow 建面板窗口。主线程调用。
 func (a *app) createWindow() {
 	win := mygo.NewWindow(mygo.WindowOptions{
-		Title: "rfc9842-reply",
+		Title: "reply9842",
 		// 480×400。实测（TestSnapshotFrames 的 480×480 帧 + 元素矩形）：
 		// 面板 tab 运行态到「复制」底边约 355px，空态约 235px，设置 tab
 		// （含运行中的提示行）约 290px。400 让三种状态都一屏放下，且空态
@@ -497,6 +546,52 @@ func (a *app) copyEnv() {
 	line := "export ANTHROPIC_BASE_URL=" + a.localURL()
 	mygo.Clipboard.WriteText(line)
 	a.setNotice("已复制："+line, false)
+}
+
+// applyTimeSettings 把两个下拉的选择写盘并立刻生效。
+//
+// 顺序：先收敛约束 → 写文件 → 通知 Runner 重算。
+// 为什么写盘失败也要继续重算：设置在本进程内已经生效，只是下次启动会退回
+// 旧值；把「这次也白点了」一起惩罚用户没有意义。失败用提示行说明。
+//
+// 约束在这里集中处理（而不是在下拉的行里）：save/reload 也走这条路径，
+// 任何入口都必须得到同一个合法组合。
+func (a *app) applyTimeSettings() {
+	retain := relayclient.RetainOptions[clampIndex(a.retainIdx, len(relayclient.RetainOptions))]
+	window := relayclient.WindowOptions[clampIndex(a.windowIdx, len(relayclient.WindowOptions))]
+
+	// 硬约束：显示区间不超过保留时长。超了就把显示区间压到保留时长所在的档位，
+	// 并同步下拉的选中项——否则界面上那个选项看起来是「选中的但没生效」。
+	if window > retain {
+		window = retain
+		a.windowIdx = relayclient.OptionIndex(window, relayclient.WindowOptions)
+		a.setNotice("显示区间不能超过日志保留时长（"+humanWindow(int(retain/time.Second))+"），已按上限设置", true)
+	}
+
+	a.settingsErr = relayclient.SaveSettings(a.settingsPath, relayclient.Settings{
+		RetainSec: int64(retain / time.Second),
+		WindowSec: int64(window / time.Second),
+	})
+	if a.settingsErr != nil {
+		a.setNotice("保存设置失败："+a.settingsErr.Error(), true)
+	}
+
+	if err := a.runner.SetStatsSettings(retain, window); err != nil {
+		a.setNotice("统计重建失败："+err.Error(), true)
+		return
+	}
+	a.invalidate()
+}
+
+// clampIndex 把下标夹进 [0, n)，防越界（下拉项被裁剪时不至于 panic）
+func clampIndex(i, n int) int {
+	if i < 0 {
+		return 0
+	}
+	if i >= n {
+		return n - 1
+	}
+	return i
 }
 
 // applyAutostart 把开关写进操作系统，再把 OS 的真实状态读回来。

@@ -20,7 +20,7 @@ import "errors"
 const (
 	// ID 是这个应用在系统里的登录项标识：macOS 的 LaunchAgent label，
 	// Windows 注册表值名（mygo 用 App.Name()，与这里保持同一个字符串）。
-	ID = "dev.jixoai.rfc9842-reply"
+	ID = "dev.jixoai.reply9842"
 
 	// Marker 是「本次启动来自登录项」的命令行参数。
 	//

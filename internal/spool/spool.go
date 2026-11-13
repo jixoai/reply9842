@@ -13,7 +13,7 @@
 //	迁移必须由「上游结束」也触发，不能只由「客户端断开」触发。原实现只在
 //	Detach 里 rename，而正常请求（客户端全程在线）从来不走 Detach，于是完成的
 //	响应永远留在 tmp/：既进不了幂等区、也不被 restartIdem 扫到，重启即丢。
-//	线上实证：/var/lib/rfc9842-reply/spool/{tmp,idem} 中 idem 为空，三个已完成
+//	线上实证：/var/lib/reply9842/spool/{tmp,idem} 中 idem 为空，三个已完成
 //	响应全躺在 tmp/。
 //
 // 持久化：每个 .dat 旁有同名 .meta sidecar，保存完整 32 字节 key 与响应头。
@@ -36,7 +36,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/downlink"
+	"github.com/jixoai/reply9842/internal/downlink"
 
 	"github.com/klauspost/compress/zstd"
 )

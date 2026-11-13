@@ -12,10 +12,10 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/clientstream"
-	"github.com/jixoai/rfc9842-reply/internal/codec"
-	"github.com/jixoai/rfc9842-reply/internal/meta"
-	"github.com/jixoai/rfc9842-reply/internal/transport"
+	"github.com/jixoai/reply9842/internal/clientstream"
+	"github.com/jixoai/reply9842/internal/codec"
+	"github.com/jixoai/reply9842/internal/meta"
+	"github.com/jixoai/reply9842/internal/transport"
 )
 
 func newKey(prefix string) [32]byte {

@@ -19,10 +19,10 @@ import (
 
 	"github.com/egoist/mygo/ui"
 
-	"github.com/jixoai/rfc9842-reply/internal/autostart"
-	"github.com/jixoai/rfc9842-reply/internal/glass"
-	"github.com/jixoai/rfc9842-reply/internal/relayclient"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
+	"github.com/jixoai/reply9842/internal/autostart"
+	"github.com/jixoai/reply9842/internal/glass"
+	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/stats"
 )
 
 // tab 索引，与 titleBar 里 ui.Tabs 的顺序一致
@@ -56,16 +56,22 @@ func (a *app) view(c *ui.Context) {
 		// 内容区的下沿，这段空白就变成「上面是主体、下面是动作」的结构，
 		// 而不是漏画的区域。
 		ui.Column(c).Grow(1).Children(func() {
-			ui.Scroll(c).Grow(1).Children(func() {
-				ui.Column(c).Padding(16, 16, 10).Gap(10).Children(func() {
-					if a.tab == tabSettings {
+			// 面板 tab 用 Column(Grow) 而不是 Scroll：图表要占满窗口剩下的高度
+			// （用户把窗口拉大时，该变高的是图，不是空白）。设置 tab 用 Scroll——
+			// 它的内容高度固定，窗口太矮时宁可滚也不能把「开机自启」切掉。
+			if a.tab == tabSettings {
+				ui.Scroll(c).Grow(1).Children(func() {
+					ui.Column(c).Padding(16, 16, 10).Gap(10).Children(func() {
 						a.settingsPane(c, p)
-					} else {
-						a.panelPane(c, p)
-					}
+						a.noticeLine(c, p)
+					})
+				})
+			} else {
+				ui.Column(c).Grow(1).Padding(16, 16, 10).Gap(10).Children(func() {
+					a.panelPane(c, p)
 					a.noticeLine(c, p)
 				})
-			})
+			}
 			a.footerPane(c, p)
 		})
 		a.footer(c, p)
@@ -102,7 +108,7 @@ func (a *app) titleBar(c *ui.Context, p *glass.Palette) {
 				}
 			})
 
-			ui.Text(c, "rfc9842-reply").FontSize(12.5).FontWeight(590).
+			ui.Text(c, "reply9842").FontSize(12.5).FontWeight(590).
 				LetterSpacing(0.06).TextColor(p.Foreground).SingleLine()
 			ui.Box(c).Grow(1)
 
@@ -142,6 +148,7 @@ func (a *app) portBadge(c *ui.Context, p *glass.Palette) {
 // panelPane 「面板」tab 的全部内容
 func (a *app) panelPane(c *ui.Context, p *glass.Palette) {
 	a.statusRow(c, p)
+	// 图表卡片吃掉剩余高度：窗口拉高时变高的是图，不是底部空白。
 	a.chartCard(c, p)
 }
 
@@ -243,7 +250,14 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 	running := a.running()
 	hasData := a.hasSeries()
 
-	glass.Surface(ui.Column(c).Padding(12, 14, 12).Gap(8), p, glass.Card).Children(func() {
+	card := ui.Column(c).Padding(12, 14, 12).Gap(8)
+	if hasData {
+		// 有数据时卡片吃掉剩余高度（窗口拉高 → 图变高，而不是底部留空）。
+		// 空态不吃：把一句引导泡在半个屏幕的空白里比留白更难看。
+		card = card.Grow(1)
+	}
+
+	glass.Surface(card, p, glass.Card).Children(func() {
 		// 头部：标题 + 图例 + live 徽标。
 		// 图例只在有柱子时出现——空态下「■省下 ■实发」在解释一个不存在的东西。
 		ui.Row(c).AlignItems(ui.Center).Gap(10).Children(func() {
@@ -258,9 +272,8 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 		if !hasData {
 			// 空态不画坐标系：一副空坐标轴会被读成「图表坏了」，
 			// 而「启动代理后…」本身就是准确的说明。
-			// 高度只给 56 而不是 chartHeight：空态撑满 132px 只是把一句
-			// 引导泡在一大片空白里，反而显得没画完。
-			ui.Box(c).Height(56).FillWidth().AlignItems(ui.Center).
+			// 空态不撑满（52 就够）：把一句引导泡在一大片空白里反而显得没画完。
+			ui.Box(c).Height(52).FillWidth().AlignItems(ui.Center).
 				Justify(ui.Center).Children(func() {
 				ui.Text(c, a.emptyChartNote()).FontSize(11.5).
 					TextColor(p.MutedForeground).SingleLine()
@@ -274,9 +287,11 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 	})
 }
 
-// chartHeight 绘图区高度（DIPs）。130 让 5% 的差异也有 6px 可读高度，
-// 又不至于把窗口顶到需要滚动。
-const chartHeight float32 = 132
+// chartMinHeight 绘图区的最小高度（DIPs）。
+//
+// 图上柱高表达压缩率，太矮时 5% 的差异只剩 2-3px、读不出来。110 是
+// 「25% 刻度间隔 27px」的下限：再矮，四档刻度就会与柱顶互相挤压。
+const chartMinHeight float32 = 110
 
 // 图表配色。绿 = 省下的（赚到的），蓝 = 实际发出去的（花掉的）。
 //
@@ -314,11 +329,24 @@ func (a *app) hasSeries() bool {
 	return false
 }
 
-// emptyChartNote 空态在图上说什么：分清「没启动」与「启动了但还没请求」。
-// 两者对用户的下一步完全不同（启动 / 去用 Agent）。
+// emptyChartNote 空态在图上说什么。
+//
+// 三种情况必须分开说，因为它们对用户的下一步完全不同：
+//
+//	没启动              → 启动代理
+//	启动了、历史也没有   → 去用 Agent（这才是第一次）
+//	启动了、历史有数据   → 这段时间没流量（不是统计丢了）
+//
+// 第三种是 2026-11-13 加小窗口（1 分钟）后暴露的：统计从磁盘恢复，历史里有
+// 上千条请求，但「最近 1 分钟」为空完全正常。此时说「等待第一个请求」会让
+// 用户以为历史数据没了。
 func (a *app) emptyChartNote() string {
 	if !a.running() {
-		return "启动代理后，这里显示每秒的上行体积与压缩效果"
+		return "启动代理后，这里显示上行体积与压缩效果"
+	}
+	if a.agg.Requests > 0 {
+		return fmt.Sprintf("最近 %s没有请求（调大显示区间可看更早的数据）",
+			humanWindow(int(a.agg.WindowSec)))
 	}
 	return "等待第一个请求经过本地代理"
 }
@@ -362,7 +390,10 @@ func (a *app) legendSwatch(c *ui.Context, col ui.Color, label string) {
 //	绿段  = 剩下的都是省下的
 func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 	series := a.agg.Series
-	plot := ui.Row(c).Height(chartHeight).FillWidth().AlignItems(ui.Stretch).Gap(6)
+	// 绘图区吃掉卡片里的剩余高度，但有下限：窗口被拉到最小高度时
+	// 图仍有 chartMinHeight，不至于压成一条线（此时由外层 Scroll 兜底）。
+	plot := ui.Row(c).Grow(1).MinHeight(chartMinHeight).FillWidth().
+		AlignItems(ui.Stretch).Gap(6)
 
 	plot.Children(func() {
 		// 纵轴刻度：0/25/50/75/100%。五档是因为柱高直接读作百分数，
@@ -439,9 +470,9 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 
 // chartSummary 图下方那行文字：图给比例，文字给绝对值，各司其职。
 //
-// 统计窗口固定为 SeriesSeconds（60）。用「最近 60 秒」而不是「本次会话」：
-// 图上的柱子就是这 60 秒，文字与图必须说的是同一段时间，否则用户会把两个
-// 数字当成同一件事的两个说法。
+// 窗口与粒度都从快照里取（WindowSec / BucketSec），不写死：用户切了显示区间，
+// 这句话必须跟着说「最近 6 小时（每 12 分钟一柱）」，否则文字和图说的就不是
+// 同一段时间——那比没有这句话更糟。
 func (a *app) chartSummary(g stats.Agg) string {
 	var raw, wire int64
 	var n int64
@@ -454,17 +485,31 @@ func (a *app) chartSummary(g stats.Agg) string {
 		return a.emptyChartNote()
 	}
 	saved := 1 - float64(wire)/float64(raw)
-	return fmt.Sprintf("最近 %s：原始 %s · 实际发送 %s · 省下 %.1f%%（%s 次请求）",
-		humanWindow(stats.SeriesSeconds),
-		humanBytes(raw), humanBytes(wire), saved*100, groupDigits(n))
+	span := int(g.WindowSec)
+	if span <= 0 {
+		span = int(stats.DefaultWindow / time.Second)
+	}
+	text := fmt.Sprintf("最近 %s：原始 %s · 实际发送 %s · 省下 %.1f%%（%s 次请求）",
+		humanWindow(span), humanBytes(raw), humanBytes(wire), saved*100, groupDigits(n))
+	if g.BucketSec > 0 {
+		text += "（每 " + humanWindow(int(g.BucketSec)) + "一柱）"
+	}
+	return text
 }
 
 // humanWindow 把秒数说成人话（1800 → "30 分钟"）。
 //
-// 为什么不直接写「1800 秒」：图上每根柱子是一分钟，「30 分钟」让读者能
+// 为什么不直接写「1800 秒」：图上每根柱子是一个时间桶，「30 分钟」让读者能
 // 把「30 根柱子」和「30 分钟」对起来；「1800 秒」需要先做一次除法。
+//
+// 天这一档只在**超过** 24 小时时启用：24 小时是用户心里的「一天」也是
+// 「这个窗口」，保留 24 小时档写作「24 小时」比「1 天」更贴合设置页的语义。
 func humanWindow(seconds int) string {
 	switch {
+	case seconds <= 0:
+		return "0 秒"
+	case seconds > 24*3600 && seconds%(24*3600) == 0:
+		return fmt.Sprintf("%d 天", seconds/(24*3600))
 	case seconds%3600 == 0:
 		return fmt.Sprintf("%d 小时", seconds/3600)
 	case seconds%60 == 0:
@@ -528,29 +573,19 @@ func (a *app) footerPane(c *ui.Context, p *glass.Palette) {
 
 // statsLine 三格统计的一行写法。
 //
-// 会话累计（不是最近一分钟）：图表说的是最近 60 秒，这一行说的是本次会话，
-// 前缀分别写明「最近 60 秒」与「本次会话」，避免两个数字被当成同一件事。
+// 口径从「本次会话」改成「近 N 小时」：统计自 2026-11-13 起从磁盘日志重建，
+// 重启不清零，所以「本次会话」已经名不副实。前缀写明保留期，让这一行的
+// 时间跨度可见——它和图上方那段窗口是两件不同的事，必须各自说清。
 func (a *app) statsLine(g stats.Agg, saved int64) string {
 	if g.Requests == 0 {
-		// 没跑过的新用户：给上次会话的成绩（如果有），否则给一句引导
-		if a.history != nil && a.history.Requests > 0 {
-			return a.historyLine(a.history)
-		}
-		return "本次会话还没有请求"
+		return "还没有请求记录（启动代理后开始统计）"
 	}
-	return fmt.Sprintf("本次会话 %s 请求 · 节省 %s · p50 %d ms",
-		groupDigits(g.Requests), humanBytes(saved), g.P50Ms)
-}
-
-// historyLine 上一次会话的成绩。回访用户最想知道「上次效果如何」，
-// 空态只说「还没有请求」等于把最有用的信息藏起来了。
-func (a *app) historyLine(h *stats.Agg) string {
-	saved := h.UpRaw - h.UpWire
-	if saved < 0 {
-		saved = 0
+	retain := int(g.RetainSec)
+	if retain <= 0 {
+		retain = int(stats.DefaultRetain / time.Second)
 	}
-	return fmt.Sprintf("上次会话 %s 请求 · 节省 %s",
-		groupDigits(h.Requests), humanBytes(saved))
+	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %d ms",
+		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), g.P50Ms)
 }
 
 // actionButton 一个套了 solid-glass 边光的按钮。
@@ -596,10 +631,13 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 
 // ---- 设置 tab ----
 
-// settingsPane 「设置」tab：上游 / 监听 / 传输方式 / 开机自启。
+// settingsPane 「设置」tab：连接配置（上游 / 监听 / 传输方式 / 开机自启）
+// + 统计显示（日志保留 / 显示区间）。
 //
-// 取代原来可折叠的配置区：折叠区的两层交易（标题行 + 展开面板）在小窗口里
-// 要么挤、要么被裁；改成 tab 后主面板不必滚动，设置也不必。
+// 拆成两张卡（2026-11-13）：上一版把它们塞进同一张卡，于是「运行中不可修改」
+// 那句提示横跨两张内容——可两个时间跨度根本不碰监听，运行中改它们完全安全
+// （只影响读盘范围与分桶粒度）。一张卡会逼出一个错误的全局约束，两张卡各自
+// 说自己的前置条件才准确。
 func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 	running := a.running()
 
@@ -623,6 +661,81 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 			}
 		})
 	}
+
+	// 统计显示：与监听无关，运行中随时可改（改完立刻按新范围重算）
+	glass.Surface(ui.Column(c).Padding(4, 14, 8), p, glass.Card).Children(func() {
+		a.retainRow(c, p)
+		a.configRule(c, p)
+		a.windowRow(c, p)
+	})
+}
+
+// retainRow 日志保留时长：磁盘上留多久的数据（同时决定重启重建的扫描范围）。
+func (a *app) retainRow(c *ui.Context, p *glass.Palette) {
+	labels := humanOptions(relayclient.RetainOptions)
+	idx := clampIndex(a.retainIdx, len(labels))
+	sel := labels[idx]
+
+	a.timeRow(c, p, "日志保留", &sel, labels, "保留多久就占多少空间")
+	// Select 直接改 sel：值变了就说明用户选了别的档位。
+	if sel != labels[idx] {
+		a.retainIdx = indexOf(labels, sel)
+		a.applyTimeSettings()
+	}
+}
+
+// windowRow 图表显示区间：柱状图横轴跨度（每桶粒度由它派生）。
+//
+// 「不超过保留时长」这个约束不在这里判断，统一由 applyTimeSettings 兜住：
+// 从下拉选、从 settings.json 读、从 flag 覆盖，三条入口都必须得到同一个
+// 合法组合，分散判断必然有一条会漏。
+func (a *app) windowRow(c *ui.Context, p *glass.Palette) {
+	labels := humanOptions(relayclient.WindowOptions)
+	idx := clampIndex(a.windowIdx, len(labels))
+	sel := labels[idx]
+
+	a.timeRow(c, p, "显示区间", &sel, labels, "图横轴的跨度")
+	if sel != labels[idx] {
+		a.windowIdx = indexOf(labels, sel)
+		a.applyTimeSettings()
+	}
+}
+
+// timeRow 一行「标签 + 下拉 + 说明」
+// timeRow 一行「标签 + 下拉 + 说明」。
+//
+// 宽度是量出来的，不是拍的：Select 有自己的最小内在宽度（最长档位 "30 分钟"
+// 加右侧箭头约 130px），给它一个比这更小的盒子它会溢出到相邻的说明文字上
+// （实测 104 宽时右边框压住提示文字）。这里给 132 并让说明只占剩下的空间。
+func (a *app) timeRow(c *ui.Context, p *glass.Palette, label string, val *string, options []string, hint string) {
+	ui.Row(c).Padding(8, 0).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Box(c).Width(84).Shrink(0).Children(func() {
+			ui.Text(c, label).FontSize(11).TextColor(p.MutedForeground).SingleLine()
+		})
+		ui.Box(c).Width(132).Shrink(0).Children(func() {
+			ui.Select(c, val, options).FontSize(11).Height(28)
+		})
+		ui.Text(c, hint).FontSize(10.5).TextColor(p.Tertiary).MaxLines(1).Grow(1)
+	})
+}
+
+// humanOptions 把档位列表转成下拉里的显示文案（30 分钟 / 7 天）
+func humanOptions(opts []time.Duration) []string {
+	out := make([]string, len(opts))
+	for i, d := range opts {
+		out[i] = humanWindow(int(d / time.Second))
+	}
+	return out
+}
+
+// indexOf 在下拉文案里找下标（找不到时回 0，防越界）
+func indexOf(labels []string, s string) int {
+	for i, l := range labels {
+		if l == s {
+			return i
+		}
+	}
+	return 0
 }
 
 // configRule 设置行之间的发丝线
@@ -718,8 +831,12 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 		ui.Textf(c, "%s · %s", state, a.transportLabel()).
 			FontSize(10.5).TextColor(p.Tertiary).SingleLine()
 		ui.Box(c).Grow(1)
-		ui.Textf(c, "v%s", version).FontSize(9.5).
-			Font("monospace").TextColor(p.Tertiary).SingleLine()
+		// 用 displayVersion 统一（注入源有的带 v 有的不带），且开发构建
+		// （"dev"）不显示版本号——"vdev" 对用户零信息量，只会被读成异常。
+		if v := displayVersion(version); v != "" {
+			ui.Text(c, v).FontSize(9.5).
+				Font("monospace").TextColor(p.Tertiary).SingleLine()
+		}
 	})
 }
 

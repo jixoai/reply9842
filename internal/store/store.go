@@ -14,7 +14,7 @@ import (
 	"container/list"
 	"sync"
 
-	"github.com/jixoai/rfc9842-reply/internal/codec"
+	"github.com/jixoai/reply9842/internal/codec"
 )
 
 // Store 内容寻址字节上限 LRU

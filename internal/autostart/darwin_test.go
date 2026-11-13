@@ -123,7 +123,7 @@ func TestOpenRejectsCorrupt(t *testing.T) {
 		"Label 不对":    `<plist version="1.0"><dict><key>Label</key><string>other</string></dict></plist>`,
 		"只有一项参数":      `<plist version="1.0"><dict><key>Label</key><string>` + label + `</string><key>ProgramArguments</key><array><string>/x</string></array></dict></plist>`,
 		"标记不对":        `<plist version="1.0"><dict><key>Label</key><string>` + label + `</string><key>ProgramArguments</key><array><string>/x</string><string>--other</string></array></dict></plist>`,
-		"路径指向不存在的二进制": `<plist version="1.0"><dict><key>Label</key><string>` + label + `</string><key>ProgramArguments</key><array><string>/nonexistent/rfc9842-reply</string><string>` + Marker + `</string></array></dict></plist>`,
+		"路径指向不存在的二进制": `<plist version="1.0"><dict><key>Label</key><string>` + label + `</string><key>ProgramArguments</key><array><string>/nonexistent/reply9842</string><string>` + Marker + `</string></array></dict></plist>`,
 	}
 	for name, body := range cases {
 		t.Run(name, func(t *testing.T) {

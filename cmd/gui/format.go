@@ -48,10 +48,16 @@ func humanDuration(d time.Duration) string {
 // 注入源有两套口径：Makefile 用 `patsubst v%,%` 去掉了 v，GitHub release
 // workflow 直接传 `git describe` 的输出（含 v）。所以这里不能假设有没有，
 // 必须先归一——否则界面会显示成 "vv0.9.1"。
+//
+// 开发构建（"dev"、"dev-dirty"）返回空串：界面据此不画这一项。
+// 给用户看 "vdev" 没有意义，而它出现在发布版里只说明构建流水线漏了注入。
 func displayVersion(v string) string {
 	v = strings.TrimSpace(v)
 	if v == "" {
 		return "v?"
+	}
+	if v == "dev" || strings.HasPrefix(v, "dev-") {
+		return ""
 	}
 	return "v" + strings.TrimPrefix(v, "v")
 }

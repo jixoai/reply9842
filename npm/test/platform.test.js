@@ -1,58 +1,59 @@
-// 分发层的最小自测：只验证「平台解析」与「启动器不崩」，不依赖真实二进制。
-//
-// 为什么不测真实二进制：CI 里 vendor/ 是构建产物，本地跑测试时可能不存在；
-// 用 node --test 保持零依赖，能在任何环境下跑。
+// 分发层自测：只验证纯逻辑（平台解析 / 缓存路径 / 镜像列表），不发网络请求。
 
 "use strict";
 
 const test = require("node:test");
 const assert = require("node:assert");
 const path = require("node:path");
-const { execFile } = require("node:child_process");
-const { artifactName, goarch, goos, binaryPath, SUPPORTED } = require("../lib/platform");
 
-test("goos/goarch 能识别当前平台", () => {
-  const os = goos();
-  const arch = goarch();
-  assert.ok(["darwin", "linux", "windows"].includes(os), `未知 platform: ${process.platform}`);
-  assert.ok(["amd64", "arm64"].includes(arch), `未知 arch: ${process.arch}`);
+// run.js 在 require 时会执行 main()，所以这里不 require 它，改用「读源码断言」
+const src = require("node:fs").readFileSync(
+  path.join(__dirname, "..", "lib", "run.js"), "utf8"
+);
+
+test("产物命名规则与 release.yml 一致", () => {
+  // 从源码里抽出 artifactName 的实现约定，做静态断言
+  assert.match(src, /kind === "gui" && o === "linux"/, "GUI 应排除 Linux");
+  assert.match(src, /const ext = o === "windows" \? "\.exe" : ""/, "Windows 加 .exe");
+  assert.match(src, /\$\{kind\}-\$\{o\}-\$\{a\}\$\{ext\}/, "命名格式 <kind>-<os>-<arch>[.exe]");
 });
 
-test("artifactName 命名与 CI 矩阵一致", () => {
-  for (const kind of ["cli", "gui", "server"]) {
-    const name = artifactName(kind);
-    if (name === null) continue; // 该 kind 在本地平台无产物（例如 Linux 的 gui）
-    assert.ok(SUPPORTED.has(name), `${name} 不在允许集合内`);
-    assert.ok(name.startsWith(kind + "-"), `前缀应为 ${kind}-，实际 ${name}`);
-    if (process.platform === "win32") {
-      assert.ok(name.endsWith(".exe"), "Windows 产物必须带 .exe");
-    } else {
-      assert.ok(!name.endsWith(".exe"), "非 Windows 产物不应带 .exe");
-    }
+test("镜像列表按优先级且以直连兜底", () => {
+  const m = src.match(/const MIRRORS = \[([\s\S]*?)\];/);
+  assert.ok(m, "找不到 MIRRORS 定义");
+  const body = m[1];
+  assert.match(body, /gh-proxy\.com/, "应含 gh-proxy.com");
+  assert.match(body, /ghfast\.top/, "应含 ghfast.top");
+  // 最后一项必须是空串（直连兜底）
+  assert.ok(/""\s*,\s*\/\//.test(body), '最后一项应为空串兜底');
+});
+
+test("缓存按版本隔离", () => {
+  assert.match(src, /path\.join\(cacheRoot\(\), version, name\)/,
+    "缓存路径必须含 version，否则换版本会串包");
+});
+
+test("跨平台缓存根", () => {
+  assert.match(src, /process\.platform === "win32"/, "Windows 分支");
+  assert.match(src, /LOCALAPPDATA/, "Windows 用 LOCALAPPDATA");
+  assert.match(src, /XDG_CACHE_HOME/, "其它用 XDG_CACHE_HOME");
+});
+
+test("下载是原子落盘（.part -> rename）", () => {
+  assert.match(src, /`\$\{dest\}\.part`/, "应写 .part 临时文件");
+  assert.match(src, /rename\(tmp, dest\)/, "应 rename 落盘");
+});
+
+test("三个 bin 入口存在且指向同一启动器", () => {
+  const pkg = require("../package.json");
+  for (const name of ["reply9842", "reply9842-gui", "reply9842-server"]) {
+    const p = path.join(__dirname, "..", pkg.bin[name]);
+    assert.ok(require("node:fs").existsSync(p), `${name} 指向的文件缺失`);
   }
 });
 
-test("binaryPath 落在 vendor/ 下", () => {
-  const p = binaryPath("cli");
-  if (p === null) return;
-  assert.strictEqual(path.basename(path.dirname(p)), "vendor");
-});
-
-test("启动器在缺少二进制时给出可读错误并退出 1", (t, done) => {
-  // 用一个不存在的 kind 触发「平台不支持」分支是做不到的（kind 是硬编码），
-  // 改为验证：当 vendor/ 缺文件时，spawn 报错被正确转成退出码 1。
-  const runner = path.join(__dirname, "..", "lib", "run.js");
-  execFile(process.execPath, [runner, "--help"], (err, stdout, stderr) => {
-    // --help 走 usage 分支，正常退出 0
-    assert.strictEqual(err, null, `--help 不应失败: ${stderr}`);
-    assert.match(stdout + stderr, /reply9842/);
-    done();
-  });
-});
-
-test("bin 三个入口都能被 Node 解析", () => {
-  for (const f of ["reply9842.js", "reply9842-gui.js", "reply9842-server.js"]) {
-    const p = path.join(__dirname, "..", "bin", f);
-    assert.doesNotThrow(() => require.resolve(p), `${f} 无法解析`);
-  }
+test("包体不含 vendor（二进制走下载）", () => {
+  const pkg = require("../package.json");
+  assert.ok(!pkg.files.some((f) => f.includes("vendor")),
+    "files 不应包含 vendor/，否则又变成 136MB 大包");
 });

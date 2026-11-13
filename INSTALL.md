@@ -20,10 +20,10 @@
 
 ```bash
 # 命令行版
-go install github.com/jixoai/rfc9842-reply/cmd/cli@latest
+go install github.com/jixoai/reply9842/cmd/cli@latest
 
 # 图形界面版
-go install github.com/jixoai/rfc9842-reply/cmd/gui@latest
+go install github.com/jixoai/reply9842/cmd/gui@latest
 ```
 
 安装后二进制落在 `$(go env GOPATH)/bin`（通常是 `~/go/bin`），确认它在 `PATH` 里：
@@ -54,7 +54,7 @@ Release 里的 Windows 产物另外用 `-H=windowsgui` 链接（`go build` 可�
 
 ## 二、下载预编译二进制
 
-见 [Releases](https://github.com/jixoai/rfc9842-reply/releases) 页面的 Assets。
+见 [Releases](https://github.com/jixoai/reply9842/releases) 页面的 Assets。
 
 | 文件 | 平台 |
 |---|---|
@@ -85,16 +85,16 @@ chmod +x ./relay-gui-darwin-arm64
 
 `relay-cli` 同理。
 
-首次启动 GUI 时，程序会在 `~/Applications/rfc9842-reply.app` 现场拼一个最小
+首次启动 GUI 时，程序会在 `~/Applications/reply9842.app` 现场拼一个最小
 app bundle（当前二进制的副本 + `Info.plist` + 内嵌图标），然后 re-exec 副本。
 这一步只为了 Dock 身份——裸 Mach-O 没有 bundle，Dock 里会是通用黑色 exec 方块、
-进程名是文件名。完成后 Dock、Cmd-Tab 与应用菜单都显示 `rfc9842-reply` 和正确图标。
+进程名是文件名。完成后 Dock、Cmd-Tab 与应用菜单都显示 `reply9842` 和正确图标。
 
 要点：
 
 - 产物仍是**一个可执行文件**；bundle 是运行时在你自己磁盘上生成的，不参与分发。
 - 重复启动不会重写任何文件（内容没变就跳过）。
-- 卸载：退出应用后删掉 `~/Applications/rfc9842-reply.app` 即可。
+- 卸载：退出应用后删掉 `~/Applications/reply9842.app` 即可。
 - 想跳过：设 `RFC9842_BUNDLED=1` 直接跑裸二进制（图标会退化成通用样式）。
 
 Windows 侧的图标与版本信息编在 PE 资源段里，双击即用，无需额外步骤。
@@ -104,8 +104,8 @@ Windows 侧的图标与版本信息编在 PE 资源段里，双击即用，无�
 ## 三、从源码构建
 
 ```bash
-git clone https://github.com/jixoai/rfc9842-reply
-cd rfc9842-reply
+git clone https://github.com/jixoai/reply9842
+cd reply9842
 
 make build          # 当前平台，产物到 bin/
 make dist           # 全平台，产物到 dist/（命名与 Releases 一致）
@@ -232,10 +232,10 @@ export OPENAI_BASE_URL=http://127.0.0.1:18899/v1
 
 ## 六、目录与文件
 
-运行时数据都在 `~/.rfc9842-reply/`：
+运行时数据都在 `~/.reply9842/`：
 
 ```
-~/.rfc9842-reply/
+~/.reply9842/
 ├── client-<date>.jsonl      逐请求追加日志（jq 直读）
 └── client-stats.json        汇总快照（每次请求后覆盖写）
 ```
@@ -256,7 +256,7 @@ GUI 读的是进程内快照（`stats.Collector.Snapshot()`）。
 
 **`relay-cli status` 报「还没有统计数据」**
 说明这个路径下还没有进程写过统计。先确认 `-stats` 指向同一文件（默认都在
-`~/.rfc9842-reply/`）。
+`~/.reply9842/`）。
 
 **GUI 在 Linux 上没有产物**
 这是有意的：native UI 的 Linux 后端依赖 GTK3，而本项目的 GUI 只面向 macOS 与

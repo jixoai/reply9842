@@ -7,7 +7,7 @@ import (
 	"runtime"
 	"testing"
 
-	"github.com/jixoai/rfc9842-reply/internal/downlink"
+	"github.com/jixoai/reply9842/internal/downlink"
 	"time"
 )
 

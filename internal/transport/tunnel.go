@@ -36,7 +36,7 @@ const (
 )
 
 // ALPN 隧道协议标识（QUIC 与 TLS 共用）
-const ALPN = "rfc9842-reply/1"
+const ALPN = "reply9842/1"
 
 // Dialer 客户端连接工厂
 type Dialer struct {

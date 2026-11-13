@@ -8,12 +8,14 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/egoist/mygo/ui"
 
-	"github.com/jixoai/rfc9842-reply/internal/glass"
-	"github.com/jixoai/rfc9842-reply/internal/relayclient"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
+	"github.com/jixoai/reply9842/internal/autostart"
+	"github.com/jixoai/reply9842/internal/glass"
+	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/stats"
 )
 
 // setRunning 让视图以「运行中」渲染（Runner 内部的 running 只有真起监听才为 true，
@@ -54,18 +56,32 @@ func desktopView(a *app) func(c *ui.Context) {
 }
 
 // newTestApp 构造一个不接磁盘、不启监听的 app，供无窗口的视图测试用。
+//
+// HOME 指向临时目录是硬要求：统计现在从磁盘重建，如果让它指向真实 HOME，
+// 测试会读到开发者自己的日志——同一份断言在不同机器上给出不同结果。
 func newTestApp(t *testing.T) *app {
 	t.Helper()
+	t.Setenv("HOME", t.TempDir())
 	cfg := relayclient.Config{}
 	cfg.Normalize()
+	// 统计与设置都落在临时 HOME 里（Config.Normalize 已经按 HOME 派生路径）
+	cfg.LogPath = filepath.Join(t.TempDir(), "client.jsonl")
+	cfg.StatsPath = filepath.Join(t.TempDir(), "client-stats.json")
 	a := &app{
 		logs:      newLogRing(50),
 		listen:    cfg.Listen,
 		server:    cfg.Server,
 		transport: cfg.Transport,
 		pal:       glass.Dark(),
+		// 偏好写进临时目录：视图测试绝不能碰用户真实的 settings.json
+		settingsPath: filepath.Join(t.TempDir(), "settings.json"),
 	}
+	a.retainIdx = relayclient.OptionIndex(relayclient.DefaultRetain, relayclient.RetainOptions)
+	a.windowIdx = relayclient.OptionIndex(relayclient.DefaultWindow, relayclient.WindowOptions)
 	a.runner = relayclient.New(cfg)
+	// 视图测试不碰真实历史：把统计来源钉死成「没有数据」，
+	// 需要数据的用例自己覆盖 a.snap。
+	a.snap = func() stats.Agg { return stats.Agg{} }
 	return a
 }
 
@@ -123,18 +139,28 @@ func TestNoEmptyTalkRow(t *testing.T) {
 	}
 }
 
-// TestVersionShownOnce 版本号只出现一次（footer）。出现两次时用户会以为是
-// 两个不同的东西。
+// TestVersionShownOnce 版本号最多出现一次（只在 footer）。
+//
+// 开发构建（version=="dev"）不显示版本号，此时出现 0 次是正确的——
+// 给用户看 "vdev" 没有意义。
 func TestVersionShownOnce(t *testing.T) {
 	a := newTestApp(t)
 	tt := ui.NewTester(a.view, 480, 400)
+	want := displayVersion(version)
 	n := 0
 	for _, s := range tt.Texts() {
-		if strings.Contains(s, displayVersion(version)) {
+		if want != "" && strings.Contains(s, want) {
 			n++
 		}
+		// 无论构建类型，titlebar 都不该出现版本
+		if strings.HasPrefix(s, "v") && strings.Contains(s, "1.1.1") {
+			t.Errorf("出现可疑版本串 %q", s)
+		}
 	}
-	if n != 1 {
+	if want == "" && n != 0 {
+		t.Errorf("dev 构建不该显示版本号，却出现 %d 次：%q", n, tt.Texts())
+	}
+	if want != "" && n != 1 {
 		t.Errorf("版本号出现 %d 次，期望 1 次：%q", n, tt.Texts())
 	}
 }
@@ -151,13 +177,13 @@ func TestPanelTabHasNoConfig(t *testing.T) {
 	}
 }
 
-// TestSettingsTab 设置 tab 有全部四个字段，且不出现面板的内容。
+// TestSettingsTab 设置 tab 有全部字段（含两个时间跨度），且不出现面板的内容。
 func TestSettingsTab(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
 	tt := ui.NewTester(a.view, 480, 400)
 
-	for _, want := range []string{"上游地址", "监听地址", "传输方式"} {
+	for _, want := range []string{"上游地址", "监听地址", "传输方式", "日志保留", "显示区间"} {
 		if !tt.HasText(want) {
 			t.Errorf("设置 tab 缺少 %q：%q", want, tt.Texts())
 		}
@@ -165,6 +191,102 @@ func TestSettingsTab(t *testing.T) {
 	// 面板的内容不该出现在设置里（同一份信息不重复两处）
 	if tt.HasText("上行体积对比") {
 		t.Errorf("设置 tab 出现了面板的 hero：%q", tt.Texts())
+	}
+}
+
+// TestTimeSettingsOptions 两个下拉的可见选项必须是需求里的 6 档。
+func TestTimeSettingsOptions(t *testing.T) {
+	retain := humanOptions(relayclient.RetainOptions)
+	wantRetain := []string{"30 分钟", "1 小时", "6 小时", "24 小时", "7 天", "30 天"}
+	for i, want := range wantRetain {
+		if retain[i] != want {
+			t.Errorf("保留档位[%d] = %q，期望 %q", i, retain[i], want)
+		}
+	}
+	window := humanOptions(relayclient.WindowOptions)
+	wantWindow := []string{"1 分钟", "5 分钟", "30 分钟", "1 小时", "6 小时", "24 小时"}
+	for i, want := range wantWindow {
+		if window[i] != want {
+			t.Errorf("显示档位[%d] = %q，期望 %q", i, window[i], want)
+		}
+	}
+}
+
+// TestSettingsPersist 改设置 → 写进 settings.json（重启后读回同一个值）。
+func TestSettingsPersist(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	a.retainIdx = relayclient.OptionIndex(7*24*time.Hour, relayclient.RetainOptions)
+	a.windowIdx = relayclient.OptionIndex(6*time.Hour, relayclient.WindowOptions)
+	a.applyTimeSettings()
+
+	if a.settingsErr != nil {
+		t.Fatalf("保存设置失败：%v", a.settingsErr)
+	}
+	got := relayclient.LoadSettings(a.settingsPath)
+	if got.Retain() != 7*24*time.Hour {
+		t.Errorf("读回 retain=%s，期望 7 天", got.Retain())
+	}
+	if got.Window() != 6*time.Hour {
+		t.Errorf("读回 window=%s，期望 6 小时", got.Window())
+	}
+}
+
+// TestWindowCannotExceedRetain 显示区间超过保留时长时被压回上限，并给出提示。
+func TestWindowCannotExceedRetain(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	// 保留 1 小时，却想显示 24 小时
+	a.retainIdx = relayclient.OptionIndex(time.Hour, relayclient.RetainOptions)
+	a.windowIdx = relayclient.OptionIndex(24*time.Hour, relayclient.WindowOptions)
+	a.applyTimeSettings()
+
+	if got := relayclient.WindowOptions[a.windowIdx]; got > time.Hour {
+		t.Errorf("显示区间 %s 超过了保留时长 1 小时", got)
+	}
+	if !a.noticeErr || !strings.Contains(a.notice, "不能超过") {
+		t.Errorf("超限时未提示：notice=%q err=%v", a.notice, a.noticeErr)
+	}
+	if a.settingsErr != nil {
+		t.Errorf("保存失败：%v", a.settingsErr)
+	}
+}
+
+// TestChartSummaryFollowsWindow 图下那句话的窗口与粒度必须来自快照。
+func TestChartSummaryFollowsWindow(t *testing.T) {
+	a := newTestApp(t)
+	agg := stats.Agg{
+		Requests:  10,
+		WindowSec: int64(6 * time.Hour / time.Second),
+		BucketSec: int64(12 * time.Minute / time.Second),
+		Series: []stats.Bucket{
+			{UpRaw: 1000, UpWire: 10, Count: 1},
+			{UpRaw: 2000, UpWire: 20, Count: 1},
+		},
+	}
+	got := a.chartSummary(agg)
+	for _, want := range []string{"最近 6 小时", "每 12 分钟一柱"} {
+		if !strings.Contains(got, want) {
+			t.Errorf("chartSummary = %q，缺少 %q", got, want)
+		}
+	}
+}
+
+// TestHumanWindow 时间跨度的中文口径（含天这一档）
+func TestHumanWindow(t *testing.T) {
+	cases := map[int]string{
+		30:         "30 秒",
+		60:         "1 分钟",
+		1800:       "30 分钟",
+		7200:       "2 小时",
+		86400:      "24 小时",
+		7 * 86400:  "7 天",
+		30 * 86400: "30 天",
+	}
+	for in, want := range cases {
+		if got := humanWindow(in); got != want {
+			t.Errorf("humanWindow(%d) = %q，期望 %q", in, got, want)
+		}
 	}
 }
 
@@ -189,7 +311,8 @@ func TestViewRunning(t *testing.T) {
 	a.snap = func() stats.Agg { return a.agg }
 	tt := ui.NewTester(a.view, 480, 400)
 
-	for _, want := range []string{"已连接", "停止", "上行体积对比", "实时", "本次会话 12,847 请求", "p50 28 ms"} {
+	// 统计口径是「近 <保留期>」（统计从磁盘重建，重启不清零），不是「本次会话」
+	for _, want := range []string{"已连接", "停止", "上行体积对比", "实时", "12,847 请求", "p50 28 ms"} {
 		if !tt.HasText(want) {
 			t.Errorf("运行态缺少 %q：%q", want, tt.Texts())
 		}
@@ -276,7 +399,8 @@ func TestMeterDirection(t *testing.T) {
 
 // TestVersionDisplay 注入源的版本号有的带 v 有的不带，界面必须归一成一个。
 func TestVersionDisplay(t *testing.T) {
-	for in, want := range map[string]string{"0.9.1": "v0.9.1", "v0.9.1": "v0.9.1", "dev": "vdev", "": "v?"} {
+	// dev 返回空串 = 「不显示」：开发构建里 "vdev" 只会被读成异常。
+	for in, want := range map[string]string{"0.9.1": "v0.9.1", "v0.9.1": "v0.9.1", "dev": "", "dev-dirty": "", "": "v?"} {
 		if got := displayVersion(in); got != want {
 			t.Errorf("displayVersion(%q) = %q，期望 %q", in, got, want)
 		}
@@ -477,4 +601,139 @@ func sparseSeries() []stats.Bucket {
 	out := make([]stats.Bucket, stats.SeriesBuckets)
 	out[stats.SeriesBuckets-3] = stats.Bucket{UpRaw: 524847, UpWire: 392, Count: 1}
 	return out
+}
+
+// TestAutoStartSwitchWiring 设置 tab 的开关必须真的走 applyAutostart
+// （写 OS → 读回 → 以 OS 为准），而不是只翻转一个内存 bool。
+//
+// HOME 被指向临时目录，所以这条测试不会碰用户真实的登录项——这一点是硬要求：
+// 跑一次 go test 不该给开发者装上开机自启。
+func TestAutoStartSwitchWiring(t *testing.T) {
+	if !autostart.Available() {
+		t.Skip("当前平台不支持开机自启")
+	}
+	// HOME 必须先由 newTestApp 钉到临时目录（它会 Setenv），再读回来——
+	// 自己先 Setenv 一次会被它覆盖，plist 就落到别处了。
+	a := newTestApp(t)
+	home := os.Getenv("HOME")
+	a.tab = tabSettings
+	a.autoStart = false
+
+	// 点之前：OS 里没有
+	if on, err := autostart.Open(); err != nil || on {
+		t.Fatalf("初始 Open() = (%v, %v)", on, err)
+	}
+
+	tt := ui.NewTester(a.view, 480, 400)
+	r, ok := tt.Find("登录后自动驻留托盘，下次登录生效")
+	if !ok {
+		t.Fatalf("找不到开关行：%q", tt.Texts())
+	}
+	// 开关在这行的最右：扫这一行找亮色胶囊，点它的中心。
+	img := tt.Image()
+	yy := int(r.Y + r.H/2)
+	var xs []int
+	for x := 380; x < 480; x++ {
+		cr, cg, _, _ := img.At(x, yy).RGBA()
+		if cr>>8 > 150 && cg>>8 > 150 {
+			xs = append(xs, x)
+		}
+	}
+	if len(xs) == 0 {
+		t.Fatalf("这一行右侧没有开关胶囊（y=%d）", yy)
+	}
+	tt.ClickAt(float32(xs[0]+xs[len(xs)-1])/2, float32(yy))
+
+	if !a.autoStart {
+		t.Fatalf("点击后 a.autoStart 仍为 false")
+	}
+	// 真相在 OS：plist 应该被写出来，且指向当前可执行文件
+	on, err := autostart.Open()
+	if err != nil || !on {
+		t.Fatalf("点击后 Open() = (%v, %v)，期望 (true, nil)", on, err)
+	}
+	path := filepath.Join(home, "Library", "LaunchAgents", autostart.ID+".plist")
+	if _, err := os.Stat(path); err != nil {
+		t.Fatalf("plist 未生成：%v", err)
+	}
+
+	// 再点一次：关掉，plist 消失
+	tt = ui.NewTester(a.view, 480, 400)
+	if r2, ok := tt.Find("登录后自动驻留托盘，下次登录生效"); ok {
+		img = tt.Image()
+		y2 := int(r2.Y + r2.H/2)
+		xs = nil
+		for x := 380; x < 480; x++ {
+			cr, cg, _, _ := img.At(x, y2).RGBA()
+			if cr>>8 > 150 && cg>>8 > 150 {
+				xs = append(xs, x)
+			}
+		}
+		if len(xs) > 0 {
+			tt.ClickAt(float32(xs[0]+xs[len(xs)-1])/2, float32(y2))
+		}
+	}
+	if a.autoStart {
+		t.Fatalf("再点击后 a.autoStart 仍为 true")
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("关闭后 plist 仍在：%v", err)
+	}
+}
+
+// TestSelectChangesRetain 真的从下拉里选一项：写盘 + 生效，两者都要。
+//
+// 为什么不用「直接调 applyTimeSettings」代替：那只能证明动作函数对，
+// 证明不了下拉真的接到了它（Click 走的是真实的命中、打开、选择路径）。
+func TestSelectChangesRetain(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	tt := ui.NewTester(a.view, 480, 460)
+
+	r, ok := tt.Find("24 小时")
+	if !ok {
+		t.Fatalf("找不到保留字段的当前值：%v", tt.Texts())
+	}
+	// 点下拉本体（不是文字）：稍偏右下避开文字命中区，落在触发器的可点区域里
+	tt.ClickAt(r.X+r.W+6, r.Y+r.H/2)
+	if err := tt.Click("7 天"); err != nil {
+		t.Fatalf("点「7 天」：%v", err)
+	}
+	if got := relayclient.RetainOptions[clampIndex(a.retainIdx, len(relayclient.RetainOptions))]; got != 7*24*time.Hour {
+		t.Fatalf("选中 %s，期望 7 天：%v", got, tt.Texts())
+	}
+	if s := relayclient.LoadSettings(a.settingsPath); s.Retain() != 7*24*time.Hour {
+		t.Fatalf("落盘 retain=%s，期望 7 天", s.Retain())
+	}
+	// Runner 也必须已经按新保留时长重建过
+	if cfg := a.runner.Config(); cfg.Retain != 7*24*time.Hour {
+		t.Errorf("Runner retain=%s，期望 7 天", cfg.Retain)
+	}
+}
+
+// TestSelectChangesWindow 切换显示区间后桶粒度跟着变（横轴跨度确实改了）。
+func TestSelectChangesWindow(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	tt := ui.NewTester(a.view, 480, 460)
+
+	// 默认 30 分钟 → 选 6 小时
+	r, ok := tt.Find("30 分钟")
+	if !ok {
+		t.Fatalf("找不到显示区间的当前值：%v", tt.Texts())
+	}
+	tt.ClickAt(r.X+r.W+6, r.Y+r.H/2)
+	if err := tt.Click("6 小时"); err != nil {
+		t.Fatalf("点「6 小时」：%v", err)
+	}
+	if got := relayclient.WindowOptions[clampIndex(a.windowIdx, len(relayclient.WindowOptions))]; got != 6*time.Hour {
+		t.Fatalf("选中 %s，期望 6 小时：%v", got, tt.Texts())
+	}
+	// 6 小时 → 每桶 12 分钟 = 720 秒
+	if got := a.runner.Snapshot().BucketSec; got != 720 {
+		t.Errorf("bucket_sec=%d，期望 720（6 小时 / 30 桶）", got)
+	}
+	if s := relayclient.LoadSettings(a.settingsPath); s.Window() != 6*time.Hour {
+		t.Errorf("落盘 window=%s，期望 6 小时", s.Window())
+	}
 }

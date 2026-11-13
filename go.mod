@@ -1,4 +1,4 @@
-module github.com/jixoai/rfc9842-reply
+module github.com/jixoai/reply9842
 
 go 1.27.3
 

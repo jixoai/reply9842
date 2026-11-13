@@ -15,7 +15,7 @@ package basefind
 import (
 	"sync"
 
-	"github.com/jixoai/rfc9842-reply/internal/codec"
+	"github.com/jixoai/reply9842/internal/codec"
 )
 
 // blockSize 对齐块大小。

@@ -19,19 +19,20 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/codec"
-	"github.com/jixoai/rfc9842-reply/internal/downlink"
-	"github.com/jixoai/rfc9842-reply/internal/meta"
-	"github.com/jixoai/rfc9842-reply/internal/spool"
-	"github.com/jixoai/rfc9842-reply/internal/stats"
-	"github.com/jixoai/rfc9842-reply/internal/store"
-	"github.com/jixoai/rfc9842-reply/internal/transport"
+	"github.com/jixoai/reply9842/internal/codec"
+	"github.com/jixoai/reply9842/internal/downlink"
+	"github.com/jixoai/reply9842/internal/meta"
+	"github.com/jixoai/reply9842/internal/spool"
+	"github.com/jixoai/reply9842/internal/stats"
+	"github.com/jixoai/reply9842/internal/store"
+	"github.com/jixoai/reply9842/internal/transport"
 )
 
 type cfg struct {
@@ -45,6 +46,8 @@ type cfg struct {
 	tmpMB          int64
 	idemMB         int64
 	upstreamTimout time.Duration
+	healthAddr     string
+	healthProbe    bool
 	logPath        string
 	statsPath      string
 }
@@ -57,20 +60,53 @@ func main() {
 	flag.StringVar(&c.cert, "cert", "", "TLS 证书（fullchain）")
 	flag.StringVar(&c.key, "key", "", "TLS 私钥")
 	flag.Int64Var(&c.cacheMB, "cache-mb", 256, "基版本缓存上限（MB，内存）")
-	flag.StringVar(&c.spoolDir, "spool-dir", "/var/lib/rfc9842-reply/spool", "流式 spool 根目录")
+	flag.StringVar(&c.spoolDir, "spool-dir", "/var/lib/reply9842/spool", "流式 spool 根目录")
 	flag.Int64Var(&c.tmpMB, "tmp-mb", 512, "活跃区字节预算（MB）")
 	flag.Int64Var(&c.idemMB, "idem-mb", 2048, "幂等区字节预算（MB）")
 	flag.DurationVar(&c.upstreamTimout, "upstream-timeout", 10*time.Minute, "上游请求超时")
+	flag.BoolVar(&c.healthProbe, "health-probe", false,
+		"探针模式：GET 自己的 /healthz，成功 exit 0、失败 exit 1。"+
+			"给 scratch 镜像的 HEALTHCHECK 用（容器内无 curl）")
+	flag.StringVar(&c.healthAddr, "health-addr", "",
+		"健康检查监听地址（如 127.0.0.1:8080）；留空不启用。"+
+			"给容器编排用：scratch 镜像无 shell，不能做 exec 型探活")
 	flag.StringVar(&c.logPath, "log", "", "逐请求日志")
 	flag.StringVar(&c.statsPath, "stats", "", "汇总统计")
 	flag.Parse()
+
+	// 探针模式：容器内无 curl，用二进制自身做 HEALTHCHECK
+	if c.healthProbe {
+		addr := c.healthAddr
+		if addr == "" {
+			addr = "127.0.0.1:8080"
+		}
+		host, port, err := net.SplitHostPort(addr)
+		if err != nil {
+			log.Fatalf("health-probe: 地址非法: %v", err)
+		}
+		if host == "0.0.0.0" || host == "" {
+			host = "127.0.0.1"
+		}
+		cl := &http.Client{Timeout: 3 * time.Second}
+		resp, err := cl.Get("http://" + net.JoinHostPort(host, port) + "/healthz")
+		if err != nil {
+			log.Printf("health-probe: %v", err)
+			os.Exit(1)
+		}
+		defer resp.Body.Close()
+		if resp.StatusCode != http.StatusOK {
+			log.Printf("health-probe: HTTP %d", resp.StatusCode)
+			os.Exit(1)
+		}
+		os.Exit(0)
+	}
 
 	if c.cert == "" || c.key == "" {
 		log.Fatalf("必须提供 -cert 与 -key")
 	}
 	home, _ := os.UserHomeDir()
 	if c.logPath == "" {
-		c.logPath = filepath.Join(home, ".rfc9842-reply",
+		c.logPath = filepath.Join(home, ".reply9842",
 			"server-"+time.Now().Format("2006-01-02")+".jsonl")
 	}
 	if c.statsPath == "" {
@@ -120,6 +156,24 @@ func main() {
 	if err != nil {
 		log.Fatalf("listen: %v", err)
 	}
+
+	// 健康检查端点：给容器编排用。scratch 镜像没有 shell，无法 exec 型探活，
+	// 只能靠 HTTP。只暴露 /healthz，不泄漏任何状态。
+	if c.healthAddr != "" {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("ok"))
+		})
+		go func() {
+			log.Printf("健康检查  %s/healthz", c.healthAddr)
+			if err := http.ListenAndServe(c.healthAddr, mux); err != nil {
+				log.Printf("健康检查服务退出: %v", err)
+			}
+		}()
+	}
+
 	log.Printf("就绪")
 
 	for a := range accepts {

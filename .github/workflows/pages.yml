@@ -4,7 +4,7 @@ name: Deploy site to GitHub Pages
 #
 # 首次启用需要仓库管理员做两件事（详见 README 的「部署」一节）：
 #   1. Settings → Pages → Source 选择 "GitHub Actions"
-#   2. 在 DNS 处为 rfc9842-reply.jixoai.com 添加 CNAME 记录指向 <owner>.github.io
+#   2. 在 DNS 处为 reply9842.jixoai.com 添加 CNAME 记录指向 <owner>.github.io
 # 做完这两步后本工作流即可自动发布，后续 push 到 main 就会更新站点。
 
 on:

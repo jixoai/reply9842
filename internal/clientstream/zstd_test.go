@@ -8,7 +8,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/jixoai/rfc9842-reply/internal/meta"
+	"github.com/jixoai/reply9842/internal/meta"
 
 	"github.com/klauspost/compress/zstd"
 )

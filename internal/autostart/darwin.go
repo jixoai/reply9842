@@ -10,7 +10,7 @@
 //
 // 机制是一个文件：
 //
-//	~/Library/LaunchAgents/dev.jixoai.rfc9842-reply.plist
+//	~/Library/LaunchAgents/dev.jixoai.reply9842.plist
 //
 // launchd 在登录时读它并启动 ProgramArguments。没有代码签名、没有特权 helper、
 // 没有安装器。

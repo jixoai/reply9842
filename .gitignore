@@ -18,3 +18,4 @@
 
 # 图标构建的中间产物（iconset 十张 PNG 只是制作过程，最终只留 .icns）
 /cmd/gui/assets/AppIcon.iconset/
+/server

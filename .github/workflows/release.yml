@@ -13,7 +13,7 @@ name: Release
 #
 # ── npm Trusted Publishing ────────────────────────────────────────────────
 # npmjs.com → reply9842 → Settings → Trusted Publisher 必须与本文件严格一致：
-#   Repository:  jixoai/rfc9842-reply
+#   Repository:  jixoai/reply9842
 #   Workflow:    release.yml
 #   Environment: npm-publish        ← job 里必须有 environment: npm-publish
 # GitHub 的 OIDC token 带 environment claim，npm 用它匹配。缺这一项的表现是
@@ -176,9 +176,9 @@ jobs:
             ### go install（需要 Go 1.27.3+）
 
             ```bash
-            go install github.com/jixoai/rfc9842-reply/cmd/cli@${{ github.ref_name }}
-            go install github.com/jixoai/rfc9842-reply/cmd/gui@${{ github.ref_name }}
-            go install github.com/jixoai/rfc9842-reply/cmd/server@${{ github.ref_name }}
+            go install github.com/jixoai/reply9842/cmd/cli@${{ github.ref_name }}
+            go install github.com/jixoai/reply9842/cmd/gui@${{ github.ref_name }}
+            go install github.com/jixoai/reply9842/cmd/server@${{ github.ref_name }}
             ```
 
             ### 下载预编译二进制

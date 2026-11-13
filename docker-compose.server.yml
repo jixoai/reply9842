@@ -1,0 +1,45 @@
+# reply9842-server 一键部署
+#
+#   docker compose -f docker-compose.server.yml up -d
+#
+# 前置：把 TLS 证书放进 ./certs/（fullchain.pem + privkey.pem）。
+# 证书必须是客户端信任的域名证书（客户端用 -server-name 校验），
+# 自签证书需要客户端加 -insecure。
+services:
+  reply9842-server:
+    image: ghcr.io/jixoai/reply9842-server:latest
+    # 本地构建：docker build -f Dockerfile.server -t <上面那个名字> .
+    container_name: reply9842-server
+    restart: unless-stopped
+    ports:
+      # 隧道：QUIC 走 UDP，TCP/TLS 走 TCP —— 两者都要
+      - "${TUNNEL_PORT:-8443}:8443/tcp"
+      - "${TUNNEL_PORT:-8443}:8443/udp"
+      # 健康检查端口只绑回环，不对外
+      - "127.0.0.1:${HEALTH_PORT:-8080}:8080"
+    volumes:
+      - ./certs:/certs:ro
+      - reply9842-spool:/var/lib/reply9842
+    environment:
+      TZ: Asia/Shanghai
+    # 上游默认指向同机 magpie；换成你的实际网关地址
+    command:
+      - "-listen"
+      - "0.0.0.0:8443"
+      - "-health-addr"
+      - "0.0.0.0:8080"
+      - "-cert"
+      - "/certs/fullchain.pem"
+      - "-key"
+      - "/certs/privkey.pem"
+      - "-spool-dir"
+      - "/var/lib/reply9842/spool"
+      - "-upstream"
+      - "${UPSTREAM:-http://127.0.0.1:3431}"
+      - "-uphost"
+      - "${UPHOST:-magpie.aiweb.xin}"
+    # spool 持久化：重启后幂等区可复用
+    # 若上游是同机服务，需要 host 网络或 extra_hosts，见 README「Docker 部署」
+
+volumes:
+  reply9842-spool:

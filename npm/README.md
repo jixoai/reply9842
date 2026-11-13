@@ -34,9 +34,9 @@ npm i -g reply9842
 ### go install（需要 Go 1.27.3+）
 
 ```bash
-go install github.com/jixoai/rfc9842-reply/cmd/cli@latest
-go install github.com/jixoai/rfc9842-reply/cmd/gui@latest
-go install github.com/jixoai/rfc9842-reply/cmd/server@latest
+go install github.com/jixoai/reply9842/cmd/cli@latest
+go install github.com/jixoai/reply9842/cmd/gui@latest
+go install github.com/jixoai/reply9842/cmd/server@latest
 ```
 
 ## 快速开始
@@ -111,7 +111,7 @@ Agent ──► reply9842 (本地)
                         └─ 转发到上游
 ```
 
-详细设计与实测数据见 [GitHub 仓库](https://github.com/jixoai/rfc9842-reply)。
+详细设计与实测数据见 [GitHub 仓库](https://github.com/jixoai/reply9842)。
 
 ## 许可证
 
