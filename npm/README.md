@@ -47,13 +47,14 @@ go install github.com/jixoai/reply9842/cmd/server@latest
 reply9842 -server <服务端地址>:28443 -server-name magpie.aiweb.xin
 ```
 
-然后把 Agent 的上游指过来：
+然后把要经过隧道的客户端的 base URL 指向本地入口：
 
-```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:18899
-# 或
-export OPENAI_BASE_URL=http://127.0.0.1:18899/v1
 ```
+http://127.0.0.1:18899
+```
+
+具体怎么配取决于你的客户端——设置它的 base URL / 上游地址即可。
+reply9842 不绑定任何特定服务商或协议实现，它只是一个 HTTP 正向转发。
 
 ### 服务端（远端部署）
 

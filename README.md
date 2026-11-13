@@ -11,6 +11,9 @@ Agent 每请求要重传 1.3–2.2 MB 的完整上下文，日请求 2 万+，�
 ```
 
 > 数据来自生产环境连续观测，含推理型模型的完整上下文。见[实测](#实测)。
+>
+> 它对协议本身不做任何假设：只是一个 HTTP 正向转发，任何「请求体大且相邻请求高度相似」
+> 的流量都适用。不绑定任何服务商，也不需要客户端侧改协议。
 
 ---
 
@@ -128,9 +131,9 @@ QUIC 与 TCP/TLS 共用同一个端口。
 ### 2. 客户端（和 Agent 同机）
 
 ```bash
-go build -o relay-client ./cmd/relay-client
+go build -o relay-cli ./cmd/cli
 
-./relay-client \
+./relay-cli \
   -listen 127.0.0.1:18899 \
   -server 47.82.76.102:28443 \
   -server-name magpie.aiweb.xin \
@@ -139,13 +142,35 @@ go build -o relay-client ./cmd/relay-client
 
 然后把 Agent 的 `base_url` 指向 `http://127.0.0.1:18899`。其余不变。
 
+> **用 IP 直连时必须给 `-server-name`。** 服务端证书的 SAN 只有 DNS 没有 IP，
+> 留空会按 `-server` 的 host（那个 IP）推导 SNI，必然 `x509: cannot validate
+> certificate ... doesn't contain any IP SANs`。用域名连则不需要显式指定。
+
+#### 连不上？先怀疑本机代理
+
+如果本机开着代理的 **TUN / 增强模式**（Clash 系常见），它用
+`0.0.0.0/1` + `128.0.0.0/1` 两条路由把整个 IPv4 空间导进 utun，隧道流量也被吞进去；
+代理对 `28443` 这类非标端口没有正确规则，TLS 握手会被中途切断，表现为
+`tcp tls: EOF` 或 `quic ... no application protocol`——看起来像服务端崩了。
+
+两条解法，任选其一：
+
+1. 在代理里把服务器 IP 加进**直连规则**（推荐）
+2. 加 `-local-addr <本机网卡 IP>` 绑定出站源地址，让内核直接走物理网卡：
+
+```bash
+ipconfig getifaddr en0          # macOS 取网卡 IP
+./relay-cli -local-addr 192.168.1.106 ...
+```
+
 ### 客户端参数
 
 | 参数 | 默认 | 说明 |
 |---|---|---|
-| `-listen` | `127.0.0.1:8899` | 本地 HTTP 入口 |
-| `-server` | `127.0.0.1:9000` | relay-server 的 host:port |
-| `-server-name` | 自动推导 | TLS SNI |
+| `-listen` | `127.0.0.1:18899` | 本地 HTTP 入口 |
+| `-server` | `47.82.76.102:28443` | relay-server 的 host:port |
+| `-server-name` | `magpie.aiweb.xin` | TLS SNI（用 IP 连时必须填证书域名）|
+| `-local-addr` | 空 | 绑定出站源地址，绕过代理 TUN 劫持 |
 | `-transport` | `auto` | `auto` / `quic` / `tcp` |
 | `-insecure` | `false` | 跳过证书校验（自签观察期）|
 | `-min-delta` | `16384` | 小于此值的请求体不做 delta |
@@ -168,6 +193,8 @@ go build -o relay-client ./cmd/relay-client
 | `-tmp-mb` | `512` | 活跃区字节预算 |
 | `-idem-mb` | `2048` | 幂等区字节预算 |
 | `-upstream-timeout` | `10m` | 上游请求超时（不随客户端断开取消）|
+| `-health-addr` | 空 | 健康检查监听（如 `127.0.0.1:8080`）；留空不启用 |
+| `-health-probe` | `false` | 探针模式：GET 自己的 `/healthz`，成功 exit 0。给 scratch 镜像的 HEALTHCHECK 用（容器内无 curl）|
 
 ## 三个关键设计决策
 
@@ -320,33 +347,38 @@ tail -f ~/.reply9842/client-$(date +%F).jsonl | \
 
 ```
 cmd/
-├── relay-client/     本地 HTTP 入口 + 基线选择 + delta 编码 + 续传
-└── relay-server/     隧道服务端 + 解码校验 + 上游转发 + spool
+├── cli/              本地 HTTP 入口 + 基线选择 + delta 编码 + 续传（命令行）
+├── gui/              同一套逻辑的图形界面（mygo native UI + 系统托盘）
+└── server/           隧道服务端 + 解码校验 + 上游转发 + spool
 internal/
 ├── meta/             隧道帧格式（magic + 版本 + 类型 + 长度前缀）
 ├── codec/            dcz 编解码、自适应 level、静默损坏防护
+├── downlink/         下行响应压缩
 ├── store/            内容寻址 LRU（零协商）
 ├── basefind/         客户端基线选择（4KB 块哈希命中率）
-├── transport/        QUIC + TCP 双栈 + auto 回退
+├── transport/        QUIC + TCP 双栈 + auto 回退 + 源地址绑定
+├── relayclient/      客户端运行时（配置归一化、runner、设置持久化）
 ├── spool/            磁盘双区域流式缓冲（tmp / idem + 字节预算淘汰）
 ├── idem/             幂等键（callerKeyId + 请求指纹）
 ├── clientstream/     帧 → HTTP 响应 + 续传游标
+├── autostart/        开机自启（launchd / HKCU Run）
+├── glass/            GUI 玻璃材质调色板与 Surface
 ├── e2e/              断线续传端到端测试
-└── stats/            逐请求与汇总统计
+└── stats/            逐请求与汇总统计（JSONL 为事实来源，重启不清零）
 ```
 
 ## 已知限制
 
-1. **响应不压缩**。当前只优化上行；下行 p50 约 18 KB，暂未处理。
-2. **`resend-full` 的线宽统计只计首次尝试**。DeltaMiss 后的全量重发不计入该行
+1. **`resend-full` 的线宽统计只计首次尝试**。DeltaMiss 后的全量重发不计入该行
    `up_wire`，所以含冷启动的窗口其真实占比会高于表格数字（见上文 † 注）。
-3. **冷启动无收益**。服务端首次见到某基线时必然 miss，第一次重发是全量成本（约 20–35%）。
-4. **QUIC 生产未启用**。有回环端到端测试（`TestQUICRoundTrip`）通过，但生产链路仍走
+2. **冷启动无收益**。服务端首次见到某基线时必然 miss，第一次重发是全量成本（约 20–35%）。
+3. **QUIC 生产未启用**。有回环端到端测试（`TestQUICRoundTrip`）通过，但生产链路仍走
    TCP/TLS；启用需放通 UDP 端口并验证中间设备。
-5. **大文档内存**。30 MB 级请求的 delta 需要显著内存，需靠 `PickLevel` 降级。
-6. **单请求体全量缓冲**。客户端与服务端都会把 body 读进内存（为统计与压缩）。
-7. **跨用户字典隔离**。若将来共享字典，必须按租户隔离——混合公私数据的字典存在
+4. **大文档内存**。30 MB 级请求的 delta 需要显著内存，需靠 `PickLevel` 降级。
+5. **单请求体全量缓冲**。客户端与服务端都会把 body 读进内存（为统计与压缩）。
+6. **跨用户字典隔离**。若将来共享字典，必须按租户隔离——混合公私数据的字典存在
    CRIME/BREACH 类攻击面（RFC 9842 §9.2）。
+7. **GUI 无 Linux 后端**。mygo 的 native UI 只支持 macOS / Windows，Linux 只有 cli 与 server。
 
 ## 规范参考
 
@@ -358,22 +390,7 @@ internal/
 | RFC 7694 (Client-Initiated Content-Encoding) | 请求方向编码协商 | 语义参考 |
 | RFC 8785 (JCS) | JSON 规范化 | 若做块哈希则必需（本方案未用）|
 
-## 官网与部署
+## 官网
 
-官网源码在 [`site/`](./site)（纯 HTML + CSS，无框架、无外部字体、无图片资源），
-线上地址 <https://reply9842.jixoai.com>。
-
-`site/` 目录：
-
-```
-site/
-├── index.html     单页落地页（内核数字 / 原理图 / 实测表 / 快速开始）
-├── style.css      全部样式（OKLCH 单品牌色，响应式，含 reduced-motion）
-└── CNAME          reply9842.jixoai.com
-```
-
-推送 `main` 且 `site/**` 有变更时，`.github/workflows/pages.yml` 自动构建并发布到
-GitHub Pages（也可在 Actions 页手动 `workflow_dispatch`）。
-
-DNS 侧 `rfc9842.jixoai.com` 已 CNAME 到 `jixoai.github.io`（Cloudflare、DNS only），
-`site/CNAME` 已写好目标域名，Pages 据此绑定自定义域并自动申请 TLS。
+<https://reply9842.jixoai.com>（源码在 [`site/`](./site)，纯 HTML + CSS，无框架、
+无外部字体、无图片资源）。

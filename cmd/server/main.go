@@ -15,6 +15,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -197,37 +198,70 @@ type server struct {
 	col    *stats.Collector
 }
 
+// serve 一条隧道连接的主循环。
+//
+// 为什么要循环（而不是处理一个请求就关）：客户端侧上了连接池，一条连接会被
+// 复用来跑后续请求。握手成本实测平均约 2 秒（本机→香港，见 transport/pool.go
+// 顶部注释），不复用等于每个请求白扔这份钱。协议上一条连接跑多个请求是安全的：
+// 帧自带长度前缀，且服务端串行处理（一条连接同一时刻只有一个请求在途），
+// 不会出现响应串台。
+//
+// 复用条件（任一不满足即关闭连接）：
+//   - 本请求完整成功（响应推完、无 delta-miss、无上游错误）
+//   - 没有残留的未读帧
+//
+// 错误路径一律关闭：半截响应留在连接里会被下一个请求误读成它的开头。
 func (s *server) serve(a transport.Accept) {
 	defer a.Conn.Close()
+	for {
+		keep, err := s.serveOne(a)
+		if !keep || err != nil {
+			if err != nil && !errors.Is(err, io.EOF) {
+				log.Printf("[%s] 关闭连接: %v", a.Kind, err)
+			}
+			return
+		}
+	}
+}
+
+// serveOne 处理一个请求，返回是否可继续复用这条连接。
+func (s *server) serveOne(a transport.Accept) (keepAlive bool, err error) {
 	start := time.Now()
 	rec := &stats.Record{Transport: string(a.Kind)}
 
 	raw, err := a.Conn.Recv()
 	if err != nil {
-		log.Printf("[%s] recv err: %v", a.Kind, err)
-		return
+		return false, err
 	}
 	ft, payload, err := meta.ReadFrame(bytes.NewReader(raw))
 	if err != nil {
-		log.Printf("[%s] meta.ReadFrame err: %v", a.Kind, err)
-		return
+		return false, err
 	}
 
 	switch ft {
 	case meta.FrameResume:
+		// 续传一律不复用连接：它本来就发生在「上一条连接异常」之后，
+		// 且 handleResume 有多条提前 return 的失败路径（解码失败、key 不存在、
+		// 客户端不支持下行压缩），那些路径下连接里可能残留半截帧。
+		// 用一次握手换确定性，比省这次复用划算。
 		s.handleResume(a, payload, rec, start)
-		return
+		return false, nil
 	case meta.FrameRequest:
 		// 继续新请求路径
+	case meta.FramePing:
+		// 保活帧：直接回一个 Ping 即可，不计入统计
+		if f, e := meta.WrapFrame(meta.FramePing, nil); e == nil {
+			_ = transport.WriteFrame(a.Conn, f)
+		}
+		return true, nil
 	default:
-		log.Printf("[%s] unexpected frame type %d", a.Kind, ft)
-		return
+		return false, fmt.Errorf("unexpected frame type %d", ft)
 	}
 
 	reqHead, hdrRaw, bodyWire, err := meta.DecodeRequest(payload)
 	if err != nil {
 		s.fail(a.Conn, "decode request: "+err.Error())
-		return
+		return false, err
 	}
 	rec.Method, rec.Path = reqHead.Method, reqHead.Path
 	rec.UpWire = int64(len(bodyWire))
@@ -243,14 +277,16 @@ func (s *server) serve(a transport.Accept) {
 		rec.Encoding, rec.Status = "delta-miss", 409
 		rec.MsTotal = time.Since(start).Milliseconds()
 		s.col.Observe(rec)
-		return
+		// DeltaMiss 后客户端会另起一次全量请求。当前连接上已回了一帧
+		// DeltaMiss，且没有后续响应，状态是干净的，可以复用。
+		return true, nil
 	}
 	if err != nil {
 		s.fail(a.Conn, "decode: "+err.Error())
 		rec.Status, rec.Err = 400, err.Error()
 		rec.MsTotal = time.Since(start).Milliseconds()
 		s.col.Observe(rec)
-		return
+		return false, err
 	}
 	rec.Encoding = encName
 	rec.BaseHit = reqHead.Encoding == meta.EncDcz
@@ -263,7 +299,7 @@ func (s *server) serve(a transport.Accept) {
 			rec.Status, rec.Err = 422, "result hash mismatch"
 			rec.MsTotal = time.Since(start).Milliseconds()
 			s.col.Observe(rec)
-			return
+			return false, errors.New("result hash mismatch")
 		}
 	}
 
@@ -285,7 +321,7 @@ func (s *server) serve(a transport.Accept) {
 		rec.Status, rec.Err = 500, err.Error()
 		rec.MsTotal = time.Since(start).Milliseconds()
 		s.col.Observe(rec)
-		return
+		return false, err
 	}
 
 	if !existing {
@@ -303,6 +339,11 @@ func (s *server) serve(a transport.Accept) {
 	}
 	rec.MsTotal = time.Since(start).Milliseconds()
 	s.col.Observe(rec)
+
+	// 只有完整成功（没有传输错误）才允许复用：streamToClient 出错时
+	// 连接里可能残留半截帧，继续用会让下一个请求读到脏数据。
+	clean := rec.Err == "" && (status == 0 || status == 200)
+	return clean, nil
 }
 
 // streamToClient 从 entry 的 from 偏移开始把 body 推给客户端。

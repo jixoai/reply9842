@@ -69,15 +69,19 @@ func startTestServer(t *testing.T) (addr, certFile, keyFile string, stop func())
 	go func() {
 		for a := range accepts {
 			go func(a Accept) {
-				// 读一帧就回一帧，够验证连通性
-				b, err := a.Conn.Recv()
-				if err != nil {
-					a.Conn.Close()
-					return
+				// 循环 echo：与真实服务端一致的「一条连接跑多个请求」语义。
+				// 只读一帧就关会让连接池无法复用，池的测试也就测不到东西。
+				defer a.Conn.Close()
+				for {
+					b, err := a.Conn.Recv()
+					if err != nil {
+						return // 对端关闭或连接错误
+					}
+					// Recv 返回的是已剥掉长度前缀的 payload，回写时必须重新封装
+					if err := a.Conn.Send(mustFrame(string(b))); err != nil {
+						return
+					}
 				}
-				// Recv 返回的是已剥掉长度前缀的 payload，回写时必须重新封装
-				_ = a.Conn.Send(mustFrame(string(b)))
-				a.Conn.Close()
 			}(a)
 		}
 	}()

@@ -282,8 +282,12 @@ func (r *Runner) Start() error {
 		Addr: c.Server, ServerName: c.ServerName, LocalAddr: c.LocalAddr,
 		Insecure: c.Insecure, Mode: mode,
 	}
+	// 连接池：实测单次 TCP+TLS 握手平均约 2 秒（本机→香港），每个请求都新建
+	// 连接等于白扔这份延迟。串行复用一条连接能把握手成本摊到接近零。
+	// 详见 internal/transport/pool.go 顶部注释。
+	pooled := transport.NewPooledDialer(dialer, 0)
 	finder := basefind.New(c.HistoryMB)
-	h := &handler{cfg: c, dialer: dialer, finder: finder, col: col, logger: logger}
+	h := &handler{cfg: c, dialer: dialer, pool: pooled, finder: finder, col: col, logger: logger}
 	srv := &http.Server{
 		Handler:           h,
 		ReadHeaderTimeout: 30 * time.Second,
@@ -464,6 +468,7 @@ func (r *Runner) notify() {
 type handler struct {
 	cfg      Config
 	dialer   *transport.Dialer
+	pool     *transport.PooledDialer
 	finder   *basefind.Finder
 	col      *stats.Collector
 	logger   *log.Logger
@@ -603,7 +608,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wireStart := time.Now()
 	stream := &clientstream.Session{IdemKey: idemKey}
 
-	conn, err := h.dialer.Dial(r.Context())
+	conn, err := h.pool.Get(r.Context())
 	if err != nil {
 		http.Error(w, "dial: "+err.Error(), 502)
 		rec.Status, rec.Err = 502, err.Error()
@@ -612,7 +617,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if err := transport.WriteFrame(conn, frame); err != nil {
-		conn.Close()
+		h.pool.Drop(conn)
 		http.Error(w, "send: "+err.Error(), 502)
 		rec.Status, rec.Err = 502, err.Error()
 		rec.MsTotal = time.Since(start).Milliseconds()
@@ -620,7 +625,15 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	clientstream.Drain(conn, w, stream, start)
-	conn.Close()
+	// 归还策略：只有「响应完整读完、且连接没出错」才进池。
+	// Drain 中途出错时连接里可能还有未读帧，复用它会让下一个请求读到
+	// 上一个请求的残留数据（串台），所以一律丢弃。
+	reusable := stream.Completed && stream.Err == nil
+	if reusable {
+		h.pool.Put(conn)
+	} else {
+		h.pool.Drop(conn)
+	}
 
 	// DeltaMiss / 断线 → 按需要重发
 	if stream.ResumeMiss {
@@ -638,10 +651,17 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if e1 == nil {
 			f2, e2 := meta.WrapFrame(meta.FrameRequest, pl2)
 			if e2 == nil {
-				if c2, e3 := h.dialer.Dial(r.Context()); e3 == nil {
-					transport.WriteFrame(c2, f2)
-					clientstream.Drain(c2, w, stream, start)
-					c2.Close()
+				if c2, e3 := h.pool.Get(r.Context()); e3 == nil {
+					if e4 := transport.WriteFrame(c2, f2); e4 != nil {
+						h.pool.Drop(c2)
+					} else {
+						clientstream.Drain(c2, w, stream, start)
+						if stream.Completed && stream.Err == nil {
+							h.pool.Put(c2)
+						} else {
+							h.pool.Drop(c2)
+						}
+					}
 				}
 			}
 		}
@@ -664,6 +684,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if e != nil {
 			break
 		}
+		// 续传重连不走连接池：服务端对 FrameResume 明确不复用连接
+		//（见 cmd/server/main.go 里的注释），所以这里也不必把连接放回池。
 		c3, e := h.dialer.Dial(r.Context())
 		if e != nil {
 			continue
