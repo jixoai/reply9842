@@ -23,10 +23,16 @@ ARG VERSION=dev
 # GOARCH 留空即回退宿主架构，行为与改动前一致。
 ARG TARGETOS
 ARG TARGETARCH
-RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
+# 架构自检不用 `file`：golang:1.27-alpine 里没有这个命令（2026-11-13 CI 实测
+# exit 127，整个 server 镜像因此从未发布成功）。改用 Go 自己的构建信息断言，
+# 它一定能读到目标二进制，且能把「cross 构建但架构错标」的回归挡住。
+RUN set -eu; \
+    CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
       -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-      -o /out/reply9842-server ./cmd/server && \
-    file /out/reply9842-server
+      -o /out/reply9842-server ./cmd/server; \
+    if [ -n "${TARGETARCH}" ]; then \
+      go version -m /out/reply9842-server | grep -q "GOARCH=${TARGETARCH}"; \
+    fi
 
 # ---- 运行 ----
 FROM scratch
