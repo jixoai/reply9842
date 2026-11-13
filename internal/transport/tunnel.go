@@ -75,6 +75,16 @@ type Conn struct {
 	reused bool
 	// handshake 建立这条连接所花的握手时间（新建才有意义；复用时为 0）。
 	handshake time.Duration
+
+	// setReadDeadline 给底层流设读超时。QUIC stream 与 tls.Conn 都有这个方法。
+	// 只在**探活**时用短超时，正常请求路径绝不设：LLM 首帧可能等 30–50 秒，
+	// 一个固定的读超时会把合法请求误杀。
+	setReadDeadline  func(time.Time) error
+	setWriteDeadline func(time.Time) error
+	// idleAt 这条连接最近一次归还到池里的时刻；0 表示正在被使用。
+	idleAt time.Time
+	// idleFor 本次取出前闲置了多久（Get 时快照）。
+	idleFor time.Duration
 }
 
 // Reused 这条连接是否来自连接池复用。
@@ -82,6 +92,31 @@ func (c *Conn) Reused() bool { return c.reused }
 
 // Handshake 建立连接所花的握手时间；复用连接返回 0。
 func (c *Conn) Handshake() time.Duration { return c.handshake }
+
+// SetReadDeadline 给底层流设读超时；传零值清除。
+func (c *Conn) SetReadDeadline(t time.Time) error {
+	if c.setReadDeadline == nil {
+		return nil
+	}
+	return c.setReadDeadline(t)
+}
+
+// SetWriteDeadline 给底层流设写超时；传零值清除。
+//
+// QUIC 流写在没有对端 ACK 时会一直阻塞（实测服务端被 kill -9 后写不返回），
+// 所以探活必须同时设写超时，否则探活本身就挂在写那一行。
+func (c *Conn) SetWriteDeadline(t time.Time) error {
+	if c.setWriteDeadline == nil {
+		return nil
+	}
+	return c.setWriteDeadline(t)
+}
+
+// IdleFor 这条连接在这次使用前闲置了多久。
+//
+// 由连接池在 Get 时快照（而不是每次现算）：Get 之后 idleAt 就清零了，
+// 上层若现算拿到的永远是 0——第一版就是这么写的，探活因此从未触发过。
+func (c *Conn) IdleFor() time.Duration { return c.idleFor }
 
 // Kind 当前连接使用的传输
 func (c *Conn) Kind() Kind { return c.kind }
@@ -235,10 +270,12 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 		return nil, fmt.Errorf("quic stream: %w", err)
 	}
 	return &Conn{
-		kind:      KindQUIC,
-		handshake: time.Since(hsStart),
-		send:      func(b []byte) error { return writeAll(st, b) },
-		recv:      func() ([]byte, error) { return readFrame(st) },
+		kind:             KindQUIC,
+		handshake:        time.Since(hsStart),
+		send:             func(b []byte) error { return writeAll(st, b) },
+		recv:             func() ([]byte, error) { return readFrame(st) },
+		setReadDeadline:  st.SetReadDeadline,
+		setWriteDeadline: st.SetWriteDeadline,
 		closeFn: func() error {
 			st.Close()
 			return qc.CloseWithError(0, "bye")
@@ -269,11 +306,13 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 		return nil, fmt.Errorf("tcp tls: %w", err)
 	}
 	return &Conn{
-		kind:      KindTCP,
-		handshake: time.Since(hsStart),
-		send:      func(b []byte) error { return writeAll(tc, b) },
-		recv:      func() ([]byte, error) { return readFrame(tc) },
-		closeFn:   tc.Close,
+		kind:             KindTCP,
+		handshake:        time.Since(hsStart),
+		send:             func(b []byte) error { return writeAll(tc, b) },
+		recv:             func() ([]byte, error) { return readFrame(tc) },
+		setReadDeadline:  tc.SetReadDeadline,
+		setWriteDeadline: tc.SetWriteDeadline,
+		closeFn:          tc.Close,
 	}, nil
 }
 

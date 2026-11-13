@@ -2,6 +2,7 @@ package transport
 
 import (
 	"context"
+	"net"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -235,4 +236,55 @@ func strings4k() string {
 		b[i] = byte('A' + i%26)
 	}
 	return string(b)
+}
+
+// TestPoolIdleForSurvivesGet 锁住一个真实的踩坑：
+//
+// IdleFor 必须在 Get 时快照。第一版是在上层现算的（Get 之后 idleAt 已被清零），
+// 于是「闲置多久」永远是 0，探活条件 `IdleFor() > 5s` 一次都没成立过——
+// 表现为服务端重启后客户端仍然挂满 120 秒（QUIC MaxIdleTimeout）。
+func TestPoolIdleForSurvivesGet(t *testing.T) {
+	p := NewPooledDialer(&Dialer{}, 4)
+	c := &Conn{}
+	p.Put(c)
+	time.Sleep(30 * time.Millisecond)
+
+	got, err := p.Get(context.Background())
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	if got != c {
+		t.Fatalf("Get 没拿到刚归还的连接")
+	}
+	if d := got.IdleFor(); d < 25*time.Millisecond {
+		t.Errorf("IdleFor() = %v，应在 Get 时快照到约 30ms", d)
+	}
+	if !got.reused {
+		t.Errorf("从池里取出的连接必须标记 reused")
+	}
+}
+
+// TestConnDeadlinesReachTransport 验证 SetReadDeadline 真的传到了底层流：
+// 探活靠它把「死连接上的阻塞读」变成 2.5 秒的 deadline exceeded。
+func TestConnDeadlinesReachTransport(t *testing.T) {
+	client, server := net.Pipe()
+	defer server.Close()
+	defer client.Close()
+
+	c := &Conn{
+		send:             func(b []byte) error { _, err := client.Write(b); return err },
+		recv:             func() ([]byte, error) { return readFrame(client) },
+		setReadDeadline:  client.SetReadDeadline,
+		setWriteDeadline: client.SetWriteDeadline,
+	}
+	if err := c.SetReadDeadline(time.Now().Add(50 * time.Millisecond)); err != nil {
+		t.Fatalf("SetReadDeadline: %v", err)
+	}
+	start := time.Now()
+	if _, err := c.Recv(); err == nil {
+		t.Fatalf("对端不写数据时 Recv 应超时")
+	}
+	if d := time.Since(start); d > time.Second {
+		t.Errorf("读超时用了 %v，deadline 没生效", d)
+	}
 }

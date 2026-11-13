@@ -102,6 +102,8 @@ func (p *PooledDialer) Get(ctx context.Context) (*Conn, error) {
 		p.hits++
 		p.mu.Unlock()
 		ic.c.reused = true
+		ic.c.idleFor = time.Since(ic.since) // 快照：出池后就没得算了
+		ic.c.idleAt = time.Time{}
 		return ic.c, nil
 	}
 	p.misses++
@@ -130,6 +132,7 @@ func (p *PooledDialer) Put(c *Conn) {
 		c.Close()
 		return
 	}
+	c.idleAt = time.Now()
 	p.idle = append(p.idle, &idleConn{c: c, since: time.Now()})
 	p.mu.Unlock()
 }

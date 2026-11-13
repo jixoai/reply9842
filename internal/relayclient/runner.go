@@ -616,6 +616,23 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.col.Observe(rec)
 		return
 	}
+	// 复用连接先探活。服务端重启后池里的连接已经死了，但**写进去不会立刻报错**：
+	// 数据进了内核缓冲，接着读就等到 QUIC 的 MaxIdleTimeout（实测 120 秒）才失败。
+	// 用户看到的是「本地客户端卡死/闪退」，而这本来一个 ping 就能判定。
+	// 只在闲置较久（probeIdleGap）时才探，刚用完的连接必活，不必付这次 RTT。
+	if conn.Reused() && conn.IdleFor() > probeIdleGap {
+		if perr := pingConn(conn); perr != nil {
+			h.logf("池里的连接已失效（%v），换新连接", perr)
+			h.pool.Drop(conn)
+			if conn, err = h.pool.Get(r.Context()); err != nil {
+				http.Error(w, "dial: "+err.Error(), 502)
+				rec.Status, rec.Err = 502, err.Error()
+				rec.MsTotal = time.Since(start).Milliseconds()
+				h.col.Observe(rec)
+				return
+			}
+		}
+	}
 	if err := transport.WriteFrame(conn, frame); err != nil {
 		h.pool.Drop(conn)
 		http.Error(w, "send: "+err.Error(), 502)
@@ -772,4 +789,48 @@ func convertHash(h codec.Hash) meta.Hash {
 	var out meta.Hash
 	copy(out[:], h[:])
 	return out
+}
+
+// ── 连接探活 ──────────────────────────────────────────────────────────────
+
+// probeIdleGap 是「值得先 ping 一下」的闲置时长。
+//
+// 取 5 秒而不是 0：刚归还的连接一定是活的，探活等于白付一个 RTT；而服务端
+// 重启这种事故，间隔通常远大于 5 秒。
+const probeIdleGap = 5 * time.Second
+
+// probeTimeout 是探活的读超时。正常 RTT 到香港约 3ms，2.5 秒足够覆盖抖动，
+// 又不会让用户等太久——探活失败意味着这条连接已经废了。
+const probeTimeout = 2500 * time.Millisecond
+
+// pingConn 在一条空闲连接上做一次 ping/pong。
+//
+// 服务端对 FramePing 原样回显（cmd/server/main.go 的 serveOne），所以
+// 「设一个短读超时 → 发 ping → 读到任意一帧」就等于「链路还活着」。
+// 读超时必须在这里设、并且用完清掉：正常请求路径不能有读超时，LLM 首帧
+// 可能等 30–50 秒，固定超时会把合法请求误杀。
+func pingConn(c *transport.Conn) error {
+	deadline := time.Now().Add(probeTimeout)
+	// 读**和**写都要设：服务端被 kill 之后，QUIC 流的 Write 会等不到 ACK
+	// 一直挂着（实测 40 秒无返回），只设读超时根本走不到读那一步。
+	if err := c.SetReadDeadline(deadline); err != nil {
+		return err
+	}
+	if err := c.SetWriteDeadline(deadline); err != nil {
+		return err
+	}
+	defer func() {
+		_ = c.SetReadDeadline(time.Time{})
+		_ = c.SetWriteDeadline(time.Time{})
+	}()
+
+	frame, err := meta.WrapFrame(meta.FramePing, nil)
+	if err != nil {
+		return err
+	}
+	if err := transport.WriteFrame(c, frame); err != nil {
+		return err
+	}
+	_, err = c.Recv()
+	return err
 }

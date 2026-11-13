@@ -9,6 +9,9 @@
 
 # ---- 构建 ----
 FROM golang:1.27-alpine AS build
+# tzdata：最终镜像是 scratch，要把 /usr/share/zoneinfo 拷进去，而 alpine 的
+# golang 镜像并不自带它（2026-11-13 CI 实测 `/usr/share/zoneinfo: not found`）。
+RUN apk add --no-cache tzdata
 WORKDIR /src
 # 依赖层单独缓存：源码变更不重编依赖
 COPY go.mod go.sum ./
