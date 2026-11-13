@@ -1,0 +1,37 @@
+schema: spec-driven
+
+# Project context (openSpec 在生成/校验 artifact 时读取)
+context: |
+  reply9842（仓库 jixoai/reply9842，曾名 rfc9842-reply）：基于内容寻址基版本的
+  增量压缩隧道，把 AI Agent 的上行请求体从 1.4 MB 压到约 1 KB（实测生产 0.225%）。
+  只做 HTTP 正向转发，不绑定任何服务商：客户端在 127.0.0.1 监听，Agent 只需把
+  base_url 指过来；两端各有状态，上一轮的请求体就是这一轮的 zstd 字典。
+
+  技术栈：Go 1.27.3（module github.com/jixoai/reply9842）、纯 Go 无 CGO、
+  mygo v0.9.0 native UI（GUI 仅 darwin/windows）、quic-go v0.65.0、
+  klauspost/compress v1.20.4（zstd）、lukechampine.com/blake3。npm 侧是纯 Node
+  启动器（node>=18，node --test）。CI 单一 release job + self-hosted 优先。
+
+  约束（改动前必读）：
+  - 三道防静默损坏不可关闭：zstd frame CRC、dcz 头 BLAKE3 校验、ResultHash 校验。
+  - 一致性只靠内容哈希：store 是 hash→body 纯 KV，无目录/无版本号/无会话 ID；
+    未命中即 FrameDeltaMiss，客户端重发全量。RFC 9842 §2.1.3 要求服务端必须校验
+    哈希、不得信任服务端 ID。
+  - 基线判定用 4 KB 块哈希命中率，不用公共前缀（后者实测区分度 0%）。
+  - 上行 pump 用 context.WithoutCancel 派生，客户端断开不取消上游；这是断线续传
+    的全部前提。
+  - 分发产物命名统一 <kind>-<os>-<arch>[.exe]，kind ∈ cli|gui|server；
+    本地 `make dist` 与 CI 必须一致。
+  - 运行时数据在 ~/.reply9842/（服务端 /var/lib/reply9842）。
+  - 文档与提交信息用中文。
+
+# Per-artifact rules
+rules:
+  spec:
+    - 每个 Requirement 必须带「落地证据」（文件:行 或 函数名），否则视为未落地
+    - 已落地与未落地必须分开写：未落地一律进 openspec/changes/，不写成 Requirement
+  proposal:
+    - 必须写明「依据」（哪条提交 / 哪句注释 / 哪个 README 段落承诺了它）
+    - 必须写明验收标准（可执行、可观测）
+  tasks:
+    - 任务粒度到「一个可独立验证的改动」
