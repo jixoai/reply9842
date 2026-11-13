@@ -369,6 +369,10 @@ func (s *server) serveOne(a transport.Accept) (keepAlive bool, err error) {
 // （ReadFrom 的明文语义），所以线上这一层要重新压一遍——每条连接一个
 // 独立的 zstd 流。这样续传天然正确：客户端每次都从 from 明文偏移处开始
 // 收一条全新的流，不需要跨连接保留解压器状态（那是唯一的正确性陷阱）。
+// noHeadTimeout 等响应头的上限。上游 TTFT 实测 20–90 秒（推理模型），
+// 120 秒留出余量，同时保证「没有生产者」的僵尸条目不会把请求挂死。
+const noHeadTimeout = 120 * time.Second
+
 func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64,
 	start time.Time, rec *stats.Record) int {
 	// 无论从哪条 return 离开，都把解码游标还回去：它背后是一个按窗口
@@ -413,6 +417,14 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 			}
 			s.fail(conn, msg)
 			return 502
+		}
+		// 头部等待必须有个上限：WaitMore(nil, ...) 在「条目存在但没有任何
+		// 生产者」时会永远阻塞（实测：客户端复用一个 written=0 的幂等键，
+		// 服务端既没有 pump 也没有数据，请求就挂在那里——用户看到的是
+		// 「请求像卡住了」）。到点回 504，让客户端自己重试，比静默挂死好。
+		if time.Since(start) > noHeadTimeout {
+			s.fail(conn, "上游 120 秒未返回响应头（上游过载或请求已失效，请重试）")
+			return 504
 		}
 		if !e.WaitMore(nil, e.Gen()) {
 			s.detachOnDisconnect(e)
