@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"image/png"
@@ -94,8 +95,9 @@ func TestViewBuilds(t *testing.T) {
 	a := newTestApp(t)
 	tt := ui.NewTester(a.view, 480, 400)
 
-	// 空态：状态行 + 折叠的 hero + 复制按钮，不该出现统计三格
-	for _, want := range []string{"已停止", "启动", "上行体积对比", "已暂停", "复制配置"} {
+	// 空态：顶栏开关（"启动代理" 是它的无障碍名）+ 图表卡 + 复制按钮，
+	// 不该出现统计三格，也没有独立的状态行。
+	for _, want := range []string{"启动代理", "上行体积对比", "已暂停", "复制地址"} {
 		if !tt.HasText(want) {
 			t.Errorf("缺少文本 %q，实际文本：%q", want, tt.Texts())
 		}
@@ -104,8 +106,9 @@ func TestViewBuilds(t *testing.T) {
 	if tt.HasText("未连接") {
 		t.Errorf("未启动不应显示「未连接」：%q", tt.Texts())
 	}
-	if tt.HasText("已连接") {
-		t.Errorf("未启动时不应显示已连接：%q", tt.Texts())
+	// 状态不再在正文里占一行（它由顶栏开关的图标形状与颜色表达）
+	if tt.HasText("本地流量不经过压缩") {
+		t.Errorf("面板里不该再有状态行文案：%q", tt.Texts())
 	}
 }
 
@@ -310,7 +313,7 @@ func TestSettingsWhileRunning(t *testing.T) {
 	}
 }
 
-// TestViewRunning 运行态：状态变「已连接」，主按钮变「停止」，hero 出巨号与倍数。
+// TestViewRunning 运行态：顶栏开关变「停止代理」，图表出「实时」，统计行给数字。
 func TestViewRunning(t *testing.T) {
 	a := newTestApp(t)
 	setRunning(a, true)
@@ -320,7 +323,7 @@ func TestViewRunning(t *testing.T) {
 	tt := ui.NewTester(a.view, 480, 400)
 
 	// 统计口径是「近 <保留期>」（统计从磁盘重建，重启不清零），不是「本次会话」
-	for _, want := range []string{"已连接", "停止", "上行体积对比", "实时", "12,847 请求", "p50 28 ms"} {
+	for _, want := range []string{"停止代理", "上行体积对比", "实时", "12,847 请求", "p50 28 ms"} {
 		if !tt.HasText(want) {
 			t.Errorf("运行态缺少 %q：%q", want, tt.Texts())
 		}
@@ -433,7 +436,7 @@ func TestLightPaletteBuilds(t *testing.T) {
 	a := newTestApp(t)
 	a.pal = glass.Light()
 	tt := ui.NewTester(a.view, 480, 400)
-	if !tt.HasText("已停止") {
+	if !tt.HasText("启动代理") {
 		t.Errorf("亮色板未渲染：%q", tt.Texts())
 	}
 }
@@ -522,8 +525,11 @@ func TestSnapshotFrames(t *testing.T) {
 		w, h  int
 		setup func(a *app)
 	}{
-		{"panel-idle", 480, 510, func(a *app) {}},
-		{"panel-running", 480, 510, func(a *app) {
+		// 尺寸与 main.go 的 createWindow 一致：480×480，且带上真机同一份
+		// TitleBar 让位量（红绿灯 x 到 78.5、栏高由 NSToolbar 撑到 66）。
+		// 不带 SetTitleBar 的话顶栏左边距退回 14，截图会比真机「宽」出一大截。
+		{"panel-idle", 480, 480, func(a *app) {}},
+		{"panel-running", 480, 480, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1204, UpRaw: 1400 * 1024, UpWire: 70 * 1024,
 				UpRatio: 70.0 / 1400, P50Ms: 28}
@@ -531,14 +537,19 @@ func TestSnapshotFrames(t *testing.T) {
 			a.snap = func() stats.Agg { return a.agg }
 			a.transport = "quic"
 		}},
-		{"panel-sparse", 480, 510, func(a *app) {
+		{"panel-sparse", 480, 480, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1, UpRaw: 524847, UpWire: 392, UpRatio: 392.0 / 524847, P50Ms: 18}
 			a.agg.Series = sparseSeries()
 			a.snap = func() stats.Agg { return a.agg }
 		}},
-		{"settings", 480, 510, func(a *app) { a.tab = tabSettings }},
-		{"settings-running", 480, 510, func(a *app) {
+		{"panel-copied", 480, 480, func(a *app) {
+			// 复制成功后的回显：徽标换对勾、footer 按钮变「已复制」。
+			setRunning(a, true)
+			a.copiedAt = time.Now()
+		}},
+		{"settings", 480, 480, func(a *app) { a.tab = tabSettings }},
+		{"settings-running", 480, 480, func(a *app) {
 			a.tab = tabSettings
 			setRunning(a, true)
 		}},
@@ -548,11 +559,14 @@ func TestSnapshotFrames(t *testing.T) {
 			a.listen = "127.0.0.1:1" // 1024 以下的端口在 macOS 上需要权限
 			a.start()
 		}},
+		// 最小宽度：顶栏必须收起应用名，而不是把右侧那一簇挤扁。
+		{"panel-narrow", 440, 400, func(a *app) { setRunning(a, true) }},
 	}
 	for _, tc := range cases {
 		a := newTestApp(t)
 		tc.setup(a)
 		tt := ui.NewTester(desktopView(a), tc.w, tc.h)
+		tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
 		img := tt.Image()
 		if img == nil {
 			t.Fatalf("%s: Image() 返回 nil", tc.name)
@@ -784,5 +798,168 @@ func TestTabsSwitchByClick(t *testing.T) {
 	tt.Frame()
 	if !tt.HasText("42 请求") {
 		t.Errorf("切回面板后统计丢了：%q", tt.Texts())
+	}
+}
+
+// TestCopyChipCopiesPlainURL 顶栏地址徽标点一下就复制。
+//
+// 复制的是**裸 URL**：这个代理是通用 HTTP 口，不绑定任何一家 SDK 的环境
+// 变量名（上一版复制 `export ANTHROPIC_BASE_URL=...`，等于替用户挑了客户端）。
+// 这条测试同时守住「不许再出现 AI 相关字样」这个解耦要求。
+func TestCopyChipCopiesPlainURL(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+	if err := tt.Click("复制地址"); err != nil {
+		t.Fatalf("点复制徽标失败：%v", err)
+	}
+	want := "http://" + a.listen
+	if got := tt.Clipboard(); got != want {
+		t.Fatalf("剪贴板 = %q，期望 %q", got, want)
+	}
+	// 复制内容不许带 shell 前缀，也不许提任何 AI 供应商
+	for _, banned := range []string{"export", "ANTHROPIC", "Anthropic", "OPENAI"} {
+		if strings.Contains(tt.Clipboard(), banned) {
+			t.Errorf("复制内容含 %q：%q", banned, tt.Clipboard())
+		}
+	}
+	// 回显必须真的亮起来：徽标换对勾、footer 按钮换词
+	if !a.copyFlashing() {
+		t.Errorf("复制后 copiedAt 没置上（copyFlashing() = false）")
+	}
+	tt.Frame()
+	if !tt.HasText("已复制") {
+		t.Errorf("复制后没有「已复制」回显：%q", tt.Texts())
+	}
+}
+
+// TestCopyFlashExpires 回显到点就退（1.6 秒），不会赖在界面上。
+//
+// 直接置 copiedAt 而不是走 copyURL：写剪贴板要框架的事件泵（视图 / 托盘
+// 两种情况之外没有），这条测试只关心「回显窗口怎么算」。
+func TestCopyFlashExpires(t *testing.T) {
+	a := newTestApp(t)
+	a.copiedAt = time.Now()
+	if !a.copyFlashing() {
+		t.Fatal("刚复制完，copyFlashing() 应为 true")
+	}
+	// 把时钟拨过回显窗口：直接改 copiedAt 比睡 1.6 秒快，且测的是同一条判据
+	a.copiedAt = time.Now().Add(-copyFlash - time.Millisecond)
+	if a.copyFlashing() {
+		t.Errorf("过了 %s 仍在回显窗口里", copyFlash)
+	}
+}
+
+// TestNoAIPromptsInUI 界面上不许出现任何 AI 供应商/环境变量的提示。
+//
+// 需求原文：「解耦任何和AI相关的提示」。协议头 anthropic-version 在
+// internal/idem/key.go 里，是技术实现（不上界面），不在本测试范围。
+func TestNoAIPromptsInUI(t *testing.T) {
+	for _, tab := range []int{tabPanel, tabSettings} {
+		a := newTestApp(t)
+		a.tab = tab
+		tt := ui.NewTester(a.view, 480, 400)
+		for _, banned := range []string{"ANTHROPIC", "Anthropic", "anthropic", "OPENAI", "OPENAI_API_KEY", "BASE_URL", "export "} {
+			if tt.HasText(banned) {
+				t.Errorf("tab=%d 出现 AI 相关提示 %q：%q", tab, banned, tt.Texts())
+			}
+		}
+	}
+}
+
+// TestRunToggleSwitchesStateAndIcon 顶栏那个图标开关：点它真的启动/停止监听，
+// 标签也随状态切换（图标没有文字，无障碍名就是用户听到的那句话）。
+//
+// 用真 Runner + 端口 0（内核分配）：这条测试的价值正在于「开关接的不是一个
+// 内存 bool」——它是用户唯一的开关，退化成假动作就等于整个应用没有开关。
+// 端口 0 让并发跑测试也不会撞端口；t.Cleanup 保证监听一定被收掉。
+func TestRunToggleSwitchesStateAndIcon(t *testing.T) {
+	a := newTestApp(t)
+	a.listen = "127.0.0.1:0"
+	t.Cleanup(func() { _ = a.runner.Stop(context.Background()) })
+
+	tt := ui.NewTester(a.view, 480, 400)
+	if !tt.HasText("启动代理") {
+		t.Fatalf("停止态应显示「启动代理」：%q", tt.Texts())
+	}
+	if err := tt.Click("启动代理"); err != nil {
+		t.Fatalf("点启动开关失败：%v", err)
+	}
+	if !a.runner.Running() {
+		t.Fatalf("点了启动，Runner 没跑起来（notice=%q）", a.notice)
+	}
+	// 真监听拿到了内核分配的端口，徽标必须跟着换成真实地址
+	if addr := a.runner.Addr(); addr == "" || addr == "127.0.0.1:0" {
+		t.Errorf("Runner.Addr() = %q，期望真实端口", addr)
+	}
+	tt.Frame()
+	if !tt.HasText("停止代理") {
+		t.Fatalf("运行态应显示「停止代理」：%q", tt.Texts())
+	}
+	if err := tt.Click("停止代理"); err != nil {
+		t.Fatalf("点停止开关失败：%v", err)
+	}
+	if a.runner.Running() {
+		t.Fatalf("点了停止，Runner 还在跑")
+	}
+	tt.Frame()
+	if !tt.HasText("启动代理") {
+		t.Fatalf("停止后应回到「启动代理」：%q", tt.Texts())
+	}
+}
+
+// TestTitleBarClearsTrafficLights 顶栏必须给红绿灯让出位置，且右侧控件不贴边。
+//
+// 让位量来自 c.TitleBar()：真机实测 macOS 在 hiddenInset 窗口里报
+// Left=79（zoom 按钮右缘）。这条测试用同一组数喂给 tester，然后断言
+// 品牌标的左缘落在 Left 右侧——不靠肉眼判读截图。
+func TestTitleBarClearsTrafficLights(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 480)
+	tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
+
+	r, ok := tt.Find("reply9842")
+	if !ok {
+		t.Fatalf("找不到应用名：%q", tt.Texts())
+	}
+	if r.X < 79 {
+		t.Errorf("应用名左缘 %.1f 落在红绿灯占位（79）里", r.X)
+	}
+	if r.X-r.W > 200 {
+		t.Errorf("应用名左缘 %.1f 太靠右（品牌标在它左边，两者合计约 90）", r.X)
+	}
+	// 右侧开关的最右缘要留出右边距，不能贴死窗口边
+	tg, ok := tt.Find("启动代理")
+	if !ok {
+		t.Fatalf("找不到开关：%q", tt.Texts())
+	}
+	if right := tg.X + tg.W; right > 480-8 {
+		t.Errorf("开关右缘 %.1f 太贴窗口边（480）", right)
+	}
+}
+
+// TestTitleBarDropsNameWhenNarrow 最小宽度下顶栏收起应用名，而不是挤压右侧。
+//
+// 480 宽时右侧那一簇（tabs + 徽标 + 开关）已经要 264，加上 89 的左侧让位，
+// 留给品牌只剩 115——再塞名字会上叠。这条测试守的是「宁可少一个词，
+// 不让控件互相压」这个取舍。
+func TestTitleBarDropsNameWhenNarrow(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 440, 400)
+	tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
+
+	if tt.HasText("reply9842") {
+		t.Errorf("440 宽时应收起应用名：%q", tt.Texts())
+	}
+	// 但开关与徽标必须还在，并且不重叠
+	chip, okChip := tt.Find("复制地址")
+	tg, okTg := tt.Find("启动代理")
+	if !okChip || !okTg {
+		t.Fatalf("窄窗口下顶栏控件丢了：chip=%v toggle=%v（%q）", okChip, okTg, tt.Texts())
+	}
+	if chip.X+chip.W > tg.X {
+		t.Errorf("徽标右缘 %.1f 压住了开关左缘 %.1f", chip.X+chip.W, tg.X)
+	}
+	if tg.X+tg.W > 440 {
+		t.Errorf("开关右缘 %.1f 超出窗口（440）", tg.X+tg.W)
 	}
 }

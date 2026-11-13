@@ -10,8 +10,10 @@
 //
 // 界面（一个窗口，两个 tab）：
 //
-//	面板  状态 + 主操作、上行压缩 hero、三格统计、复制配置
+//	面板  上行压缩图、统计摘要、复制地址
 //	设置  上游 / 监听 / 传输方式 / 开机自启
+//
+// 启动/停止与连接状态都在自绘标题栏上（图标开关），不在面板里重复一遍。
 //
 // 视觉照 OpenDesign 的设计稿转写成 native 绘制，材质见 internal/glass。
 //
@@ -19,7 +21,7 @@
 //   - 压缩比 68px 巨号是运行态的主角；空态**不摆巨号**，只留一句引导——
 //     空态显示「0×」会让用户以为压缩率是 0，摆个破折号又像坏掉的进度条
 //   - 玻璃用 mygo 的 plugins/glass 做真模糊，不是画个半透明色块充数
-//   - 每条信息只出现一次：状态在状态行、版本在 footer、端口在 titlebar
+//   - 每条信息只出现一次：状态在顶栏开关、版本在 footer、监听地址在顶栏徽标
 //
 // 刻意不做 hosts 劫持与配置文件改写：两者都需要提权或改动用户既有配置，
 // 收益（省一步手工）与风险（全局副作用、格式易碎）不成比例。
@@ -36,6 +38,7 @@ import (
 	"time"
 
 	"github.com/egoist/mygo"
+	"github.com/egoist/mygo/transfer"
 	"github.com/egoist/mygo/ui"
 
 	"github.com/jixoai/reply9842/internal/autostart"
@@ -138,11 +141,15 @@ type app struct {
 	// quitting 已进入退出流程。托盘/Dock 的「显示窗口」在退出途中不该再建窗。
 	quitting bool
 
-	// 一次性操作反馈（复制成功/失败），与启动失败的错误分开显示，
-	// 避免同一个原因在状态区与提示行各喊一遍
+	// 一次性操作反馈（启动/停止结果、保存失败），与顶栏开关的状态分开显示，
+	// 避免同一个原因在开关与提示行各喊一遍
 	notice    string
 	noticeErr bool
 	noticeExp time.Time
+
+	// copiedAt 最近一次「复制地址」成功的时刻（零值 = 不在回显窗口里）。
+	// 徽标与 footer 按钮都读它，两处回显因此永远同步。
+	copiedAt time.Time
 
 	// 材质色板（深色 = solid-glass 的设计原型）
 	pal *glass.Palette
@@ -449,21 +456,25 @@ func (a *app) showWindow() {
 func (a *app) createWindow() {
 	win := mygo.NewWindow(mygo.WindowOptions{
 		Title: "reply9842",
-		// 480×510。
+		// 480×496。
 		//
-		// 这个数字不是拍的：设置 tab 的内容在无头渲染里逐行量过——
-		// 8 行字段（上游 / 服务器域名 / 源地址 / 监听 / 传输 / 自启 /
-		// 日志保留 / 显示区间）加 7 条分隔线到 y≈359，加上 titlebar(45) +
-		// footer(28) + 上下内边距(26) + 底部操作行(30) 约需 488；真机窗口的
-		// 外框（圆角阴影那条看不见的边）再吃掉若干像素。400 时最后一行
-		// 「显示区间」会被切掉（实测，无头渲染看不出来），所以这里留到 510。
+		// 高度这个数字不是拍的，是两件事叠出来的：
+		//
+		//  1. 设置 tab 的内容在无头渲染里逐行量过——8 行字段（上游 / 服务器域名 /
+		//     源地址 / 监听 / 传输 / 自启 / 日志保留 / 显示区间）加 7 条分隔线到
+		//     y≈359，加上 titlebar + footer + 上下内边距，400 时最后一行
+		//     「显示区间」会被切掉（实测），所以不低于 480。
+		//  2. 本轮的顶栏从 44 长到 48（红绿灯纵向居中需要一个更松的栏，见
+		//     view.go 的 titleBarHeight），面板少了原先 38px 的状态行。
+		//     510 - 38 + 4 = 476，取 480 与 light 截图用例一致，两者都留了余量。
 		//
 		// 面板 tab 在高窗口里不会露白：有数据时图表卡片 grow 吃满剩余高度。
 		Width:  480,
-		Height: 510,
-		// 窗口可以拉大，但别小到把状态行与主按钮挤成两行
+		Height: 480,
+		// 窗口可以拉大，但别小到把顶栏右侧那一簇挤成两行（顶栏靠收起应用名
+		// 兜到 468，见 titleBar 的 showName）。
 		MinWidth: 440,
-		// 太矮时设置 tab 会滚（比切开好），但别矮到连状态行都放不下
+		// 太矮时设置 tab 会滚（比切开好），但别矮到连顶栏都放不下
 		MinHeight: 400,
 		// 记住位置/尺寸（含最大化），下次从托盘打开时还原。
 		// 键名固定，改它等于丢掉用户摆好的位置。
@@ -472,6 +483,15 @@ func (a *app) createWindow() {
 		// HiddenInset 保留 macOS 的红绿灯（traffic lights），
 		// 让它压在自绘 titlebar 上；其他平台等同 Hidden。
 		TitleBarStyle: mygo.TitleBarHiddenInset,
+		// 红绿灯的位置：不指定时 AppKit 把它们放在顶边 19 处，而 hiddenInset
+		// 窗口会带一条 66 高的 NSToolbar 撑出来的标题区——灯因此落在自绘
+		// 顶栏（48 高）的上半截，视觉上偏上 7pt（真机截图实测：灯心 26，
+		// 顶栏中线 24，而灯本应在 24）。
+		//
+		// 指定 y=17 让 14 高的灯占据 17..31、灯心正好 24 = 顶栏中线，同时
+		// （19, 17）也基本是 macOS 自己的默认位置，不会显得「灯被挪走了」。
+		// 见 view.go 的 titleBarHeight。
+		TrafficLightPosition: &mygo.Point{X: 19, Y: 17},
 		// 桌面透进来，玻璃才有真实内容可模糊（见 internal/glass 包注释）。
 		// 不开这项，页面底板虽是半透明，背后仍是窗口的纯色，blur 等于白做。
 		Vibrancy: mygo.VibrancyUnderWindow,
@@ -533,19 +553,19 @@ func (a *app) start() {
 		return
 	}
 	if err := a.runner.Start(); err != nil {
-		// 不再额外弹一条「启动失败」：状态行已经把「启动失败 + 原因」
+		// 不再额外弹一条「启动失败」：面板的 failureLine 已经把「启动失败 + 原因」
 		// 常驻显示出来了，同一件事说两遍只会让用户怀疑自己漏看了什么。
 		return
 	}
-	a.setNotice("已启动，监听 "+a.runner.Addr(), false)
+	// 启动成功不弹提示：顶栏开关整个变成绿色停止块、footer 出现「运行中 00:02」、
+	// 徽标换成真实端口——三处同时变，比一行会推挤布局的提示条说得更清楚。
 }
 
 func (a *app) stop() {
 	if err := a.runner.Stop(context.Background()); err != nil {
 		a.setNotice(humanError(err), true)
-		return
 	}
-	a.setNotice("已停止", false)
+	// 同上：停止成功由开关与 footer 表达，不需要额外一行字。
 }
 
 // toggle 启动 / 停止（托盘菜单与主按钮共用同一条路径）
@@ -557,11 +577,58 @@ func (a *app) toggle() {
 	}
 }
 
-// copyEnv 复制 Agent 需要的环境变量
-func (a *app) copyEnv() {
-	line := "export ANTHROPIC_BASE_URL=" + a.localURL()
-	mygo.Clipboard.WriteText(line)
-	a.setNotice("已复制："+line, false)
+// copyURL 把本机 relay 的 HTTP 地址放进剪贴板。
+//
+// 只复制裸 URL：这个代理是通用的 HTTP 转发口，不绑定任何一家 SDK 的环境变量
+// 名字。上一版复制的是 `export ANTHROPIC_BASE_URL=...`，那等于替用户决定了
+// 用什么客户端——而同一个地址 OpenAI 兼容客户端、curl、浏览器都能用。
+//
+// 两条写入口（c 非 nil 走视图、nil 走托盘）：
+//
+//	c != nil   ui.Context.WriteClipboardThen —— 框架的正路，写完异步回调，
+//	           无头测试里也走同一份实现（ui.Tester 自带剪贴板）
+//	c == nil   托盘菜单回调没有 Context，直接 mygo.Clipboard
+//
+// 不用 mygo.Clipboard 统一处理：它要求应用事件循环已在跑，在视图里调用会在
+// 测试环境下卡死（onMain 没人泵）。
+//
+// 复制成功才置闪光：写剪贴板可能因为别的进程占着而失败，装成功会让用户以为
+// 贴出来的是新地址。失败走 noticeLine 说清。
+func (a *app) copyURL(c *ui.Context) {
+	url := a.localURL()
+	done := func(err error) {
+		if err != nil {
+			a.setNotice("复制失败："+err.Error(), true)
+			a.invalidate()
+			return
+		}
+		a.setNotice("已复制 "+url, false)
+		a.copiedAt = time.Now()
+		a.invalidate()
+	}
+	if c != nil {
+		c.WriteClipboardThen(url, done)
+		return
+	}
+	if err := mygo.Clipboard.Write(transfer.TextData(url)); err != nil {
+		done(err)
+		return
+	}
+	done(nil)
+}
+
+// copyFlash 复制成功的回显时长。
+//
+// 1.6 秒：短到不会赖在界面上，长到能覆盖「点击 → 视线移到目标 → 意识到成功」
+// 这一整段。0.6 秒那种一闪，用户经常连自己点没点中都判断不了。
+const copyFlash = 1600 * time.Millisecond
+
+// copyFlashing 是否还在复制成功的回显窗口里（徽标与 footer 按钮共用）。
+//
+// 视图每秒重建一次（心跳），所以不需要额外的计时器去清它：时间一过，
+// 下一个心跳帧自然就恢复原样了。
+func (a *app) copyFlashing() bool {
+	return !a.copiedAt.IsZero() && time.Since(a.copiedAt) < copyFlash
 }
 
 // applyTimeSettings 把两个下拉的选择写盘并立刻生效。

@@ -1,11 +1,15 @@
 // view.go — 界面绘制（mygo native UI 的模型：view 是状态的纯函数）
 //
-// 布局（2026-11-13 kzf 反馈后重排）：
+// 布局（2026-11-13 第二轮反馈后重排）：
 //
-//	titlebar  品牌标 + 应用名 + [面板｜设置] tabs + 端口徽标
-//	面板 tab  状态行（状态 + 主操作同一行）· 上行压缩 hero · 三格统计 · 复制配置
+//	titlebar  品牌标 + 应用名 + [面板｜设置] tabs + 复制地址徽标 + 启动/停止图标开关
+//	面板 tab  上行压缩图（吃掉剩余高度）· 启动失败说明（仅失败时）· 统计行 + 复制地址
 //	设置 tab  上游 / 监听 / 传输方式 / 开机自启
-//	footer    运行态 + 传输方式 + 版本号（版本号只在这里出现）
+//	footer    运行态 + 传输方式 + 上游 + 版本号（版本号只在这里出现）
+//
+// 为什么面板不再有状态行：它只有两件事——「连接状态」和「启动/停止」——两件都
+// 已经被顶栏接管（图标开关的形状与颜色就是状态，点它就是那个动作）。一行 38px
+// 的卡片只为了重复顶栏已有的信息，却占着首屏最贵的位置。
 //
 // 空态的两条硬规则：
 //   - 不摆 68px 巨号：空态没有数字，摆「—」是一根读作「坏掉的进度条」的粗横条，
@@ -15,6 +19,7 @@ package main
 
 import (
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/egoist/mygo/ui"
@@ -80,124 +85,245 @@ func (a *app) view(c *ui.Context) {
 
 // ---- titlebar ----
 
-// titleBar 自绘标题栏：品牌标 + 应用名 + tabs + 端口徽标。
+// titleBarHeight 自绘标题栏的高度（DIPs）。
+//
+// 48 是「红绿灯纵向居中」这个约束反解出来的，不是手感：红绿灯按钮实测 14 高，
+// 窗口选项里把它们的左上角放在 y=17（见 main.go 的 TrafficLightPosition），
+// 于是灯心在 24 —— 正好是 48 的一半。灯与这一栏的中线共线，视觉上才读作
+// 「一条 bar 上的一排控件」，而不是「一排灯飘在一块深色板的上半部」。
+//
+// 之前这里写的是 max(bar.Height, 44)，而 macOS 在带 NSToolbar 的 hiddenInset
+// 窗口里报的 bar.Height 是 66：bar 被撑到 66 高，灯却仍在 y≈19-33，于是灯
+// 相对这一栏偏上 7pt（真机截图实测），这正是「和 window-controls 搭不上」的原因。
+const titleBarHeight float32 = 48
+
+// titleBarHeightFor 取这一栏的高度：别的平台（Windows 的标题按钮填满
+// bar.Bottom）报的控件区比 48 高时，宁可加高也不让控件压在内容上。
+func titleBarHeightFor(bar ui.TitleBar) float32 {
+	if bar.Bottom+4 > titleBarHeight {
+		return bar.Bottom + 4
+	}
+	return titleBarHeight
+}
+
+// titleBar 自绘标题栏：品牌 + [面板｜设置] + 复制地址徽标 + 启动/停止开关。
 //
 // 拖拽交给 DragWindow（双击最大化的行为也由它负责）。
-// 左侧留出红绿灯的位置（c.TitleBar().Left）——不留的话红绿灯会压住品牌标。
+//
+// 两侧都要给窗口控件让位：macOS 的红绿灯在左（bar.Left），Windows 的最小化/
+// 最大化/关闭在右（bar.Right）——只让左边的话，Windows 上最右侧那个开关会整块
+// 被压在关闭按钮底下，既点不到也看不见。
 //
 // 版本号不在这里：它和 footer 各显示一次时，用户会以为是两个不同的东西。
 func (a *app) titleBar(c *ui.Context, p *glass.Palette) {
 	bar := c.TitleBar()
-	height := max(bar.Height, 44)
+	height := titleBarHeightFor(bar)
+	w, _ := c.Size()
+
+	// 让位量：灯/按钮的实际占位 + 一段呼吸。控件区为 0（无边框、全屏）时
+	// 退回 14，那是这一栏自己的内边距。
+	left, right := float32(14), float32(14)
+	if bar.Left > 0 {
+		left = bar.Left + 10
+	}
+	if bar.Right > 0 {
+		right = bar.Right + 12
+	}
+
+	// 窄窗口下让出应用名：480 宽时右侧那一簇（tabs 100 + 徽标 120 + 开关 26
+	// 加两道 9 的间隙）要 264，加上左侧 89 的让位与 12 的右边距，留给品牌
+	// 只剩 115——240 加上名字（69）就顶上了。468 是「名字右边还能留 20 空隙」
+	// 的下限；比它窄就把名字收起来，留下三条横杠的品牌标：Dock 与菜单栏
+	// 已经指明了这是什么应用，而两项都在的代价是元素互相挤压。
+	showName := w >= 468
 
 	ui.Row(c).Height(height).FillWidth().
-		Padding(0, 12, 0, max(bar.Left, 14)).
-		Gap(9).AlignItems(ui.Center).
+		Padding(0, right, 0, left).
+		Gap(8).AlignItems(ui.Center).
 		Background(p.PageDim).
 		DragWindow().
 		Children(func() {
-			// 品牌标：三条圆角横杠（设计稿的 mark）
-			ui.Box(c).Size(15, 15).Shrink(0).Draw(func(pt *ui.Painter, r ui.Rect) {
-				bars := []struct {
-					y, w  float32
-					alpha float32
-				}{{3.2, 10.5, 0.92}, {6.3, 10.5, 0.60}, {9.4, 4.4, 0.95}}
-				for _, b := range bars {
-					pt.Fill(ui.Rect{X: r.X + 2.2, Y: r.Y + b.y, W: b.w, H: 2.1},
-						p.Foreground.Alpha(b.alpha), 1.05)
+			ui.Row(c).Gap(7).AlignItems(ui.Center).Shrink(0).Children(func() {
+				a.brandMark(c, p)
+				if showName {
+					ui.Text(c, "reply9842").FontSize(12.5).FontWeight(590).
+						LetterSpacing(0.06).TextColor(p.Foreground).SingleLine()
 				}
 			})
 
-			ui.Text(c, "reply9842").FontSize(12.5).FontWeight(590).
-				LetterSpacing(0.06).TextColor(p.Foreground).SingleLine()
 			ui.Box(c).Grow(1)
 
-			// tabs 在右上角（用户明确要求），紧挨端口徽标左侧
+			// tabs 在右上角（用户明确要求），紧挨复制徽标左侧。
 			// 用 Segmented 而不是 ui.Tabs：Tabs 的选中态是一条下划线，
-			// 在这条 44px 的深色条上几乎看不见；分段控件的选中块与玻璃
+			// 在这条 48px 的深色条上几乎看不见；分段控件的选中块与玻璃
 			// 材质语言一致（「一片薄玻璃贴在厚玻璃上」）。
 			ui.Segmented(c, &a.tab, "面板", "设置").
 				FontSize(11.5).Height(26).Shrink(0)
 
-			a.portBadge(c, p)
+			a.hostChip(c, p)
+			a.runToggle(c, p)
 		})
 
 	// 底边发丝线：与 body 之间一道分界，让 titlebar 读作一条独立 chrome
 	ui.Box(c).Height(1).FillWidth().Background(p.Hairline)
 }
 
-// portBadge 监听端口的徽标（设计稿的 brand-port：mono + 浅底 + 内描边）
-func (a *app) portBadge(c *ui.Context, p *glass.Palette) {
-	addr := a.listen
-	if a.running() {
-		if r := a.runner.Addr(); r != "" {
-			addr = r
+// brandMark 品牌标：三条圆角横杠（设计稿的 mark）。
+//
+// 宽度收在 15 上是为了和 12.5 的行高对齐：横杠的落差 6.2 正好落在字身中线
+// 两侧，因此品牌标与「reply9842」在视觉上共用一条中线。
+func (a *app) brandMark(c *ui.Context, p *glass.Palette) {
+	ui.Box(c).Size(15, 15).Shrink(0).Draw(func(pt *ui.Painter, r ui.Rect) {
+		bars := []struct {
+			y, w  float32
+			alpha float32
+		}{{3.2, 10.5, 0.92}, {6.3, 10.5, 0.60}, {9.4, 4.4, 0.95}}
+		for _, b := range bars {
+			pt.Fill(ui.Rect{X: r.X + 2.2, Y: r.Y + b.y, W: b.w, H: 2.1},
+				p.Foreground.Alpha(b.alpha), 1.05)
 		}
-	}
-	ui.Row(c).Padding(2.5, 6).Background(ui.RGBA(255, 255, 255, 0.04)).
-		InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.045)).
-		Radius(6).Shrink(0).
-		Children(func() {
-			ui.Text(c, addr).FontSize(10).Font("monospace").
-				TextColor(p.Tertiary).SingleLine()
-		})
+	})
 }
+
+// hostChip 可点击复制的地址（shadcn 的 copy 组件那一套）。
+//
+// 交互契约：
+//
+//	默认   地址（mono，可截断）+ 复制图标
+//	悬停   底色抬亮一档、文字提到正文色 —— 整块都是可点区域
+//	点击   复制纯 URL 到剪贴板，图标变对勾、文字变「已复制」，1.6 秒后复原
+//
+// 为什么显示时去掉 scheme：这一栏只有 480 宽，`http://` 要吃掉约 40px，
+// 而复制出去的内容仍是完整 URL（footer 的提示与这里显示同源，见 localURL）。
+// 显示上截断用 TruncateMiddle：`127.0.0.…:18899` 保住端口那一半——
+// 端口才是用户要核对的那几个数字。
+func (a *app) hostChip(c *ui.Context, p *glass.Palette) {
+	copied := a.copyFlashing()
+	bg, fg, icon := ui.RGBA(255, 255, 255, 0.04), p.MutedForeground, iconCopy
+	if copied {
+		bg, fg, icon = p.Success.Alpha(0.12), p.Success, iconCheck
+	}
+
+	chip := ui.ButtonBase(c.Key("copy-host")).Shrink(0).Height(22).
+		Padding(0, 7).Gap(5).Radius(7).
+		AlignItems(ui.Center).Cursor(ui.CursorPointer).
+		Label("复制地址").
+		InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.045)).
+		Shadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.03))
+	switch {
+	case chip.Pressed():
+		chip = chip.Background(ui.RGBA(255, 255, 255, 0.12))
+	case chip.Hovered():
+		chip = chip.Background(ui.RGBA(255, 255, 255, 0.085))
+	default:
+		chip = chip.Background(bg)
+	}
+	// 悬停时文字也提亮：面积这么小的徽标，只换底色不足以说「这里能点」。
+	text := fg
+	if chip.Hovered() && !copied {
+		text = p.Foreground
+	}
+	chip.Children(func() {
+		ui.Icon(c, icon).Size(10, 10).Shrink(0).TextColor(fg)
+		ui.Text(c, a.hostText()).FontSize(10).Font("monospace").
+			TextColor(text).SingleLine().TruncateMiddle().MaxWidth(104)
+	})
+	if chip.Clicked() {
+		a.copyURL(c)
+	}
+}
+
+// hostText 徽标上显示的地址（去掉 scheme，端口是用户真正要核对的东西）
+func (a *app) hostText() string {
+	return strings.TrimPrefix(a.localURL(), "http://")
+}
+
+// runToggle 启动/停止：顶栏右侧的图标开关。
+//
+// 它不是「切换按钮」而是一个动作按钮，只是图标与配色随运行状态变：
+// 停止时是实心三角（播放 = 开始），运行时是实心方块（停止 = 结束）并且
+// 整块染上成功色——用户扫一眼窗口右上角就知道现在到底跑没跑，不必去读字。
+//
+// 三态底色在这里按帧选择，而不是交给 Theme 的 faces 机制：这个按钮的面色
+// 依赖运行状态，要走 faces 就必须让 Theme 随状态变化，那会把 Segmented、
+// 输入框一起染色。直接读 Hovered/Pressed 是框架给自绘控件的正道（读它会让
+// 悬停变化重建一次视图，代价与一秒一次的心跳同量级）。
+func (a *app) runToggle(c *ui.Context, p *glass.Palette) {
+	running := a.running()
+	key, label := "run-start", "启动代理"
+	icon, iconColor := iconPlay, p.Foreground
+	rest, hover, pressed := p.Control, p.Hover, p.Pressed
+	if running {
+		key, label = "run-stop", "停止代理"
+		icon, iconColor = iconStop, p.Success
+		rest, hover, pressed = p.Success.Alpha(0.16), p.Success.Alpha(0.26), p.Success.Alpha(0.34)
+	}
+
+	btn := ui.ButtonBase(c.Key(key)).Size(26, 26).Radius(9).
+		Shrink(0).Cursor(ui.CursorPointer).
+		Label(label).Tooltip(label).
+		InsetShadow(0, 1, 0, 0, p.ControlRim).
+		InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.045)).
+		Shadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.05)).
+		Shadow(0, 1, 2, 0, ui.RGBA(0, 0, 0, 0.28))
+	switch {
+	case btn.Pressed():
+		btn = btn.Background(pressed)
+	case btn.Hovered():
+		btn = btn.Background(hover)
+	default:
+		btn = btn.Background(rest)
+	}
+	btn.Children(func() {
+		ui.Icon(c, icon).Size(11, 11).TextColor(iconColor)
+	})
+	if btn.Clicked() {
+		a.toggle()
+	}
+}
+
+// 图标（24×24 view box，lucide 的几何）。
+//
+// 都是实心/描边混排的两组：动作图标（播放、停止）用实心块，因为 11px 下
+// 描边三角会糊成三条线；辅助图标（复制、对勾）用描边，因为它们在 10px 上要
+// 与 mono 文字的笔画重量相当，实心会变成两个黑点。
+var (
+	iconPlay  = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><path d="M7 5.4c0-1.1 1.2-1.8 2.2-1.2l10.9 6.6c.9.6.9 1.9 0 2.5L9.2 19.8C8.2 20.4 7 19.7 7 18.6z" fill="currentColor"/></svg>`))
+	iconStop  = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2.6" fill="currentColor"/></svg>`))
+	iconCopy  = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="13" x="9" y="9" rx="2.5"/><path d="M5 15.5A2.5 2.5 0 0 1 2.5 13V5A2.5 2.5 0 0 1 5 2.5h8A2.5 2.5 0 0 1 15.5 5"/></svg>`))
+	iconCheck = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6.5 9.5 17 4 11.5"/></svg>`))
+)
 
 // ---- 面板 tab ----
 
-// panelPane 「面板」tab 的全部内容
+// panelPane 「面板」tab 的全部内容。
+//
+// 没有状态行：连接状态与主操作都已经被顶栏接管（见 runToggle），这里只剩
+// 「效果如何」——图占满剩余高度，失败时在上面补一句原因。
 func (a *app) panelPane(c *ui.Context, p *glass.Palette) {
-	a.statusRow(c, p)
+	a.failureLine(c, p)
 	// 图表卡片吃掉剩余高度：窗口拉高时变高的是图，不是底部空白。
 	a.chartCard(c, p)
 }
 
-// statusRow 状态 + 主操作同一行。
+// failureLine 启动失败那一句（仅失败时出现）。
 //
-// 为什么合并：独立的状态卡用 90px 高度说「没事发生」，却占着首屏黄金位；
-// 而「启动代理」是用户打开这个窗口的唯一目的，应该在第一屏最显眼处。
-//
-//	┌──────────────────────────────────────────────┐
-//	│ ● 已停止 · 本地流量不经过压缩          [启动代理] │
-//	└──────────────────────────────────────────────┘
-func (a *app) statusRow(c *ui.Context, p *glass.Palette) {
-	kind, label, detail := a.state()
-	color := p.MutedForeground
-	switch kind {
-	case stateRunning:
-		color = p.Success
-	case stateFailed:
-		color = p.Danger
+// 状态行的另一半职责就是它：开关只能表达「没跑起来」，说不出为什么。
+// 这一行把它补上，并且在开关旁边就能看到——用户点完开关，视线还在右上角，
+// 这句出现在正文第一行，不会被当成装饰。
+func (a *app) failureLine(c *ui.Context, p *glass.Palette) {
+	if a.running() || a.lastErr() == nil {
+		return
 	}
-
-	glass.Surface(ui.Row(c).Padding(9, 12).AlignItems(ui.Center).Gap(9), p, glass.Panel()).
-		Children(func() {
-			// 状态点：实心小圆 + 一圈极淡外描边。
-			// 不用同色光晕——solid-glass 的规矩是「光影在边缘」，雾状红晕是它明确反对的。
-			ui.Box(c).Size(8, 8).Radius(4).Shrink(0).Background(color).
-				Shadow(0, 0, 0, 1, ui.RGBA(0, 0, 0, 0.35))
-
-			// 大字号用 15 而不是设计稿的 23：这是一行内联状态，不是页面标题。
-			// 23px 会把这一行顶到 46px 高，又把「一屏放下」破坏掉。
-			ui.Text(c, label).FontSize(15).FontWeight(600).
-				LetterSpacing(-0.16).TextColor(color).SingleLine()
-
-			ui.Text(c, "·").FontSize(11).TextColor(p.Tertiary).SingleLine()
-			ui.Text(c, detail).FontSize(11).TextColor(p.MutedForeground).
-				MaxLines(1).Grow(1)
-
-			// 主操作按钮贴右：它是这一行唯一的可点目标，位置固定才不会
-			// 在「启动/停止」切换时左右跳。
-			if a.running() {
-				if a.actionButton(c, p, "stop", "停止", true).Clicked() {
-					a.stop()
-				}
-			} else {
-				if a.actionButton(c, p, "start", "启动", true).Clicked() {
-					a.start()
-				}
-			}
-		})
+	glass.Surface(ui.Row(c).Padding(8, 12).AlignItems(ui.Center).Gap(8),
+		p, glass.Panel()).Children(func() {
+		ui.Box(c).Size(8, 8).Radius(4).Shrink(0).Background(p.Danger).
+			Shadow(0, 0, 0, 1, ui.RGBA(0, 0, 0, 0.35))
+		ui.Text(c, "启动失败").FontSize(12).FontWeight(600).
+			TextColor(p.Danger).SingleLine().Shrink(0)
+		ui.Text(c, humanError(a.lastErr())).FontSize(11).
+			TextColor(p.MutedForeground).MaxLines(1).Grow(1)
+	})
 }
 
 // liveBadge 「实时 / 已暂停」胶囊（内嵌 4px 圆点）。
@@ -250,14 +376,13 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 	running := a.running()
 	hasData := a.hasSeries()
 
-	card := ui.Column(c).Padding(12, 14, 12).Gap(8)
-	if hasData {
-		// 有数据时卡片吃掉剩余高度（窗口拉高 → 图变高，而不是底部留空）。
-		// 空态不吃：把一句引导泡在半个屏幕的空白里比留白更难看。
-		card = card.Grow(1)
-	}
-
-	glass.Surface(card, p, glass.Card).Children(func() {
+	// 卡片永远吃掉剩余高度。
+	//
+	// 空态也吃（2026-11-13 第二轮）：状态行搬去顶栏之后，面板上空出了那 38px，
+	// 若空卡仍按内容高度收着，下面就是 300px 纯空——那不是「留白」，是「没画完」。
+	// 让卡片撑满，空态那句引导在卡内垂直居中，读作「一张空的图，等待数据」；
+	// 这才是空态该有的形状（shadcn 的 Empty 也是占满容器再居中）。
+	glass.Surface(ui.Column(c).Padding(12, 14, 12).Gap(8).Grow(1), p, glass.Card).Children(func() {
 		// 头部：标题 + 图例 + live 徽标。
 		// 图例只在有柱子时出现——空态下「■省下 ■实发」在解释一个不存在的东西。
 		ui.Row(c).AlignItems(ui.Center).Gap(10).Children(func() {
@@ -272,9 +397,12 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 		if !hasData {
 			// 空态不画坐标系：一副空坐标轴会被读成「图表坏了」，
 			// 而「启动代理后…」本身就是准确的说明。
-			// 空态不撑满（52 就够）：把一句引导泡在一大片空白里反而显得没画完。
-			ui.Box(c).Height(52).FillWidth().AlignItems(ui.Center).
-				Justify(ui.Center).Children(func() {
+			//
+			// 引导放在绘图区（而不是卡片正中）的高度一半处：标题在上、引导居中、
+			// 下面留给图的位置——将来出现第一根柱子时，那句引导消失的位置正好是
+			// 柱子长出来的地方，视线不会跳。
+			ui.Box(c).Grow(1).MinHeight(52).FillWidth().
+				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
 				ui.Text(c, a.emptyChartNote()).FontSize(11.5).
 					TextColor(p.MutedForeground).SingleLine()
 			})
@@ -557,7 +685,12 @@ func (a *app) heroNote(g stats.Agg, running bool) string {
 // 为什么统计压成一行文字：三格卡片要占 60px 高，而它们的信息（请求数、
 // 节省量、p50）在有图表之后是次要的——图表已经回答了「效果如何」，
 // 这些数字是「顺带看一眼」的量级。腾出来的高度给图表。
+//
+// 顶栏那个徽标已经能复制地址，这个按钮仍留着：它挨着统计数字，用户在
+// 「看成效」时顺手就要 `http://…` 去贴到别处，回顶栏找一个 10px 的小徽标
+// 反而是绕路。两处复制同一个东西、用同一条路径（copyURL），口径不会漂。
 func (a *app) footerPane(c *ui.Context, p *glass.Palette) {
+	copied := a.copyFlashing()
 	g := a.agg
 	saved := g.UpRaw - g.UpWire
 	if saved < 0 {
@@ -567,8 +700,19 @@ func (a *app) footerPane(c *ui.Context, p *glass.Palette) {
 	ui.Row(c).FillWidth().Padding(0, 16, 12).AlignItems(ui.Center).Gap(10).Children(func() {
 		ui.Text(c, a.statsLine(g, saved)).FontSize(11).
 			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(1).Grow(1)
-		if a.actionButton(c, p, "copy", "复制配置", false).Clicked() {
-			a.copyEnv()
+
+		label := "复制地址"
+		if copied {
+			label = "已复制"
+		}
+		btn := a.actionButton(c, p, "copy", label, false)
+		if copied {
+			// 成功反馈靠换一个词 + 换成成功色，而不是弹一个 toast：
+			// 复制是低风险动作，用户只需要知道「刚才那下生效了」。
+			btn = btn.TextColor(p.Success)
+		}
+		if btn.Clicked() {
+			a.copyURL(c)
 		}
 	})
 }
@@ -617,9 +761,15 @@ func (a *app) actionButton(c *ui.Context, p *glass.Palette, key, label string, p
 		Shadow(0, 1, 2, 0, ui.RGBA(0, 0, 0, 0.25))
 }
 
-// noticeLine 一次性操作反馈（复制成功、启动/停止结果）。
+// noticeLine 一次性操作反馈（设置保存失败、复制失败）。
 //
-// 只报操作结果，不重复渲染启动失败原因——那个在状态行里常驻显示过了。
+// 只在失败时出现：成功都有别的、更靠近源头的地方在说（复制→徽标变对勾、
+// 启动→开关变绿、设置写盘→下拉框自己已经改了），再补一句是重复。
+//
+// 备注：这一行参与内容流（不是浮层），出现时会把下面的卡片推下去。它只在
+// 「用户刚做了一个动作、结果出乎意料」时出现，属于需要读的那类信息，
+// 挤一下布局是可接受的；反过来，成功提示绝不能走这条路——那会让每次
+// 复制都晃一下图表。
 func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 	if a.notice == "" || time.Now().After(a.noticeExp) {
 		return

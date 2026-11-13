@@ -17,7 +17,7 @@
 //	──────
 //	启动 / 停止
 //	──────
-//	复制 ANTHROPIC_BASE_URL
+//	复制地址
 //	──────
 //	退出 reply9842
 //
@@ -152,8 +152,8 @@ func (t *trayUI) buildMenu() *mygo.Menu {
 		mygo.Separator(),
 		t.toggleItem,
 		mygo.Separator(),
-		{ID: itemCopy, Label: "复制 ANTHROPIC_BASE_URL", Click: func(*mygo.MenuItem, *mygo.Window) {
-			a.copyEnv()
+		{ID: itemCopy, Label: "复制地址", Click: func(*mygo.MenuItem, *mygo.Window) {
+			a.copyURL(nil)
 		}},
 	}
 
