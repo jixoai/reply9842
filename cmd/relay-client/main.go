@@ -22,6 +22,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,8 +42,9 @@ type cfg struct {
 	transport  string
 	insecure   bool
 	minDelta   int
-	minPrefix  float64
-	historyN   int
+	historyMB  int64
+	captureDir string
+	captureN   int
 	maxResume  int
 	logPath    string
 	statsPath  string
@@ -56,8 +58,9 @@ func main() {
 	flag.StringVar(&c.transport, "transport", "auto", "传输: auto|quic|tcp")
 	flag.BoolVar(&c.insecure, "insecure", false, "跳过服务端证书校验（自签观察期）")
 	flag.IntVar(&c.minDelta, "min-delta", 16<<10, "小于此字节数的请求体不做 delta")
-	flag.Float64Var(&c.minPrefix, "min-prefix", 0.5, "公共前缀占比低于此值不做 delta")
-	flag.IntVar(&c.historyN, "history", 8, "保留的历史基线条数")
+	flag.Int64Var(&c.historyMB, "history-mb", 64, "基线历史总字节预算（MB）")
+	flag.StringVar(&c.captureDir, "capture-dir", "", "采样目录：把请求体原样落盘供离线分析（留空不采）")
+	flag.IntVar(&c.captureN, "capture-n", 30, "最多采样多少条")
 	flag.IntVar(&c.maxResume, "max-resume", 3, "断线后最大续传重试次数（0=不续传）")
 	flag.StringVar(&c.logPath, "log", "", "逐请求日志（默认 ~/.rfc9842-reply/client-<date>.jsonl）")
 	flag.StringVar(&c.statsPath, "stats", "", "汇总统计（默认同目录 stats.json）")
@@ -83,12 +86,13 @@ func main() {
 		Addr: c.server, ServerName: c.serverName,
 		Insecure: c.insecure, Mode: mode,
 	}
-	finder := basefind.New(c.historyN)
+	finder := basefind.New(c.historyMB)
 
 	log.Printf("relay-client 启动")
 	log.Printf("  本地 HTTP   http://%s", c.listen)
 	log.Printf("  隧道上游    %s (%s)", c.server, mode)
-	log.Printf("  delta 门槛  >=%d 字节 且 前缀>=%.0f%%", c.minDelta, c.minPrefix*100)
+	log.Printf("  delta 门槛  >=%d 字节（块复用率>=50%%）", c.minDelta)
+	log.Printf("  基线历史    %d MB", c.historyMB)
 	log.Printf("  日志        %s", c.logPath)
 
 	h := &handler{c: &c, dialer: dialer, finder: finder, col: col}
@@ -115,11 +119,34 @@ func main() {
 	}
 }
 
+// capture 把请求体原样落盘（按序号命名），用于离线重放分析。
+// 只采前 captureN 条，避免无限增长。
+func (h *handler) capture(body []byte) {
+	h.capMu.Lock()
+	n := h.capCount
+	if n >= h.c.captureN {
+		h.capMu.Unlock()
+		return
+	}
+	h.capCount++
+	h.capMu.Unlock()
+
+	os.MkdirAll(h.c.captureDir, 0o755)
+	path := filepath.Join(h.c.captureDir, fmt.Sprintf("req-%04d.bin", n))
+	if err := os.WriteFile(path, body, 0o600); err != nil {
+		log.Printf("capture write err: %v", err)
+		return
+	}
+	log.Printf("captured #%d %d bytes -> %s", n, len(body), path)
+}
+
 type handler struct {
-	c      *cfg
-	dialer *transport.Dialer
-	finder *basefind.Finder
-	col    *stats.Collector
+	c        *cfg
+	dialer   *transport.Dialer
+	finder   *basefind.Finder
+	col      *stats.Collector
+	capMu    sync.Mutex
+	capCount int
 }
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -136,6 +163,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	rec.UpRaw = int64(len(body))
+
+	// 采样（仅在开启时）：原样落盘，供离线分析二进制前缀特征
+	if h.c.captureDir != "" {
+		h.capture(body)
+	}
 
 	// ---- 选择编码 ----
 	enc := meta.EncIdentity
@@ -159,7 +191,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		// 大请求：尝试 delta
-		bh, baseBody := h.finder.Pick(body, h.c.minPrefix)
+		bh, baseBody := h.finder.Pick(body)
 		if !bh.IsZero() {
 			lvl := codec.PickLevel(len(body))
 			z, err := codec.EncodeDcz(body, bh, lvl, baseBody)

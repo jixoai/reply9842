@@ -375,12 +375,22 @@ func (s *server) startPump(e *spool.Entry, h *meta.RequestHead, hdrRaw, body []b
 
 		resp, err := s.client.Do(req)
 		if err != nil {
+			// 上游不可达：标记为不可复用，Finish 后立即从 spool 移除。
+			// 否则空响应会被当成「已完成」永久命中，客户端永远拿到空结果。
 			e.Finish(err)
+			e.MarkUncacheable()
 			return
 		}
 		defer resp.Body.Close()
 
 		e.SetHead(resp.StatusCode, meta.EncodeHeaders(resp.Header))
+		// 非 2xx 响应不进入幂等复用（瞬时故障不应被固化）
+		if resp.StatusCode >= 400 {
+			defer func() {
+				// 让客户端拿到这次的错误响应，但之后不再复用
+			}()
+			e.MarkUncacheable()
+		}
 
 		buf := make([]byte, 32*1024)
 		for {
@@ -404,7 +414,9 @@ func (s *server) startPump(e *spool.Entry, h *meta.RequestHead, hdrRaw, body []b
 			}
 		}
 		e.Finish(nil)
-		s.store.Put(body)
+		if !e.Uncacheable() {
+			s.store.Put(body)
+		}
 	}()
 }
 

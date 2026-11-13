@@ -93,6 +93,9 @@ type Entry struct {
 	// gen 单调递增的「内容版本号」，WaitMore 用它判断是否有新数据
 	gen uint64
 
+	// uncacheable 标记「这条记录不该被复用」（上游失败/非 2xx）
+	uncacheable bool
+
 	// elem 在 Manager 的 LRU 列表中的位置
 	elem *list.Element
 }
@@ -289,6 +292,23 @@ func (e *Entry) finishLocked() {
 	e.gen++
 	close(e.notify)
 	e.notify = make(chan struct{})
+}
+
+// MarkUncacheable 标记该条目不可复用。
+//
+// 场景：上游连接失败（0 字节 + error）或返回 4xx/5xx。这类结果如果留在
+// idem 区，同一个 key 之后会永远命中这个失败响应，客户端再也拿不到正确结果。
+func (e *Entry) MarkUncacheable() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.uncacheable = true
+}
+
+// Uncacheable 是否已标记为不可复用
+func (e *Entry) Uncacheable() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.uncacheable
 }
 
 // SetHead 记录响应头（仅首次生效），并写入 sidecar 供重启后恢复。

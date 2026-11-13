@@ -414,3 +414,38 @@ func TestStartupResetsTmpKeepsIdem(t *testing.T) {
 		t.Errorf("idem 数据丢失: %q", got)
 	}
 }
+
+// 上游失败产生的空条目必须可标记为不可复用，并从 spool 移除
+func TestUncacheableEviction(t *testing.T) {
+	m := newTestManager(t)
+	var k [32]byte
+	k[0] = 0xAA
+
+	e, _, _ := m.Acquire(k)
+	// 模拟上游失败：0 字节 + error
+	e.Finish(errTestUpstream)
+	e.MarkUncacheable()
+
+	if !e.Uncacheable() {
+		t.Fatal("should be marked uncacheable")
+	}
+	if !e.IsComplete() {
+		t.Fatal("should be complete")
+	}
+
+	// 回收后再次 Acquire 应该得到新条目（existing=false）
+	m.Evict(k)
+	_, existing, err := m.Acquire(k)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if existing {
+		t.Fatal("evicted entry should not be reused: 失败的响应被固化会导致客户端永远拿到空结果")
+	}
+}
+
+var errTestUpstream = errStr("upstream unreachable")
+
+type errStr string
+
+func (e errStr) Error() string { return string(e) }
