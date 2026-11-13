@@ -37,12 +37,23 @@ RUN set -eu; \
       go version -m /out/reply9842-server | grep -q "GOARCH=${TARGETARCH}"; \
     fi
 
+# scratch 里没有 shell，不能建目录；状态目录必须在构建阶段就建好并交出属主。
+# 否则运行期 os.UserHomeDir() 得到 "/"，stats 初始化会去 mkdir /.reply9842，
+# 非 root（65532）直接 permission denied —— 2026-11-13 的镜像冒烟测试就是这么
+# 挂的（`stats: mkdir /.reply9842: permission denied`）。
+# 目录会作为 VOLUME 的种子：Docker 初始化匿名卷时连属主一起拷进去。
+RUN mkdir -p /out/state/spool && chown -R 65532:65532 /out/state
+
 # ---- 运行 ----
 FROM scratch
 COPY --from=build /out/reply9842-server /reply9842-server
 # 时区数据（日志时间戳需要）
 COPY --from=build /usr/share/zoneinfo /usr/share/zoneinfo
-ENV TZ=Asia/Shanghai
+# 状态目录：预先建好并把属主交给运行用户（scratch 里没法 RUN chown）。
+# HOME 指过去，server 的默认日志/统计就落在这个可写目录里，而不是 "/"。
+COPY --from=build --chown=65532:65532 /out/state /var/lib/reply9842
+ENV TZ=Asia/Shanghai \
+    HOME=/var/lib/reply9842
 # 证书与 spool 目录
 VOLUME ["/certs", "/var/lib/reply9842"]
 USER 65532:65532

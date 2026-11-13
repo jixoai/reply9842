@@ -499,16 +499,46 @@ jobs:
           cache-to: type=gha,mode=max
 
       - name: Smoke test the image
-        # 镜像推完必须验证它真的能起来，否则「构建成功但跑不起来」会一路传到用户
+        # 镜像推完必须验证它真的能起来，否则「构建成功但跑不起来」会一路传到用户。
+        #
+        # 两步，缺一不可：
+        #  1. 不带参数跑（覆盖 ENTRYPOINT，绕开 CMD 里的 -cert）→ 必须打印参数校验错误
+        #  2. 挂自签证书真跑起来 → /healthz 必须 200
+        #
+        # 第 2 步是 2026-11-13 补的：只验第 1 步时，镜像里 stats 初始化写
+        # `/.reply9842` 被 permission denied 打死（非 root + HOME=/），
+        # 而第 1 步在 CMD 已经给了 -cert 的情况下根本走不到那里。
         run: |
           set -euo pipefail
           img="ghcr.io/${{ github.repository }}-server:latest"
           docker pull "$img"
-          # 无证书应当 fatal 退出（证明二进制真的在跑，而不是空壳）
-          if docker run --rm "$img" 2>&1 | grep -q "必须提供 -cert 与 -key"; then
-            echo "✓ 镜像可执行且参数校验生效"
+
+          if docker run --rm --entrypoint /reply9842-server "$img" 2>&1 | grep -q "必须提供 -cert 与 -key"; then
+            echo "✓ 参数校验生效"
           else
-            echo "❌ 镜像未能正常启动" >&2
-            docker run --rm "$img" 2>&1 | tail -20 >&2 || true
+            echo "❌ 参数校验没触发" >&2
+            docker run --rm --entrypoint /reply9842-server "$img" 2>&1 | tail -20 >&2 || true
             exit 1
           fi
+
+          workdir="$(mktemp -d)"
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
+            -keyout "$workdir/key.pem" -out "$workdir/cert.pem" 2>/dev/null
+          docker run -d --name r9842-smoke \
+            -v "$workdir/cert.pem:/certs/fullchain.pem:ro" \
+            -v "$workdir/key.pem:/certs/privkey.pem:ro" \
+            -p 18080:8080 "$img" >/dev/null
+          ok=""
+          for _ in $(seq 1 20); do
+            if curl -fsS --max-time 2 http://127.0.0.1:18080/healthz >/dev/null 2>&1; then ok=1; break; fi
+            sleep 1
+          done
+          if [ -z "$ok" ]; then
+            echo "❌ 容器起来了但 /healthz 不通" >&2
+            docker logs r9842-smoke 2>&1 | tail -30 >&2 || true
+            docker rm -f r9842-smoke >/dev/null 2>&1 || true
+            exit 1
+          fi
+          echo "✓ 容器运行中且 /healthz 返回 200"
+          docker rm -f r9842-smoke >/dev/null
