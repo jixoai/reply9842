@@ -287,6 +287,9 @@ func main() {
 	cfg.Listen, cfg.Server, cfg.Transport = *listen, *server, *transport
 	cfg.ServerName, cfg.Insecure = *serverName, *insecure
 	cfg.LocalAddr = *localAddr
+	// 默认值快照：用来判断某个 flag 是「用户真的指定了」还是「没动」。
+	defCfg := relayclient.Config{}
+	defCfg.Normalize()
 
 	pal := glass.Dark()
 	if *light {
@@ -305,6 +308,28 @@ func main() {
 	}
 	st.Normalize()
 	cfg.Retain, cfg.Window = st.Retain(), st.Window()
+
+	// 连接参数：settings.json 也要能记住它们。
+	//
+	// 背景（2026-11-14）：用户机器开着 TUN 全局代理，隧道服务器 IP 被导进
+	// utun（route get 47.82.76.102 → 198.18.0.1 / utun5），必须把「源地址」
+	// 绑到物理网卡才能连上。这些值是 flag-only 的，GUI 重启就回默认值 ——
+	// 表现就是「更新到 0.3 之后连不上了」。现在写进配置，且 flag 显式给了
+	// 值（≠ 默认值）时仍然以 flag 为准。
+	pick := func(flagVal, defVal, saved, cur string) string {
+		if flagVal != defVal {
+			return cur // 命令行显式指定，尊重它
+		}
+		if saved != "" {
+			return saved
+		}
+		return cur
+	}
+	cfg.Listen = pick(*listen, defCfg.Listen, st.Listen, cfg.Listen)
+	cfg.Server = pick(*server, defCfg.Server, st.Server, cfg.Server)
+	cfg.ServerName = pick(*serverName, defCfg.ServerName, st.ServerName, cfg.ServerName)
+	cfg.LocalAddr = pick(*localAddr, defCfg.LocalAddr, st.LocalAddr, cfg.LocalAddr)
+	cfg.Transport = pick(*transport, defCfg.Transport, st.Transport, cfg.Transport)
 
 	a := &app{
 		logs:           logRing,
@@ -780,6 +805,11 @@ func (a *app) currentSettings() relayclient.Settings {
 		WindowSec:    int64(window / time.Second),
 		AutoUpdate:   a.autoUpdate,
 		UpdateMirror: strings.TrimSpace(a.updateMirror),
+		Server:       strings.TrimSpace(a.server),
+		ServerName:   strings.TrimSpace(a.serverName),
+		Listen:       strings.TrimSpace(a.listen),
+		LocalAddr:    strings.TrimSpace(a.localAddr),
+		Transport:    a.transport,
 		// 运行态由 Runner 的**实际**状态给出，不是某个「想让它跑」的标记：
 		// 启动失败时不能让文件写成 true，否则下次启动会再失败一次。
 		Running: a.running(),

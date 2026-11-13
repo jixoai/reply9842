@@ -75,6 +75,20 @@ type Settings struct {
 	// 更新状态行里。
 	UpdateMirror string `json:"update_mirror"`
 
+	// ---- 连接参数（2026-11-14 起持久化）----
+	//
+	// 这四个字段以前只活在命令行 flag 里，GUI 重启就回默认值。用户机器上的
+	// 现实是：系统开着 TUN 全局代理，隧道服务器 IP 被导进 utun，必须填
+	// 「源地址」绑物理网卡才能连上。升级一次就丢一次配置，等于每次升级都要
+	// 重新踩一遍——所以持久化它们。
+	//
+	// 空串 = 未配置，沿用 Config.Normalize 的默认值（老配置文件因此无需迁移）。
+	Server     string `json:"server,omitempty"`
+	ServerName string `json:"server_name,omitempty"`
+	Listen     string `json:"listen,omitempty"`
+	LocalAddr  string `json:"local_addr,omitempty"`
+	Transport  string `json:"transport,omitempty"`
+
 	// Running 上次退出时的运行状态。
 	//
 	// true  = 上次是开着隧道退出的（含登录启动、自动更新重启），下次启动自动进入运行；
@@ -100,6 +114,28 @@ func (s Settings) Retain() time.Duration { return time.Duration(s.RetainSec) * t
 
 // Window 显示区间
 func (s Settings) Window() time.Duration { return time.Duration(s.WindowSec) * time.Second }
+
+// ApplyTo 把配置里的连接参数盖到 cfg 上（只盖非空项）。
+//
+// flag 与配置的优先级由调用方决定：GUI 里 flag 显式给了值就不该被文件覆盖。
+func (s Settings) ApplyTo(cfg *Config) {
+	if s.Server != "" {
+		cfg.Server = s.Server
+	}
+	if s.ServerName != "" {
+		cfg.ServerName = s.ServerName
+	}
+	if s.Listen != "" {
+		cfg.Listen = s.Listen
+	}
+	if s.LocalAddr != "" {
+		cfg.LocalAddr = s.LocalAddr
+	}
+	switch strings.ToLower(s.Transport) {
+	case "auto", "quic", "tcp":
+		cfg.Transport = strings.ToLower(s.Transport)
+	}
+}
 
 // Normalize 把越界或缺失的字段收敛到合法集合。
 //

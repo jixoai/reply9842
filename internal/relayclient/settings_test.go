@@ -219,3 +219,47 @@ func TestSettingsMirrorTrimmed(t *testing.T) {
 		t.Fatalf("update_mirror = %q，期望 %q", got.UpdateMirror, want)
 	}
 }
+
+// TestSettingsKeepsConnectionFields 连接参数必须能存下来。
+//
+// 2026-11-14 实证：用户机器开着 TUN 全局代理，47.82.76.102 被路由到
+// utun5/198.18.0.1，必须把「源地址」绑到物理网卡才能连上。这些值以前只在
+// flag 里，GUI 一重启就回默认——用户看到的是「更新到 0.3 之后连不上了」。
+func TestSettingsKeepsConnectionFields(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "settings.json")
+	s := DefaultSettings()
+	s.Server = "47.82.76.102:28443"
+	s.ServerName = "magpie.aiweb.xin"
+	s.LocalAddr = "192.168.1.106"
+	s.Transport = "tcp"
+	s.Listen = "127.0.0.1:18899"
+	if err := SaveSettings(p, s); err != nil {
+		t.Fatal(err)
+	}
+	got := LoadSettings(p)
+	if got.Server != s.Server || got.ServerName != s.ServerName ||
+		got.LocalAddr != s.LocalAddr || got.Transport != s.Transport || got.Listen != s.Listen {
+		t.Fatalf("连接参数没有往返：%+v", got)
+	}
+
+	var cfg Config
+	cfg.Normalize()
+	got.ApplyTo(&cfg)
+	if cfg.LocalAddr != "192.168.1.106" || cfg.Transport != "tcp" {
+		t.Fatalf("ApplyTo 没生效：%+v", cfg)
+	}
+}
+
+// TestApplyToIgnoresEmpty 空字段不能把默认值盖成空串。
+func TestApplyToIgnoresEmpty(t *testing.T) {
+	var cfg Config
+	cfg.Normalize()
+	want := *cfg2ptr(cfg.Server)
+	Settings{}.ApplyTo(&cfg)
+	if cfg.Server != want {
+		t.Fatalf("空 Settings 覆盖了默认服务器：%q → %q", want, cfg.Server)
+	}
+}
+
+func cfg2ptr(s string) *string { return &s }
