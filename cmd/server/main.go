@@ -159,6 +159,10 @@ func main() {
 
 	// 健康检查端点：给容器编排用。scratch 镜像没有 shell，无法 exec 型探活，
 	// 只能靠 HTTP。只暴露 /healthz，不泄漏任何状态。
+	//
+	// 端口冲突必须 fail fast：容器里 HEALTHCHECK 打的是固定端口，如果这个端口
+	// 被别的进程占着，探活会打到别人身上并返回 200——编排层看到的是假绿，而
+	// 本进程其实没有健康端点。先同步 Listen 确认端口到手，再起 serve goroutine。
 	if c.healthAddr != "" {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -166,9 +170,13 @@ func main() {
 			w.WriteHeader(http.StatusOK)
 			_, _ = w.Write([]byte("ok"))
 		})
+		ln, err := net.Listen("tcp", c.healthAddr)
+		if err != nil {
+			log.Fatalf("健康检查端口 %s 不可用: %v", c.healthAddr, err)
+		}
+		log.Printf("健康检查  %s/healthz", c.healthAddr)
 		go func() {
-			log.Printf("健康检查  %s/healthz", c.healthAddr)
-			if err := http.ListenAndServe(c.healthAddr, mux); err != nil {
+			if err := http.Serve(ln, mux); err != nil {
 				log.Printf("健康检查服务退出: %v", err)
 			}
 		}()

@@ -38,13 +38,17 @@ import (
 // 默认值集中在一处：CLI 的 flag 默认值、GUI 的输入框初值都从这里取，
 // 避免「文档写的默认」与「代码跑的默认」漂移。
 const (
-	DefaultListen    = "127.0.0.1:18899"
-	DefaultServer    = "47.82.76.102:28443"
-	DefaultTransport = "auto"
-	DefaultMinDelta  = 16 << 10
-	DefaultHistoryMB = 64
-	DefaultCaptureN  = 30
-	DefaultMaxResume = 3
+	DefaultListen = "127.0.0.1:18899"
+	DefaultServer = "47.82.76.102:28443"
+	// DefaultServerName 是 TLS SNI。上游用 IP 连接时**必须**填证书上的域名——
+	// 服务端证书的 SAN 通常只有 DNS 没有 IP，留空推导成 IP 会直接
+	// x509: cannot validate certificate for <ip> because it doesn't contain any IP SANs。
+	DefaultServerName = "magpie.aiweb.xin"
+	DefaultTransport  = "auto"
+	DefaultMinDelta   = 16 << 10
+	DefaultHistoryMB  = 64
+	DefaultCaptureN   = 30
+	DefaultMaxResume  = 3
 )
 
 // Config 一次运行所需的全部配置（与 CLI flag 一一对应）
@@ -72,6 +76,12 @@ func (c *Config) Normalize() {
 	}
 	if c.Server == "" {
 		c.Server = DefaultServer
+	}
+	// ServerName 留空时的兜底。注意：只在「上游是 IP 且证书是已知域名」这种
+	// 内置默认组合下填；用户改了 Server 却留空 SNI 时，transport 层会按
+	// Server 的 host 推导（对域名成立，对 IP 会失败——失败信息本身可读）。
+	if c.ServerName == "" && c.Server == DefaultServer {
+		c.ServerName = DefaultServerName
 	}
 	if c.Transport == "" {
 		c.Transport = DefaultTransport

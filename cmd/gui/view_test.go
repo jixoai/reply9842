@@ -252,7 +252,10 @@ func TestWindowCannotExceedRetain(t *testing.T) {
 	}
 }
 
-// TestChartSummaryFollowsWindow 图下那句话的窗口与粒度必须来自快照。
+// TestChartSummaryFollowsWindow 图下那句话的窗口必须来自快照。
+//
+// 不要求桶粒度后缀：一行装不下四段（会被省略号截断），设计上保留
+// 「请求数」而不是「每桶多久」——桶粒度可由窗口长度除以 30 推出。
 func TestChartSummaryFollowsWindow(t *testing.T) {
 	a := newTestApp(t)
 	agg := stats.Agg{
@@ -265,10 +268,15 @@ func TestChartSummaryFollowsWindow(t *testing.T) {
 		},
 	}
 	got := a.chartSummary(agg)
-	for _, want := range []string{"最近 6 小时", "每 12 分钟一柱"} {
+	for _, want := range []string{"最近 6 小时", "2 次"} {
 		if !strings.Contains(got, want) {
 			t.Errorf("chartSummary = %q，缺少 %q", got, want)
 		}
+	}
+	// 换窗口后这句话必须跟着变（硬编码窗口的回归防线）
+	agg.WindowSec = int64(time.Minute / time.Second)
+	if got := a.chartSummary(agg); !strings.Contains(got, "最近 1 分钟") {
+		t.Errorf("窗口改成 1 分钟后 chartSummary = %q", got)
 	}
 }
 
@@ -735,5 +743,46 @@ func TestSelectChangesWindow(t *testing.T) {
 	}
 	if s := relayclient.LoadSettings(a.settingsPath); s.Window() != 6*time.Hour {
 		t.Errorf("落盘 window=%s，期望 6 小时", s.Window())
+	}
+}
+
+// TestTabsSwitchByClick 点「设置」必须真的切到设置 pane，点「面板」切回来。
+//
+// 为什么用无头点击而不是真机点击：原生 UI 的 tab 是自绘控件，真机上靠像素
+// 坐标点它既受窗口位置影响、又受显示器缩放影响（实测点偏了几十像素就点空）。
+// 无头 tester 走的是同一条输入路径（命中测试 → 事件 → 重建），所以它能证明
+// 「控件接上了状态」，而真机截图只证明「画出来了」。
+func TestTabsSwitchByClick(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+	if a.tab != tabPanel {
+		t.Fatalf("初始 tab = %d，期望面板", a.tab)
+	}
+	if err := tt.Click("设置"); err != nil {
+		t.Fatalf("点「设置」失败：%v", err)
+	}
+	if a.tab != tabSettings {
+		t.Fatalf("点「设置」后 tab = %d，期望 %d", a.tab, tabSettings)
+	}
+	// 切到设置后，设置的内容必须在
+	for _, want := range []string{"上游地址", "监听地址", "传输方式"} {
+		if !tt.HasText(want) {
+			t.Errorf("设置 pane 缺少 %q：%q", want, tt.Texts())
+		}
+	}
+
+	if err := tt.Click("面板"); err != nil {
+		t.Fatalf("点「面板」失败：%v", err)
+	}
+	if a.tab != tabPanel {
+		t.Fatalf("点「面板」后 tab = %d，期望 %d", a.tab, tabPanel)
+	}
+	// 切回后统计仍在（状态不因切 tab 丢失）
+	a.fakeRun = nil
+	a.agg = stats.Agg{Requests: 42, UpRaw: 1000, UpWire: 10, UpRatio: 0.01}
+	a.snap = func() stats.Agg { return a.agg }
+	tt.Frame()
+	if !tt.HasText("42 请求") {
+		t.Errorf("切回面板后统计丢了：%q", tt.Texts())
 	}
 }

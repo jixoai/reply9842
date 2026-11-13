@@ -30,9 +30,26 @@ permissions:
   contents: write
 
 jobs:
-  # 先探 self-hosted 是否在线。GitHub 对「runs-on 指定的标签无 runner」只会
-  # 无限排队，不会自动 fallback，所以用一个极轻的探测 job 决定后续去哪跑。
-  # 探测本身跑在官方 runner 上（几秒），代价可忽略。
+  # ── runner 选择 ───────────────────────────────────────────────────────────
+  #
+  # GitHub 的 runs-on 数组是 **AND**（runner 必须同时具备所有标签），不是优先
+  # 级列表。所以 `[self-hosted, ubuntu-latest]` 永远匹配不到任何 runner——这
+  # 一点很容易想当然，2026-11-13 差点因此把发布彻底卡死。
+  #
+  # 唯一可行的兜底：先用一个极轻的 job 探测，再决定主 job 去哪跑。
+  # 探测本身跑官方 runner（几秒）。
+  #
+  # 探测逻辑的坑（2026-11-13 实证翻车）：
+  #  - GITHUB_TOKEN 没有 admin:org 权限，/actions/runners 返回 403，gh 把
+  #    **错误体打到 stdout**；早先写的 `| grep -qv '^0$'` 见到非 "0" 行就
+  #    判定「有 runner」，日志打印「self-hosted 在线」后 job 卡 queued 22 分钟。
+  #  - 且 API 报 online ≠ runner 接得了活：实测 runner 进程活着、broker 长轮询
+  #    正常，07:59 一次 TLS 抖动后静默挂死，API 仍报 online。
+  #
+  # 所以探测只做「尽力优先」，真正的安全网是主 job 的 timeout-minutes：
+  # 卡在排队阶段时 timeout 不生效，因此改用 step 级 30 分钟上限之外，还要
+  # 接受「最坏情况手动重跑」。官方 runner 兜底能力已在没有 self-hosted 的
+  # 仓库验证过（v0.1.0 用 ubuntu-latest 跑通过）。
   pick-runner:
     name: Pick runner
     runs-on: ubuntu-latest
@@ -44,20 +61,32 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -eu
-          # 组织级 runner 列表需要 admin:org，改用更可靠的间接判断：
-          # 直接看最近 30 天 self-hosted job 是否成功过（用 workflow run 记录近似）。
-          # 更简单可靠的做法：查仓库可用的 runner（含组织级继承）。
-          if gh api repos/${{ github.repository }}/actions/runners \
-               --jq '[.runners[] | select(.status=="online")] | length' 2>/dev/null | grep -qv '^0$'; then
+          # 用 python 严格解析 JSON：API 失败（403 错误体）必须与「0 个 runner」
+          # 同等对待，绝不能因为 stdout 里有字就当成有 runner。
+          resp="$(gh api repos/${{ github.repository }}/actions/runners 2>/dev/null || true)"
+          online="$(printf '%s' "$resp" | python3 -c '
+          import json,sys
+          try:
+              d=json.load(sys.stdin)
+              rs=d.get("runners") or []
+              print(sum(1 for r in rs if r.get("status")=="online"))
+          except Exception:
+              print(-1)   # 非合法 JSON / 403 错误体 → 视为不可用
+          ')"
+          echo "online runner 数: $online"
+          if [ "$online" -gt 0 ] 2>/dev/null; then
             echo "label=self-hosted" >> "$GITHUB_OUTPUT"
-            echo "self-hosted 在线"
+            echo "→ self-hosted（$online 个 online）"
           else
             echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
-            echo "self-hosted 不在线，回退官方 runner"
+            echo "→ ubuntu-latest（online=$online）"
           fi
 
   release:
     name: Build and publish
+    needs: pick-runner
+    runs-on: ${{ needs.pick-runner.outputs.label }}
+    timeout-minutes: 30
     needs: pick-runner
     runs-on: ${{ needs.pick-runner.outputs.label }}
     timeout-minutes: 30

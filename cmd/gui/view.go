@@ -283,7 +283,7 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 
 		a.chartPlot(c, p)
 		ui.Text(c, a.chartSummary(g)).FontSize(11).
-			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(1)
+			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(2)
 	})
 }
 
@@ -489,10 +489,12 @@ func (a *app) chartSummary(g stats.Agg) string {
 	if span <= 0 {
 		span = int(stats.DefaultWindow / time.Second)
 	}
-	text := fmt.Sprintf("最近 %s：原始 %s · 实际发送 %s · 省下 %.1f%%（%s 次请求）",
+	text := fmt.Sprintf("最近 %s：%s → %s · 省下 %.1f%%（%s 次请求）",
 		humanWindow(span), humanBytes(raw), humanBytes(wire), saved*100, groupDigits(n))
 	if g.BucketSec > 0 {
-		text += "（每 " + humanWindow(int(g.BucketSec)) + "一柱）"
+		// 桶粒度单独一句、允许折到第二行：480px 宽时它和前三段挤不进一行，
+		// 被省略号截掉的会是「每 N 一柱」这个最有用的信息。
+		text += " · 每 " + humanWindow(int(g.BucketSec)) + "一柱"
 	}
 	return text
 }
@@ -641,33 +643,45 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 	running := a.running()
 
-	glass.Surface(ui.Column(c).Padding(4, 14, 8), p, glass.Card).Children(func() {
+	// 一张卡装全部 7 行，不拆成两张。
+	//
+	// 曾经拆成「连接设置」+「统计跨度」两张卡，理由是两类设置的前置条件不同
+	// （前者运行中不可改，后者随时可改）。但拆开后两张卡的圆角、内边距、卡间
+	// 间距吃掉了约 40px，在 400px 的窗口里正好把最后一行「显示区间」顶出可视区。
+	// 前置条件的差异用一句提示说清就够了，不值得用一整张卡的面积来换。
+	glass.Surface(ui.Column(c).Padding(3, 14, 6), p, glass.Card).Children(func() {
 		a.configField(c, p, "上游地址", &a.server, relayclient.DefaultServer, running)
+		a.configRule(c, p)
+		// TLS SNI：用 IP 连服务器时必须填证书上的域名，否则 x509 校验失败
+		// （证书 SAN 只有 DNS，没有 IP）。留空时按上游地址推导，只在
+		// 「上游地址是域名且证书就是那个域名」时才成立。
+		a.configField(c, p, "服务器域名", &a.serverName,
+			relayclient.DefaultServerName, running)
 		a.configRule(c, p)
 		a.configField(c, p, "监听地址", &a.listen, relayclient.DefaultListen, running)
 		a.configRule(c, p)
 		a.transportRow(c, p, running)
 		a.configRule(c, p)
 		a.autoStartRow(c, p)
+		// 两个时间跨度不碰监听，运行中改也安全：它们的提示在各自行内，
+		// 不参与下面那句「先停止再改」。
+		a.configRule(c, p)
+		a.retainRow(c, p)
+		a.configRule(c, p)
+		a.windowRow(c, p)
 	})
 
-	// 运行中不可改：说清「为什么点不动」+「怎么做」，而不是让输入框静静失效
+	// 运行中不可改：说清「为什么点不动」+「怎么做」，而不是让输入框静静失效。
+	// 只针对上面那五个「连接类」字段——统计跨度随时可改。
 	if running {
 		ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
-			ui.Text(c, "运行中不可修改，先停止再改").
+			ui.Text(c, "连接设置在运行中不可修改，先停止再改").
 				FontSize(11).TextColor(p.Warning).MaxLines(1).Grow(1)
 			if a.actionButton(c, p, "stop-settings", "停止", false).Clicked() {
 				a.stop()
 			}
 		})
 	}
-
-	// 统计显示：与监听无关，运行中随时可改（改完立刻按新范围重算）
-	glass.Surface(ui.Column(c).Padding(4, 14, 8), p, glass.Card).Children(func() {
-		a.retainRow(c, p)
-		a.configRule(c, p)
-		a.windowRow(c, p)
-	})
 }
 
 // retainRow 日志保留时长：磁盘上留多久的数据（同时决定重启重建的扫描范围）。
@@ -708,12 +722,12 @@ func (a *app) windowRow(c *ui.Context, p *glass.Palette) {
 // 加右侧箭头约 130px），给它一个比这更小的盒子它会溢出到相邻的说明文字上
 // （实测 104 宽时右边框压住提示文字）。这里给 132 并让说明只占剩下的空间。
 func (a *app) timeRow(c *ui.Context, p *glass.Palette, label string, val *string, options []string, hint string) {
-	ui.Row(c).Padding(8, 0).Gap(12).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Box(c).Width(84).Shrink(0).Children(func() {
 			ui.Text(c, label).FontSize(11).TextColor(p.MutedForeground).SingleLine()
 		})
 		ui.Box(c).Width(132).Shrink(0).Children(func() {
-			ui.Select(c, val, options).FontSize(11).Height(28)
+			ui.Select(c, val, options).FontSize(11).Height(26)
 		})
 		ui.Text(c, hint).FontSize(10.5).TextColor(p.Tertiary).MaxLines(1).Grow(1)
 	})
@@ -745,13 +759,13 @@ func (a *app) configRule(c *ui.Context, p *glass.Palette) {
 
 // configField 一行「标签 + 输入框」（标签固定 84px，两行字段左边缘对齐）
 func (a *app) configField(c *ui.Context, p *glass.Palette, label string, val *string, placeholder string, disabled bool) {
-	ui.Row(c).Padding(8, 0).Gap(12).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Box(c).Width(84).Shrink(0).Children(func() {
 			ui.Text(c, label).FontSize(11).TextColor(p.MutedForeground).SingleLine()
 		})
 		ui.Box(c).Grow(1).Children(func() {
 			ui.TextInput(c, val).Placeholder(placeholder).
-				FontSize(11).Height(28).Radius(9).Disabled(disabled)
+				FontSize(11).Height(26).Radius(9).Disabled(disabled)
 		})
 	})
 }
@@ -766,12 +780,12 @@ func (a *app) transportRow(c *ui.Context, p *glass.Palette, disabled bool) {
 			idx = i
 		}
 	}
-	ui.Row(c).Padding(8, 0).Gap(12).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Box(c).Width(84).Shrink(0).Children(func() {
 			ui.Text(c, "传输方式").FontSize(11).TextColor(p.MutedForeground).SingleLine()
 		})
 		ui.Box(c).Grow(1).Children(func() {
-			ui.Segmented(c, &idx, labels...).FontSize(11.5).Height(26).Disabled(disabled)
+			ui.Segmented(c, &idx, labels...).FontSize(11.5).Height(24).Disabled(disabled)
 		})
 	})
 	if options[idx] != a.transport {
@@ -786,7 +800,7 @@ func (a *app) transportRow(c *ui.Context, p *glass.Palette, disabled bool) {
 //
 // 语言上要说清两件事：它是登录项（不是「后台服务」），以及下次登录才生效。
 func (a *app) autoStartRow(c *ui.Context, p *glass.Palette) {
-	ui.Row(c).Padding(8, 0).Gap(12).AlignItems(ui.Center).Children(func() {
+	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
 		ui.Box(c).Width(84).Shrink(0).Children(func() {
 			ui.Text(c, "开机自启").FontSize(11).TextColor(p.MutedForeground).SingleLine()
 		})

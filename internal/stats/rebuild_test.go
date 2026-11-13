@@ -2,6 +2,7 @@ package stats
 
 import (
 	"encoding/json"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -431,5 +432,137 @@ func TestObserveAppendsAndSnapshotWrites(t *testing.T) {
 	// 快照里必须带上窗口说明，CLI/前端据此显示区间
 	if agg.RetainSec != int64(DefaultRetain/time.Second) || agg.BucketSec == 0 {
 		t.Errorf("快照缺少窗口字段：retain=%d bucket=%d", agg.RetainSec, agg.BucketSec)
+	}
+}
+
+// TestCompactReal32MB 真实跑一次 32MB 阈值：造一个 >32MB 的日志文件，
+// 老记录（超出保留）必须被删掉，窗口内的保留。
+func TestCompactReal32MB(t *testing.T) {
+	if testing.Short() {
+		t.Skip("short 模式跳过（要写 33MB）")
+	}
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "client-2026-11-13.jsonl")
+	now := time.Now()
+
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 老记录（2 小时前）：每行约 300B，写 33MB ≈ 11 万行
+	pad := make([]byte, 200)
+	for i := range pad {
+		pad[i] = 'x'
+	}
+	oldT := now.Add(-2 * time.Hour).Format(time.RFC3339Nano)
+	n := 0
+	for size := int64(0); size < 33<<20; n++ {
+		line := fmt.Sprintf(`{"t":%q,"status":200,"up_raw":1000,"up_wire":100,"enc":"dcz"}`+"\n", oldT)
+		sz, _ := f.WriteString(line)
+		size += int64(sz)
+	}
+	// 新记录（刚刚）：这一条必须活下来
+	f.WriteString(fmt.Sprintf(`{"t":%q,"status":200,"up_raw":77,"up_wire":7,"enc":"dcz"}`+"\n",
+		now.Format(time.RFC3339Nano)))
+	f.Close()
+
+	st, _ := os.Stat(logPath)
+	t.Logf("压实前 %.1f MB / %d 行", float64(st.Size())/(1<<20), n)
+	if st.Size() < compactBytes {
+		t.Fatalf("文件 %.1f MB 没到 %d MB 阈值，测不出触发", float64(st.Size())/(1<<20), compactBytes>>20)
+	}
+
+	c, err := Open(Options{
+		LogPath:   logPath,
+		StatsPath: filepath.Join(dir, "s.json"),
+		Retain:    time.Minute,
+		Window:    time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 重建时窗口外记录已被排除
+	if agg := c.Snapshot(); agg.Requests != 1 {
+		t.Fatalf("重建 requests=%d，期望 1（只有新记录在窗口内）", agg.Requests)
+	}
+
+	// 发一条新请求：logSize 已超阈值 → 自动压实
+	c.Observe(&Record{Status: 200, UpRaw: 5, UpWire: 5})
+
+	after, err := os.Stat(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Logf("压实后 %.2f MB", float64(after.Size())/(1<<20))
+	if after.Size() > 1<<20 {
+		t.Fatalf("压实后仍有 %.1f MB，老记录没被清掉", float64(after.Size())/(1<<20))
+	}
+	if after.Size() == 0 {
+		t.Fatal("压实后文件为空，窗口内记录被误删")
+	}
+
+	// 压实后的文件必须能被重新重建
+	c2, err := Open(Options{LogPath: logPath, StatsPath: filepath.Join(dir, "s2.json"), Retain: time.Minute})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c2.Close()
+	if agg := c2.Snapshot(); agg.Requests != 2 {
+		t.Errorf("压实后重建 requests=%d，期望 2（旧新各一）", agg.Requests)
+	}
+}
+
+// TestWideRetainDoesNotCorruptNarrowWindow 保留 30 天 + 显示 1 分钟时，
+// 窗口外的海量老记录不能污染窗口内的桶。
+//
+// 这是「保留远大于窗口」组合下的真 bug 形态：30 个桶的环一圈正好是一个窗口，
+// 窗口外的记录按槽位取模会与窗口内的槽位撞号。若靠「扫描顺序单调」侥幸不出错，
+// 一旦文件里混有乱序行（多机合并、时钟回拨）就会静默画出错误的图。
+func TestWideRetainDoesNotCorruptNarrowWindow(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "client-x.jsonl")
+	now := time.Now()
+
+	var recs []Record
+	// 大量窗口外记录（2 小时前），保留 30 天所以它们都会被累加
+	for i := 0; i < 200; i++ {
+		recs = append(recs, Record{
+			Status: 200, UpRaw: 10_000, UpWire: 10_000,
+			Time: now.Add(-2 * time.Hour).Format(time.RFC3339Nano),
+		})
+	}
+	// 窗口内一条（刚刚）
+	recs = append(recs, Record{
+		Status: 200, UpRaw: 33, UpWire: 3,
+		Time: now.Format(time.RFC3339Nano),
+	})
+	writeRecords(t, logPath, now, recs)
+
+	c, err := Open(Options{
+		LogPath:   logPath,
+		StatsPath: filepath.Join(dir, "s.json"),
+		Retain:    30 * 24 * time.Hour,
+		Window:    time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	agg := c.Snapshot()
+	// 聚合总量要包含全部（保留 30 天，2 小时前仍在内）
+	if agg.Requests != 201 {
+		t.Fatalf("requests=%d，期望 201", agg.Requests)
+	}
+	// 但图上的桶只能有窗口内那一条
+	var raw, cnt int64
+	for _, b := range agg.Series {
+		raw += b.UpRaw
+		cnt += b.Count
+	}
+	if cnt != 1 || raw != 33 {
+		t.Errorf("1 分钟窗口内桶里 count=%d raw=%d，期望 1/33（窗口外记录不许入桶）", cnt, raw)
 	}
 }

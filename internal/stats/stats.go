@@ -399,8 +399,15 @@ func BucketSecs(window time.Duration) int64 {
 }
 
 // bucketLocked 把一次请求记进它所属的桶（c.mu 必须已持有）。
+//
+// 只记「显示区间内」的记录：保留时长可以远大于显示区间（30 天 vs 24 小时），
+// 窗口外的记录若也按槽位取模，会和窗口内的槽位撞号（30 个桶的环正好一圈就是
+// 一个窗口），只是靠「扫描顺序单调」才碰巧不出错——那是运气，不是正确性。
 func (c *Collector) bucketLocked(t time.Time, r *Record) {
 	bsec := BucketSecs(c.window)
+	if t.Before(time.Now().Add(-c.window)) {
+		return // 出窗口：不参与分桶（聚合总量里仍然有它）
+	}
 	at := bucketStart(t, bsec)
 	slot := &c.series[int(at.Unix()/bsec)%SeriesBuckets]
 	if !slot.At.Equal(at) {
