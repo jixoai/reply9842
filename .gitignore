@@ -11,3 +11,7 @@
 # 日志与统计（运行时落在 ~/.rfc9842-reply，不在此）
 *.jsonl
 *-stats.json
+
+# 本地构建产物（Makefile 的 dist/ 与 bin/）
+/dist/
+/bin/

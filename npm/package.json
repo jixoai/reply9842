@@ -1,0 +1,51 @@
+{
+  "name": "reply9842",
+  "version": "0.1.0",
+  "description": "RFC 9842 增量压缩隧道：把 AI Agent 的上行带宽砍掉 99.8%。一个包内含全平台 CLI / GUI / 服务端二进制",
+  "keywords": [
+    "rfc9842",
+    "compression",
+    "dictionary",
+    "delta",
+    "llm",
+    "agent",
+    "proxy",
+    "zstd"
+  ],
+  "homepage": "https://rfc9842-reply.jixoai.com",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jixoai/rfc9842-reply.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jixoai/rfc9842-reply/issues"
+  },
+  "license": "MIT",
+  "author": "jixoai",
+  "bin": {
+    "reply9842": "bin/reply9842.js",
+    "reply9842-gui": "bin/reply9842-gui.js",
+    "reply9842-server": "bin/reply9842-server.js"
+  },
+  "files": [
+    "bin/",
+    "lib/",
+    "vendor/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "os": [
+    "darwin",
+    "linux",
+    "win32"
+  ],
+  "scripts": {
+    "test": "node --test test/*.test.js"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

@@ -1,0 +1,245 @@
+name: Release
+
+# 打 tag（v*）时：
+#   1. 全平台构建 CLI / GUI / server 三个产物
+#   2. 上传到 GitHub Releases
+#   3. 把全部产物塞进一个 npm 包（reply9842）并用 OIDC 发布
+#
+# 安全设计：
+#   - GitHub Release 只用 GITHUB_TOKEN，permissions 只给 contents: write
+#   - npm 用 Trusted Publishing（OIDC），仓库里不存 NPM_TOKEN
+#       npmjs.com → reply9842 → Settings → Trusted Publisher
+#       绑定：jixoai/rfc9842-reply + 本工作流文件名
+#   - 全平台交叉编译，不需要 CGO（mygo 纯 Go，已验证）
+#
+# npm 单包策略：
+#   不用 optionalDependencies 拆平台包，而是把 13 个二进制全放进 vendor/。
+#   代价是包体大，换来「一次安装、零解析、零下载失败」。
+#   若将来包体成为问题，再拆 optionalDependencies 不迟。
+
+on:
+  push:
+    tags:
+      - "v*"
+  # 允许手动触发预演：只构建 + 跑测试，不建 release、不发布 npm
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  test:
+    name: Test and vet
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+      - name: go vet
+        run: go vet ./...
+      - name: go test
+        run: go test ./...
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+      - name: npm layer self-test
+        working-directory: npm
+        run: npm test
+
+  build:
+    name: Build ${{ matrix.kind }}-${{ matrix.os }}-${{ matrix.arch }}
+    needs: test
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # CLI：全平台
+          - { kind: cli, os: linux, arch: amd64 }
+          - { kind: cli, os: linux, arch: arm64 }
+          - { kind: cli, os: darwin, arch: amd64 }
+          - { kind: cli, os: darwin, arch: arm64 }
+          - { kind: cli, os: windows, arch: amd64 }
+          # GUI：只有 darwin / windows（native UI 无 Linux 后端）
+          - { kind: gui, os: darwin, arch: amd64 }
+          - { kind: gui, os: darwin, arch: arm64 }
+          - { kind: gui, os: windows, arch: amd64 }
+          # server：全平台
+          - { kind: server, os: linux, arch: amd64 }
+          - { kind: server, os: linux, arch: arm64 }
+          - { kind: server, os: darwin, arch: amd64 }
+          - { kind: server, os: darwin, arch: arm64 }
+          - { kind: server, os: windows, arch: amd64 }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: "1.27.x"
+          cache: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            v="dev-${GITHUB_SHA::7}"
+          fi
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.os }}
+          GOARCH: ${{ matrix.arch }}
+          VERSION: ${{ steps.ver.outputs.version }}
+          KIND: ${{ matrix.kind }}
+        run: |
+          set -euo pipefail
+          ext=""
+          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
+          out="${KIND}-${GOOS}-${GOARCH}${ext}"
+
+          ldflags="-s -w -X main.version=${VERSION}"
+          if [ "$KIND" = "gui" ] && [ "$GOOS" = "windows" ]; then
+            # 双击不弹黑框；go install 传不了这个 flag，故另有 runtime 兜底
+            ldflags="$ldflags -H=windowsgui"
+          fi
+
+          CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" \
+            -o "$out" "./cmd/${KIND}"
+          ls -lh "$out"
+          echo "OUT=$out" >> "$GITHUB_ENV"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: bin-${{ matrix.kind }}-${{ matrix.os }}-${{ matrix.arch }}
+          path: ${{ env.OUT }}
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          ls -lh
+          shasum -a 256 * > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          body: |
+            ## 安装
+
+            ### npm（一个包内含全平台 CLI / GUI / 服务端）
+
+            ```bash
+            npx reply9842@${{ github.ref_name }}          # 本地转发客户端
+            npx reply9842-gui@${{ github.ref_name }}      # 图形界面
+            npx reply9842-server@${{ github.ref_name }}   # 服务端
+
+            npm i -g reply9842@${{ github.ref_name }}     # 或全局安装
+            ```
+
+            ### go install（需要 Go 1.27.3+）
+
+            ```bash
+            go install github.com/jixoai/rfc9842-reply/cmd/cli@${{ github.ref_name }}
+            go install github.com/jixoai/rfc9842-reply/cmd/gui@${{ github.ref_name }}
+            go install github.com/jixoai/rfc9842-reply/cmd/server@${{ github.ref_name }}
+            ```
+
+            ### 下载预编译二进制
+
+            见下方 Assets，校验和见 `SHA256SUMS.txt`。
+
+            | 文件 | 说明 |
+            |---|---|
+            | `cli-<os>-<arch>` | 本地中转 + 增量压缩隧道 |
+            | `gui-<os>-<arch>` | 图形界面（macOS / Windows） |
+            | `server-<os>-<arch>` | 隧道服务端 |
+
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  npm:
+    name: Publish npm
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC 发布必需：npm 用这个令牌换短期凭证
+      id-token: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          registry-url: "https://registry.npmjs.org"
+
+      - name: Download all binaries into package vendor/
+        uses: actions/download-artifact@v4
+        with:
+          path: npm/vendor
+          merge-multiple: true
+
+      - name: Resolve version
+        id: ver
+        run: |
+          v="${GITHUB_REF_NAME#v}"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+          ls -lh npm/vendor
+
+      - name: Set package version
+        working-directory: npm
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          node -e '
+            const fs = require("fs");
+            const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
+            p.version = process.env.VERSION;
+            fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
+            console.log("version ->", p.version);
+          '
+
+      - name: Mark binaries executable
+        run: |
+          cd npm/vendor
+          for f in *; do
+            case "$f" in
+              *.exe) chmod 0644 "$f" ;;
+              *)     chmod 0755 "$f" ;;
+            esac
+          done
+
+      - name: Copy repo docs into package
+        run: cp README.md LICENSE npm/
+
+      - name: Verify package contents
+        working-directory: npm
+        run: npm pack --dry-run 2>&1 | tail -40
+
+      - name: Publish via OIDC
+        working-directory: npm
+        # Trusted Publishing 不需要 NODE_AUTH_TOKEN：npm CLI 11+ 用 Actions 的
+        # id-token 换短期凭证，并自动生成 provenance。
+        run: npm publish --provenance --access public
