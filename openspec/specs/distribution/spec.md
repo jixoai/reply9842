@@ -137,6 +137,70 @@ header 完好使 `file` 报 normal，部署后 `status=11/SEGV`。二进制下�
 - **WHEN** 同一 tag 的 workflow 被重跑，`SHA256SUMS.txt` 已存在
 - **THEN** 该文件不被算进校验和清单
 
+### Requirement: 镜像可由环境变量配置
+
+镜像前缀链 SHALL 可用 `REPLY9842_MIRROR` 覆盖，支持逗号分隔的回退链。
+解析规则必须与 Go 侧 `internal/update/mirror.go` 完全一致（三处共用：npm 引导器 /
+update 包 / GUI 设置页）：逐项 trim、空项跳过、`direct` 大小写不敏感、无有效项即直连
+且**不回退**默认列表、前缀末尾自动补 `/`、非法 URL 报错带原值、保序去重。
+
+不使用 `npm_config_*` 前缀：npm 会吃掉自己的变量并做一层 config 解析，语义会变形。
+
+落地证据：`npm/lib/mirror.js`、`npm/test/mirror.test.js`（12 例）、
+`internal/update/mirror.go`、`internal/update/mirror_test.go`。
+
+#### Scenario: 只给了 without 尾斜杠的镜像
+
+- **WHEN** `REPLY9842_MIRROR=https://m.example.com`
+- **THEN** 自动补成 `https://m.example.com/` 再拼接，不产出 `https://m.example.comhttps://github.com/...`
+
+#### Scenario: 显式直连
+
+- **WHEN** `REPLY9842_MIRROR=`, `REPLY9842_MIRROR=direct` 或 `REPLY9842_MIRROR=DIRECT`
+- **THEN** 结果只有直连，不回退内置镜像列表
+
+#### Scenario: 拼错的 URL
+
+- **WHEN** 某个 item 不是合法 http(s) URL 或缺主机名
+- **THEN** 报错并带出原始值，不静默忽略（否则用户会看到「全部镜像失败」却不知为何）
+
+### Requirement: 下载必须真正断点续传
+
+下载器 SHALL 流式写盘并支持 `Range` 续传，而不是把整个文件收进内存后一次性落盘。
+响应必须分类处理：`append`（206 且起点等于已有长度）、`restart`（body 从 0 开始）、
+`refetch`（起点对不上 → 删 `.part` 重发）、`complete`（416 且已有长度正好等于总长）。
+
+落地证据：`npm/lib/download.js`（`classifyResponse`）、`npm/test/download.test.js`（27 例）。
+
+#### Scenario: 中断后续传
+
+- **WHEN** 下载到 3 MB 时连接断了，重跑
+- **THEN** 带 `Range: bytes=3000000-` 续上，只花全量约 41% 的时间，最终 sha256 与
+  `SHA256SUMS.txt` 一致
+
+#### Scenario: 416 的空 body 不能当数据读
+
+- **WHEN** `.part` 比服务端文件还长，服务端回 416
+- **THEN** 删除 `.part` 后重发无 `Range` 请求；把 416 的 body 当续传流读完会报出
+  「实际 0 字节，服务端声明 N 字节」——错误信息离真因极远（实测踩过）
+
+#### Scenario: 内存不随文件线性增长
+
+- **WHEN** 下载 15.3 MB 的 GUI 产物
+- **THEN** 峰值内存增量约 2 MB（旧实现 Buffer.concat 约 9 MB）
+
+### Requirement: 镜像内容不一致时换镜像重试
+
+sha256 校验失败 SHALL 删除 `.part` 并在**下一个镜像**重试；全部镜像都失败才整体报错。
+每个镜像各给一次「免罚重来」的机会，避免首个镜像的内容错误立刻把尝试次数用光。
+
+落地证据：`npm/lib/download.js`、`internal/update/download.go`（`verifyChecksum` 逐镜像）。
+
+#### Scenario: 首个镜像返回错误内容
+
+- **WHEN** 镜像缓存了别的版本或返回 HTML 错误页
+- **THEN** 校验失败 → 换下一个镜像 → 成功，用户无感
+
 ## 已知边界
 
 - **产物未做代码签名 / 公证**：macOS 首次运行会被 Gatekeeper 拦下，文档给

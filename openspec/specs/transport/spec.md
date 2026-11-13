@@ -132,6 +132,62 @@ TCP 走 `net.Dialer.LocalAddr`，QUIC 走 `net.ListenUDP` + `quic.Dial`（`DialA
 - **WHEN** 对端只支持 TLS 1.1 及更早
 - **THEN** 握手失败，不降级
 
+### Requirement: 连接复用（串行池）
+
+客户端 SHALL 复用隧道连接而不是每请求新建。服务端 SHALL 支持在一条连接上连续处理
+多个请求（帧自带长度前缀，串行处理故无串台风险）。
+
+动机是实测数据：本机→香港单次 TCP+TLS 握手 747/2330/2821/773/3188 ms（均值约 2 s），
+而原实现每请求都新建连接、用完即关，等于每个请求白扔 1–3 秒。这比隧道省下的带宽值钱。
+
+选**串行复用**而非多路复用：多路复用要引入请求 ID、乱序响应、流量控制，改动面覆盖
+frame / clientstream / 服务端 accept 循环，出错就是数据串台；而串行复用已吃掉绝大部分
+收益，并发时退化为「各占一条连接」不比原实现差。
+
+落地证据：`internal/transport/pool.go`（`PooledDialer`：LIFO 取用、90 s 超龄淘汰、
+maxIdle=4）、`cmd/server/main.go`（`serve` 循环 + `serveOne` 返回 keepAlive）、
+`internal/relayclient/runner.go`（Get/Put 时机）、`internal/transport/pool_test.go`。
+
+#### Scenario: 响应未读完不能归还
+
+- **WHEN** `Drain` 中途出错，连接里可能还有未读帧
+- **THEN** 丢弃连接（`Drop`）而不是归还——否则下一个请求会读到上一个的残留数据
+
+#### Scenario: 串台
+
+- **WHEN** 同一连接上先后跑长度不同的多个请求
+- **THEN** 每次读到的都是自己那条响应（`TestPoolNoCrossTalk` 用 4 种长度验证）
+
+#### Scenario: 续传不复用
+
+- **WHEN** 走 `FrameResume` 续传
+- **THEN** 该连接不归还池——续传本就发生在异常之后，多条提前 return 的失败路径可能留半截帧
+
+#### Scenario: 超龄连接
+
+- **WHEN** 空闲连接超过 90 s
+- **THEN** 取用时丢弃并新建，避免复用一条对端早已关闭的连接
+
+### Requirement: 握手耗时必须可观测
+
+每条连接 SHALL 记录建立耗时，且只有本次真的新建连接才计入统计（复用命中为 0）。
+该值进入逐请求记录的 `ms_handshake` 与时间桶的握手计数，让「连接池是否真的生效」
+可被观测，而不是靠一次性测试。
+
+落地证据：`internal/transport/tunnel.go`（`Conn.Handshake()` / `Conn.Reused()`）、
+`internal/stats/stats.go`（`Record.MsHandshake`、`Bucket.HsSum/HsCount`）、
+`internal/relayclient/runner.go`（仅在 `!conn.Reused()` 时填）。
+
+#### Scenario: 复用生效
+
+- **WHEN** 连续请求命中连接池
+- **THEN** `ms_handshake` 为 0，界面摘要显示「全程复用连接」
+
+#### Scenario: 池未命中
+
+- **WHEN** 每个请求都非零握手耗时
+- **THEN** 说明池没命中，每个请求仍在付约 2 秒的握手成本
+
 ## 已知边界
 
 - **QUIC 生产未启用**：有回环端到端测试通过，生产链路仍走 TCP/TLS，启用需放通 UDP

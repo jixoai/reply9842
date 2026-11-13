@@ -202,6 +202,113 @@ GUI SHALL 只允许一个实例：第二次启动把 argv 交给第一个实例�
 - **WHEN** 用户再次双击应用图标
 - **THEN** 已有窗口被显示到前面，不产生第二个进程
 
+### Requirement: 顶栏承载开关与可复制地址
+
+顶栏 SHALL 包含：品牌标、应用名、[面板｜设置] 分段控件、可点击复制的地址徽标、
+启动/停止图标开关。面板内容区**不再**有独立的状态行——状态与主操作已全部上移到顶栏，
+腾出的高度给图表。
+
+开关是**图标**按钮（26×26），运行中显示停止图标 + Success 色淡底，未运行时显示播放图标
++ 中性底；hover/pressed 三态齐全。地址徽标点击复制**纯 URL**（`http://127.0.0.1:PORT`），
+图标变对勾、文字变「已复制」，1.6 s 后复原（对齐 shadcn 的 copy 组件）。
+
+落地证据：`cmd/gui/view.go`（`titleBar` / `runToggle` / `copyChip`）、
+`cmd/gui/view_test.go`（`TestRunToggleSwitchesStateAndIcon` / `TestCopyChipCopiesPlainURL` /
+`TestCopyFlashingExpires`）。
+
+#### Scenario: 开关不是假动作
+
+- **WHEN** 用 `ui.Tester` 真实点击顶栏开关
+- **THEN** 真的启动/停止 runner（测试用端口 0 的真 Runner 验证），标签与图标同步切换
+
+#### Scenario: 窄窗口让出应用名
+
+- **WHEN** 窗口缩到 460 宽
+- **THEN** 收起「reply9842」文字只留品牌图标，右侧那一簇（tabs + 徽标 + 开关）完整保留
+
+#### Scenario: 与 macOS 红绿灯共存
+
+- **WHEN** `TitleBarHiddenInset` + `TrafficLightPosition{19,17}`
+- **THEN** 顶栏内容不侵入红绿灯区域（`TestTitleBarClearsTrafficLights` 用像素坐标断言）
+
+### Requirement: 界面文案不绑定任何 AI 服务商
+
+界面上 SHALL 不出现 `ANTHROPIC` / `OPENAI` / `BASE_URL` / `export` 等绑定特定协议或
+服务商的提示；复制出去的内容是纯 URL。产品对协议不做假设，只是一个 HTTP 正向转发。
+
+注意 `internal/idem/key.go` 里的 `anthropic-version` 是协议头，属于技术实现，不在限制内。
+
+落地证据：`cmd/gui/tray.go`（菜单项改为「复制地址」）、`cmd/gui/view.go`（footer 按钮）、
+`cmd/gui/main.go`（`copyURL`）、`cmd/gui/view_test.go`（`TestNoAIPromptsInUI` 扫两个 tab
+的全部 UI 文本 × 8 个禁词）。
+
+#### Scenario: 全界面扫描
+
+- **WHEN** 遍历面板与设置两个 tab 的所有文本
+- **THEN** 不含任何禁词
+
+### Requirement: 面板同时呈现压缩率与流量延迟
+
+面板 SHALL 提供两张图，回答两个不同问题：
+
+1. **上行体积对比**——「省了多少」。柱高表达压缩率（绿=省下，蓝=实发），90% 参考线。
+   吃掉剩余高度。
+2. **流量与延迟**——「现在顺不顺」。柱=上下行流量（堆叠，共用字节刻度），
+   线=延迟（琥珀，独立毫秒刻度，空桶处断开不插值）。定高，不随窗口长高。
+
+第二张图是必要的：压缩率 99.9% 时连接可能同时卡得要死，这个维度在第一张图上完全看不见。
+
+纵轴给**三档**（字节峰值 / 延迟峰值 / 0）而不是两档：只有两档时折线在竖直方向没有参照，
+读者不知道该按哪个刻度读。
+
+落地证据：`cmd/gui/view.go`（`chartCard` / `trafficCard` / `trafficPlot`）、
+`cmd/gui/view_test.go`（`fakeSeries` 填了上下行与延迟，否则第二张图折线贴底会被误判成画错）。
+
+#### Scenario: 空桶处折线断开
+
+- **WHEN** 某几个时间桶没有请求
+- **THEN** 折线在该处断开而不是插值——插值会画出一条「延迟平稳」的假象
+
+#### Scenario: 握手不画成柱
+
+- **WHEN** 连接复用生效，绝大多数桶握手次数为 0
+- **THEN** 不画握手柱（会得到一片空白让人以为数据丢了），改在摘要行报
+  「全程复用连接」或「握手 N 次 · 均 X ms」
+
+### Requirement: 底部单栏合并状态与统计
+
+窗口底部 SHALL 只有**一条**栏，内容从左到右：`状态 · 传输 · 统计摘要 ……… 复制按钮 · 版本号`。
+顺序按读者关心程度排：先跑没跑，再走什么，再看效果；复制是动作，版本最右。
+
+原先是两栏（内容区末尾的统计+复制 / 窗口底部的状态条），各占 27–32 px，在一屏里读作两条
+重复的底边。合并后省下的高度正好抵掉第二张图的开销。
+
+落地证据：`cmd/gui/view.go`（`footer` / `footerStatsLine`）。
+
+#### Scenario: 空态不重复说同一件事
+
+- **WHEN** 还没有任何请求记录
+- **THEN** 状态区已显示「未运行」，统计摘要整段省略（不显示「还没有请求记录」）
+
+### Requirement: 默认窗口尺寸由内容实测决定
+
+默认窗口 SHALL 为 560×660。高度按实测内容反推：顶栏 48 + 主图（最小 110 + 卡片装饰 56）
++ 副图（88 + 56）+ 底栏 32 + 内边距 ≈ 610，取 660 留余量（最坏情况=运行中 + 两行更新错误
++ 两行保存失败提示，底边 654）。宽度 560 是因为两张图的纵轴标签占 46 px，480 时单柱不到
+8 px、堆叠柱会糊。
+
+必须用**像素坐标**守卫而不是 `HasText`：设置页在 `Scroll` 里，被裁掉的行仍存在于
+`Texts()` 中。
+
+落地证据：`cmd/gui/main.go`（`Width`/`Height` 及其注释）、
+`cmd/gui/view_test.go`（`TestSettingsFitsShippedWindow`，断言 13 个必填项的矩形底边
+都在 footer 顶边之上，440 与 560 两个宽度都验）。
+
+#### Scenario: 设置页再加行
+
+- **WHEN** 未来往设置页加更多行导致溢出
+- **THEN** `TestSettingsFitsShippedWindow` 先失败并报出是哪一项被切掉，按同样方法重量再决定
+
 ## 已知边界
 
 - **GUI 无 Linux 产物**：mygo native UI 的 Linux 后端依赖 GTK3，本项目只面向 macOS 与
