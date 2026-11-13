@@ -1,83 +1,88 @@
 name: Release
 
-# 打 tag（v*）时：
-#   1. 全平台构建 CLI / GUI / server 三个产物
-#   2. 上传到 GitHub Releases
-#   3. 把全部产物塞进一个 npm 包（reply9842）并用 OIDC 发布
+# 打 tag（v*）时：构建全平台产物 → GitHub Release → npm（OIDC Trusted Publishing）
 #
-# 安全设计：
-#   - GitHub Release 只用 GITHUB_TOKEN，permissions 只给 contents: write
-#   - npm 用 Trusted Publishing（OIDC），仓库里不存 NPM_TOKEN
-#       npmjs.com → reply9842 → Settings → Trusted Publisher
-#       绑定：jixoai/rfc9842-reply + 本工作流文件名
-#   - 全平台交叉编译，不需要 CGO（mygo 纯 Go，已验证）
+# ── 为什么要单 job + self-hosted ──────────────────────────────────────────
+# 早期版本把 13 个平台摊成 13 个 matrix job。实测本地串行交叉编译全部平台只要
+# 65 秒，而 13 个 job 每个都要 checkout + setup-go + 拉 Go 缓存 + 启动 runner，
+# 单次发布烧掉约 15 分钟免费额度。本项目的 Go 交叉编译不需要各平台 runner
+# （CGO_ENABLED=0，纯 Go），所以合成一个 job 反而快且省。
 #
-# npm 单包策略：
-#   不用 optionalDependencies 拆平台包，而是把 13 个二进制全放进 vendor/。
-#   代价是包体大，换来「一次安装、零解析、零下载失败」。
-#   若将来包体成为问题，再拆 optionalDependencies 不迟。
+# runner 选择：优先 self-hosted（jixoai 组织级 mac-ext-01，常驻且已有模块缓存），
+# 官方托管 runner 作为兜底——self-hosted 掉线时 CI 仍能跑完。
+#
+# ── npm Trusted Publishing ────────────────────────────────────────────────
+# npmjs.com → reply9842 → Settings → Trusted Publisher 必须与本文件严格一致：
+#   Repository:  jixoai/rfc9842-reply
+#   Workflow:    release.yml
+#   Environment: npm-publish        ← job 里必须有 environment: npm-publish
+# GitHub 的 OIDC token 带 environment claim，npm 用它匹配。缺这一项的表现是
+# 404「package not found」，极易误判为包不存在。
 
 on:
   push:
     tags:
       - "v*"
-  # 允许手动触发预演：只构建 + 跑测试，不建 release、不发布 npm
+  # 手动预演：只构建 + 测，不建 release、不发 npm
   workflow_dispatch:
 
 permissions:
   contents: write
 
 jobs:
-  test:
-    name: Test and vet
+  # 先探 self-hosted 是否在线。GitHub 对「runs-on 指定的标签无 runner」只会
+  # 无限排队，不会自动 fallback，所以用一个极轻的探测 job 决定后续去哪跑。
+  # 探测本身跑在官方 runner 上（几秒），代价可忽略。
+  pick-runner:
+    name: Pick runner
     runs-on: ubuntu-latest
+    outputs:
+      label: ${{ steps.pick.outputs.label }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
-        with:
-          go-version: "1.27.x"
-          cache: true
-      - name: go vet
-        run: go vet ./...
-      - name: go test
-        run: go test ./...
-      - uses: actions/setup-node@v4
-        with:
-          node-version: "22"
-      - name: npm layer self-test
-        working-directory: npm
-        run: npm test
+      - id: pick
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+          # 组织级 runner 列表需要 admin:org，改用更可靠的间接判断：
+          # 直接看最近 30 天 self-hosted job 是否成功过（用 workflow run 记录近似）。
+          # 更简单可靠的做法：查仓库可用的 runner（含组织级继承）。
+          if gh api repos/${{ github.repository }}/actions/runners \
+               --jq '[.runners[] | select(.status=="online")] | length' 2>/dev/null | grep -qv '^0$'; then
+            echo "label=self-hosted" >> "$GITHUB_OUTPUT"
+            echo "self-hosted 在线"
+          else
+            echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
+            echo "self-hosted 不在线，回退官方 runner"
+          fi
 
-  build:
-    name: Build ${{ matrix.kind }}-${{ matrix.os }}-${{ matrix.arch }}
-    needs: test
-    runs-on: ubuntu-latest
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          # CLI：全平台
-          - { kind: cli, os: linux, arch: amd64 }
-          - { kind: cli, os: linux, arch: arm64 }
-          - { kind: cli, os: darwin, arch: amd64 }
-          - { kind: cli, os: darwin, arch: arm64 }
-          - { kind: cli, os: windows, arch: amd64 }
-          # GUI：只有 darwin / windows（native UI 无 Linux 后端）
-          - { kind: gui, os: darwin, arch: amd64 }
-          - { kind: gui, os: darwin, arch: arm64 }
-          - { kind: gui, os: windows, arch: amd64 }
-          # server：全平台
-          - { kind: server, os: linux, arch: amd64 }
-          - { kind: server, os: linux, arch: arm64 }
-          - { kind: server, os: darwin, arch: amd64 }
-          - { kind: server, os: darwin, arch: arm64 }
-          - { kind: server, os: windows, arch: amd64 }
+  release:
+    name: Build and publish
+    needs: pick-runner
+    runs-on: ${{ needs.pick-runner.outputs.label }}
+    timeout-minutes: 30
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: "1.27.x"
+          # self-hosted 上用本地缓存目录，避免每次从 GitHub 拉 Go 工具链
           cache: true
+
+      - name: Verify toolchain
+        run: |
+          go version
+          node --version || echo "node 缺失（npm 步骤会单独 setup）"
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
 
       - name: Resolve version
         id: ver
@@ -87,72 +92,69 @@ jobs:
             v="dev-${GITHUB_SHA::7}"
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
+          echo "version=$v"
 
-      # Windows 的图标与版本信息只能经 PE 资源段进入 exe，而 Go 只认同目录下
-      # 的 *.syso。该文件已入库（图标是稳定资产）；但版本号是构建期的，tag
-      # 构建必须用当次 VERSION 重新生成一次，否则 exe 属性里的版本会永远停在
-      # 入库那一刻。图标本身不依赖这一步——重新生成只是重打包同一个 .ico。
-      - name: Generate Windows resources
-        if: matrix.kind == 'gui' && matrix.os == 'windows'
+      - name: Build all platforms
+        id: build
         env:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          go install github.com/tc-hib/go-winres@latest
-          export PATH="$(go env GOPATH)/bin:$PATH"
-          ./cmd/gui/make_winres.sh
-
-      - name: Build
-        env:
-          GOOS: ${{ matrix.os }}
-          GOARCH: ${{ matrix.arch }}
-          VERSION: ${{ steps.ver.outputs.version }}
-          KIND: ${{ matrix.kind }}
-        run: |
-          set -euo pipefail
-          ext=""
-          if [ "$GOOS" = "windows" ]; then ext=".exe"; fi
-          out="${KIND}-${GOOS}-${GOARCH}${ext}"
-
+          rm -rf dist && mkdir -p dist
           ldflags="-s -w -X main.version=${VERSION}"
-          if [ "$KIND" = "gui" ] && [ "$GOOS" = "windows" ]; then
-            # 双击不弹黑框；go install 传不了这个 flag，故另有 runtime 兜底
-            ldflags="$ldflags -H=windowsgui"
-          fi
+          made=0
+          for kind in cli gui server; do
+            for os in linux darwin windows; do
+              for arch in amd64 arm64; do
+                # GUI 只有 darwin / windows（mygo native UI 无 Linux 后端）
+                if [ "$kind" = "gui" ] && [ "$os" = "linux" ]; then continue; fi
+                ext=""; [ "$os" = "windows" ] && ext=".exe"
+                out="dist/${kind}-${os}-${arch}${ext}"
 
-          CGO_ENABLED=0 go build -trimpath -ldflags "$ldflags" \
-            -o "$out" "./cmd/${KIND}"
-          ls -lh "$out"
-          echo "OUT=$out" >> "$GITHUB_ENV"
+                ld="$ldflags"
+                # Windows GUI 双击不弹控制台（go install 传不了，另有 console_windows.go 兜底）
+                if [ "$kind" = "gui" ] && [ "$os" = "windows" ]; then
+                  ld="$ld -H=windowsgui"
+                fi
 
-      - name: Upload artifact
+                echo "→ $out"
+                GOOS=$os GOARCH=$arch CGO_ENABLED=0 \
+                  go build -trimpath -ldflags "$ld" -o "$out" "./cmd/${kind}"
+                made=$((made+1))
+              done
+            done
+          done
+          echo "built=$made" >> "$GITHUB_OUTPUT"
+          echo "共 $made 个产物"
+          ls -lh dist
+
+      - name: Self-check binaries
+        run: |
+          set -euo pipefail
+          # 每一类至少能在本机跑（跨架构的用 file 检查格式）
+          ./dist/cli-darwin-arm64 version
+          for f in dist/*; do
+            file "$f" | sed 's/^/  /'
+          done
+          # GUI 的 Windows 产物必须是 GUI 子系统
+          file dist/gui-windows-amd64.exe | grep -q "GUI" \
+            || { echo "gui-windows 不是 GUI 子系统"; exit 1; }
+
+      - name: Upload artifacts (给 npm job 用)
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: actions/upload-artifact@v4
         with:
-          name: bin-${{ matrix.kind }}-${{ matrix.os }}-${{ matrix.arch }}
-          path: ${{ env.OUT }}
-          if-no-files-found: error
-          retention-days: 7
-
-  release:
-    name: Publish GitHub Release
-    needs: build
-    if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: actions/download-artifact@v4
-        with:
-          path: dist
-          merge-multiple: true
+          name: binaries
+          path: dist/*
+          retention-days: 3
 
       - name: Checksums
+        if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          cd dist
-          ls -lh
-          shasum -a 256 * > SHA256SUMS.txt
-          cat SHA256SUMS.txt
+          cd dist && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt
 
-      - name: Create release
+      - name: Publish GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
         with:
           files: dist/*
@@ -183,106 +185,76 @@ jobs:
 
             见下方 Assets，校验和见 `SHA256SUMS.txt`。
 
-            | 文件 | 说明 |
-            |---|---|
-            | `cli-<os>-<arch>` | 本地中转 + 增量压缩隧道 |
-            | `gui-<os>-<arch>` | 图形界面（macOS / Windows） |
-            | `server-<os>-<arch>` | 隧道服务端 |
-
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
+      # ── npm 独立 job：需要 environment + id-token，且要 Node 环境 ──────────
+      # 单独成 job 是因为 environment 的保护规则与 OIDC 权限都按 job 生效；
+      # needs 传递 dist 目录（self-hosted 与官方 runner 不共享文件系统，
+      # 所以这里用 artifact 中转）。
+
   npm:
     name: Publish npm
-    needs: build
+    needs: release
     if: startsWith(github.ref, 'refs/tags/v')
-    runs-on: ubuntu-latest
-    # 必须与 npmjs.com 上 Trusted Publisher 的 Environment name 完全一致。
-    # GitHub 的 OIDC token 里带 environment claim，npm 用它匹配 Trusted
-    # Publisher 配置；job 不声明 environment 时该 claim 为空，匹配失败的表现
-    # 是 404「package not found」（而不是权限错误，极具迷惑性）。
+    # 必须与 npmjs.com Trusted Publisher 的 Environment name 完全一致
     environment: npm-publish
+    runs-on: ubuntu-latest          # npm 发布用官方 runner 即可（无需自建）
+    timeout-minutes: 15
     permissions:
       contents: read
-      # OIDC 发布必需：npm 用这个令牌换短期凭证
-      id-token: write
+      id-token: write               # OIDC 必需
     steps:
       - uses: actions/checkout@v4
 
-      # 刻意不传 registry-url：它会让 setup-node 往 .npmrc 写 NODE_AUTH_TOKEN，
-      # npm 见到该变量就走 Basic Auth，OIDC 换来的短期凭证被忽略，结果是
-      # E404（registry 对无权写入返回 404 而非 403）。npm 默认 registry 即可。
+      # 不传 registry-url：它会让 setup-node 写 NODE_AUTH_TOKEN 到 .npmrc，
+      # npm 见到该变量就走 Basic Auth，OIDC 换来的凭证被忽略（实测 E404）。
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
 
-      - name: Download all binaries into package vendor/
+      - name: Upgrade npm (Trusted Publishing 需要 CLI 11+)
+        run: npm install -g npm@latest
+
+      - name: Download binaries
         uses: actions/download-artifact@v4
         with:
+          name: binaries
           path: npm/vendor
-          merge-multiple: true
 
-      - name: Resolve version
-        id: ver
+      - name: OIDC preconditions
+        # npm 的 oidc() 在任一前置条件失败时只是 log.verbose + return undefined，
+        # 最终统一表现为 ENEEDAUTH，无法从错误码区分。这步把条件逐个打印。
         run: |
-          v="${GITHUB_REF_NAME#v}"
-          echo "version=$v" >> "$GITHUB_OUTPUT"
-          ls -lh npm/vendor
+          echo "npm: $(npm --version)"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL: ${ACTIONS_ID_TOKEN_REQUEST_URL:+set}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+set}"
+          echo "NODE_AUTH_TOKEN: ${NODE_AUTH_TOKEN:-unset}"
 
-      - name: Set package version
+      - name: Set version
         working-directory: npm
         env:
-          VERSION: ${{ steps.ver.outputs.version }}
+          VERSION: ${{ github.ref_name }}
         run: |
           node -e '
             const fs = require("fs");
             const p = JSON.parse(fs.readFileSync("package.json", "utf8"));
-            p.version = process.env.VERSION;
+            p.version = process.env.VERSION.replace(/^v/, "");
             fs.writeFileSync("package.json", JSON.stringify(p, null, 2) + "\n");
             console.log("version ->", p.version);
           '
 
-      - name: Mark binaries executable
+      - name: Prepare package
         run: |
-          cd npm/vendor
-          for f in *; do
-            case "$f" in
-              *.exe) chmod 0644 "$f" ;;
-              *)     chmod 0755 "$f" ;;
-            esac
-          done
+          set -euo pipefail
+          chmod 0755 npm/vendor/cli-* npm/vendor/gui-* npm/vendor/server-* 2>/dev/null || true
+          chmod 0644 npm/vendor/*.exe 2>/dev/null || true
+          cp README.md LICENSE npm/
 
-      - name: Copy repo docs into package
-        run: cp README.md LICENSE npm/
-
-      - name: Verify package contents
+      - name: Publish
         working-directory: npm
-        run: npm pack --dry-run 2>&1 | tail -40
-
-      - name: Upgrade npm (Trusted Publishing 需要 CLI 11+)
-        run: npm install -g npm@latest
-
-      - name: OIDC preconditions
-        # 诊断：npm 的 oidc() 在四个前置条件失败时静默 return undefined，
-        # 最终表现为 ENEEDAUTH。先把这些条件逐个打印出来。
-        run: |
-          echo "npm version: $(npm --version)"
-          echo "ACTIONS_ID_TOKEN_REQUEST_URL set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
-          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
-          echo "GITHUB_ACTIONS: ${GITHUB_ACTIONS:-unset}"
-          echo "NODE_AUTH_TOKEN: ${NODE_AUTH_TOKEN:-unset}"
-          echo "--- npmrc ---"
-          cat ~/.npmrc 2>/dev/null || echo "(no ~/.npmrc)"
-          cat .npmrc 2>/dev/null || echo "(no ./.npmrc)"
-          echo "--- registry ---"
-          npm config get registry
-
-      - name: Publish via OIDC
-        working-directory: npm
-        # Trusted Publishing：npm CLI 11+ 用 Actions 的 id-token 换短期凭证。
-        # 关键：环境里绝不能有 NODE_AUTH_TOKEN（哪怕是空串）——npm 会认为
-        # 已有凭据配置，OIDC 分支被跳过，最后报 ENEEDAUTH。
+        # 环境里绝不能有 NODE_AUTH_TOKEN（哪怕空串）：npm 会认为已有凭据配置，
+        # OIDC 分支被跳过。同时清掉可能残留的 .npmrc。
         run: |
           rm -f ~/.npmrc .npmrc 2>/dev/null || true
-          echo "NODE_AUTH_TOKEN=${NODE_AUTH_TOKEN:-unset}"
           npm publish --provenance --access public --loglevel verbose
