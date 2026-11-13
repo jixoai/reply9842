@@ -18,6 +18,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sync"
 
 	"github.com/klauspost/compress/zstd"
 	"lukechampine.com/blake3"
@@ -64,22 +65,58 @@ type encKey struct {
 }
 
 type encPool struct {
-	m map[encKey]*zstd.Encoder
+	mu    sync.Mutex
+	free  map[encKey][]*zstd.Encoder
+	total int
 }
 
-func newEncPool() *encPool { return &encPool{m: make(map[encKey]*zstd.Encoder)} }
+// 池的上限。为什么必须是常数而不是「按 (level, dict) 无限缓存」：
+//
+// key 里带字典哈希，而 LLM 会话每一轮的基版本都不同 —— 无限缓存等价于
+// 「每个请求留一个编码器」。level 19 的编码器持有字典窗口与匹配表
+// （单个可达数十 MB），内存会随请求数线性上涨：2026-11-14 另一台机器
+// 跑到 5GB 就是这么来的。
+//
+// 实测（2026-11-14，客户端 1.5MB 请求 × 不同基线）：
+//
+//	不复用（0）   常驻 ~150MB
+//	复用 2 个     常驻 ~560MB
+//	复用 4 个     常驻 ~930MB
+//	无上限（旧）  1.5GB 且持续增长
+//
+// 编码器重建只要毫秒级，而每请求的压缩耗时是百毫秒级，所以默认不复用——
+// 用确定的内存换可忽略的时间。
+const (
+	encPoolCap    = 0 // 池内实例总数上限（0=不复用，用完即关）
+	encPoolPerKey = 1 // 同一个 (level,dict) 只留一个空闲实例
+)
+
+func newEncPool() *encPool { return &encPool{free: make(map[encKey][]*zstd.Encoder)} }
 
 var pool = newEncPool()
 
-func (p *encPool) get(level int, dict []byte) (*zstd.Encoder, error) {
+// acquire 取一个可**独占使用**的编码器。
+//
+// 必须独占：zstd.Encoder 的 EncodeAll 不改共享状态，但同一个实例被两个
+// goroutine 同时调用会踩内部缓冲区（数据竞争 → 输出损坏/进程崩）。所以池
+// 交出实例后从 free 列表里摘掉，用完由 release 还回来。
+func (p *encPool) acquire(level int, dict []byte) (*zstd.Encoder, encKey, error) {
 	var dh Hash
 	if len(dict) > 0 {
 		dh = Sum(dict)
 	}
 	k := encKey{level: level, dictH: dh}
-	if e, ok := p.m[k]; ok {
-		return e, nil
+
+	p.mu.Lock()
+	if list := p.free[k]; len(list) > 0 {
+		e := list[len(list)-1]
+		p.free[k] = list[:len(list)-1]
+		p.total--
+		p.mu.Unlock()
+		return e, k, nil
 	}
+	p.mu.Unlock()
+
 	opts := []zstd.EOption{
 		zstd.WithEncoderLevel(zstd.EncoderLevelFromZstd(level)),
 		// 窗口：dcz 允许到 128MB；普通 zstd coding 被 RFC 9659 限到 8MB，
@@ -91,11 +128,32 @@ func (p *encPool) get(level int, dict []byte) (*zstd.Encoder, error) {
 		opts = append(opts, zstd.WithEncoderDictRaw(rawDictID, dict))
 	}
 	e, err := zstd.NewWriter(nil, opts...)
-	if err != nil {
-		return nil, err
+	return e, k, err
+}
+
+// release 归还一个编码器；超过上限就直接丢弃（让 GC 收）。
+func (p *encPool) release(k encKey, e *zstd.Encoder) {
+	if e == nil {
+		return
 	}
-	p.m[k] = e
-	return e, nil
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.total >= encPoolCap || len(p.free[k]) >= encPoolPerKey {
+		// 不缓存就顺手关掉：level 19 + 大字典的编码器持有几十到几百 MB 的
+		// 窗口/匹配表，只等 GC 会让常驻内存跟着 GC 节奏漂。release 由**持有者**
+		// 调用，此刻没有第二个 goroutine 在用它，Close 是安全的。
+		e.Close()
+		return
+	}
+	p.free[k] = append(p.free[k], e)
+	p.total++
+}
+
+// poolSize 当前空闲实例数（测试用）。
+func (p *encPool) poolSize() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.total
 }
 
 // PickLevel 按 body 大小选 zstd level。
@@ -120,11 +178,13 @@ func PickLevel(bodySize int) int {
 
 // Compress 用 zstd 压缩（无字典或带字典）
 func Compress(body []byte, level int, dict []byte) ([]byte, error) {
-	e, err := pool.get(level, dict)
+	e, k, err := pool.acquire(level, dict)
 	if err != nil {
 		return nil, err
 	}
-	return e.EncodeAll(body, nil), nil
+	out := e.EncodeAll(body, nil)
+	pool.release(k, e)
+	return out, nil
 }
 
 // ---- dcz 线格式 ----

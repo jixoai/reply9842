@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"testing"
 	"time"
 )
@@ -449,3 +450,53 @@ var errTestUpstream = errStr("upstream unreachable")
 type errStr string
 
 func (e errStr) Error() string { return string(e) }
+
+// TestReleaseCursorFreesDecoder 读完必须把解码游标还回去。
+//
+// 每个游标背后是一个 zstd.Decoder，history 环形缓冲按帧窗口分配（实测
+// ~4MB）。2026-11-14 生产环境跑 5 小时 RSS 993MB，heap profile 里 95% 在
+// zstd.(*history).ensureBlockRing —— 就是「游标跟着 entry 一直缓存」造成的。
+// 这条测试锁住「读完释放」这个契约，并用 HeapInuse 兜住规模。
+func TestReleaseCursorFreesDecoder(t *testing.T) {
+	m, err := New(Options{Dir: t.TempDir(), TmpBudget: 64 << 20, IdemBudget: 64 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer m.Close()
+
+	body := bytes.Repeat([]byte("hello-spool-"), 40000) // ~480KB
+	var key [32]byte
+	key[0] = 1
+
+	e, _, err := m.Acquire(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.SetHead(200, nil)
+	if err := e.Append(body); err != nil {
+		t.Fatal(err)
+	}
+	e.Finish(nil)
+
+	var before, after runtime.MemStats
+	runtime.GC()
+	runtime.ReadMemStats(&before)
+
+	for i := 0; i < 40; i++ {
+		if _, err := e.ReadFrom(0, 64<<10); err != nil {
+			t.Fatalf("ReadFrom: %v", err)
+		}
+		e.ReleaseCursor()
+		if e.cur != nil {
+			t.Fatal("ReleaseCursor 之后仍然缓存着解码游标")
+		}
+	}
+
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	grown := int64(after.HeapInuse) - int64(before.HeapInuse)
+	// 40 次「建解码器 + 释放」不应该留下 40×4MB；留 32MB 余量吸收噪声。
+	if grown > 32<<20 {
+		t.Fatalf("循环后 HeapInuse 增长 %d bytes（>32MB），解码器没被释放", grown)
+	}
+}

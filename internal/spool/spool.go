@@ -201,6 +201,24 @@ func (e *Entry) ReadFrom(offset int64, n int) ([]byte, error) {
 	return buf[:got], nil
 }
 
+// ReleaseCursor 释放压缩条目的解码游标。
+//
+// 每个游标背后是一个 zstd.Decoder，它的 history 环形缓冲按帧窗口分配
+// （实测约 4MB/个）。游标若跟着条目一直缓存——idem 区能留上万条——内存就会
+// 随请求数线性增长：2026-11-14 生产环境跑 5 小时涨到 993MB，heap profile
+// 里 95% 在 zstd.(*history).ensureBlockRing。
+//
+// 读完就释放，代价是下次续传要重新 seek（695KB 实测 0.46ms），换来的是
+// 阶数级的内存下降。
+func (e *Entry) ReleaseCursor() {
+	e.readMu.Lock()
+	if e.cur != nil {
+		e.cur.dec.Close()
+		e.cur = nil
+	}
+	e.readMu.Unlock()
+}
+
 // readable 已推出压缩器、可从 .dat 解出的明文字节数。
 func (e *Entry) readable() int64 {
 	e.mu.Lock()

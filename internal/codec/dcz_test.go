@@ -2,7 +2,9 @@ package codec
 
 import (
 	"bytes"
+	"fmt"
 	"strings"
+	"sync"
 	"testing"
 )
 
@@ -157,5 +159,64 @@ func TestPickLevel(t *testing.T) {
 		if got := PickLevel(c.size); got != c.want {
 			t.Errorf("PickLevel(%d) = %d, want %d", c.size, got, c.want)
 		}
+	}
+}
+
+// TestEncoderPoolBounded 编码器池必须是常数规模。
+//
+// key 里带字典哈希，而每轮会话的基版本都不同 —— 无限缓存等价于每个请求留一个
+// level-19 编码器（单个可达数十 MB）。2026-11-14 实测另一台机器内存涨到 5GB，
+// 来源就是这里。这条测试用 40 个不同字典压一轮，断言池不超过上限。
+func TestEncoderPoolBounded(t *testing.T) {
+	p := newEncPool()
+	body := bytes.Repeat([]byte("abc"), 1000)
+	for i := 0; i < 40; i++ {
+		dict := []byte(strings.Repeat("d", 100+i))
+		e, k, err := p.acquire(19, dict)
+		if err != nil {
+			t.Fatalf("acquire: %v", err)
+		}
+		_ = e.EncodeAll(body, nil)
+		p.release(k, e)
+	}
+	if n := p.poolSize(); n > encPoolCap {
+		t.Fatalf("池里有 %d 个实例，上限是 %d", n, encPoolCap)
+	}
+}
+
+// TestCompressConcurrentSameDict 同一个字典的并发压缩不能共享编码器实例。
+//
+// zstd.Encoder 的 EncodeAll 不保证并发安全：两个 goroutine 同时用同一个实例
+// 会踩内部缓冲区（输出损坏 / 崩溃）。池必须交出独占实例。
+func TestCompressConcurrentSameDict(t *testing.T) {
+	dict := bytes.Repeat([]byte("shared-dict-"), 500)
+	body := bytes.Repeat([]byte("payload-"), 3000)
+	want, err := Compress(body, 19, dict)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < 20; j++ {
+				got, err := Compress(body, 19, dict)
+				if err != nil {
+					errs <- err
+					return
+				}
+				if !bytes.Equal(got, want) {
+					errs <- fmt.Errorf("并发压缩结果不一致：%d vs %d 字节", len(got), len(want))
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		t.Fatal(err)
 	}
 }

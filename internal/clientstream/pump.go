@@ -257,6 +257,11 @@ func (r *rawSink) flush() error {
 	if err != nil {
 		r.broken = true
 	}
+	// 正常结束也要关解码器：它按帧窗口分配 history 环形缓冲（实测 ~4MB），
+	// 只等 GC 回收等于把峰值内存交给 GC 节奏。服务端侧同一个坑已经实测
+	// 把 RSS 顶到 993MB（见 spool.Entry.ReleaseCursor）。
+	r.dec.Close()
+	r.dec = nil
 	return err
 }
 

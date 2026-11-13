@@ -22,6 +22,7 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/http/pprof"
 	"os"
 	"path/filepath"
 	"strings"
@@ -48,6 +49,7 @@ type cfg struct {
 	idemMB         int64
 	upstreamTimout time.Duration
 	healthAddr     string
+	pprof          bool
 	healthProbe    bool
 	logPath        string
 	statsPath      string
@@ -68,6 +70,8 @@ func main() {
 	flag.BoolVar(&c.healthProbe, "health-probe", false,
 		"探针模式：GET 自己的 /healthz，成功 exit 0、失败 exit 1。"+
 			"给 scratch 镜像的 HEALTHCHECK 用（容器内无 curl）")
+	flag.BoolVar(&c.pprof, "pprof", false,
+		"在健康检查端口上挂 /debug/pprof/（排障用，生产别对公网开）")
 	flag.StringVar(&c.healthAddr, "health-addr", "",
 		"健康检查监听地址（如 127.0.0.1:8080）；留空不启用。"+
 			"给容器编排用：scratch 镜像无 shell，不能做 exec 型探活")
@@ -166,6 +170,15 @@ func main() {
 	// 本进程其实没有健康端点。先同步 Listen 确认端口到手，再起 serve goroutine。
 	if c.healthAddr != "" {
 		mux := http.NewServeMux()
+		if c.pprof {
+			// 只在显式开 -pprof 时挂上：pprof 能看全量堆与 goroutine，
+			// 不该是默认暴露面。与 /healthz 同一个监听，方便只绑回环。
+			mux.HandleFunc("/debug/pprof/", pprof.Index)
+			mux.HandleFunc("/debug/pprof/heap", pprof.Handler("heap").ServeHTTP)
+			mux.HandleFunc("/debug/pprof/goroutine", pprof.Handler("goroutine").ServeHTTP)
+			mux.HandleFunc("/debug/pprof/allocs", pprof.Handler("allocs").ServeHTTP)
+			log.Printf("pprof     %s/debug/pprof/", c.healthAddr)
+		}
 		mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 			w.WriteHeader(http.StatusOK)
@@ -358,6 +371,9 @@ func (s *server) serveOne(a transport.Accept) (keepAlive bool, err error) {
 // 收一条全新的流，不需要跨连接保留解压器状态（那是唯一的正确性陷阱）。
 func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64,
 	start time.Time, rec *stats.Record) int {
+	// 无论从哪条 return 离开，都把解码游标还回去：它背后是一个按窗口
+	// 分配的 zstd 解码器（约 4MB），跟着条目缓存会把内存按请求数堆起来。
+	defer e.ReleaseCursor()
 
 	// enc 必须在**头就绪且压缩决策已拍板之后**才判定：
 	// startPump 是 goroutine，压缩决策发生在它内部（要等攒够 MinUseful）。
