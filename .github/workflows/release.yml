@@ -515,11 +515,14 @@ jobs:
 
           # 必须把 -cert/-key 显式传空：--entrypoint 只覆盖 ENTRYPOINT，
           # 镜像的 CMD 仍会作为参数追加进来，于是「不带参数」根本测不到。
-          if docker run --rm --entrypoint /reply9842-server "$img" -cert "" -key "" 2>&1 | grep -q "必须提供 -cert 与 -key"; then
+          # 注意 set -o pipefail：`docker run | grep -q` 里二进制必然非零退出，
+          # 整条管道会被判失败，于是即使 grep 命中也走 else 分支。先收进变量。
+          out="$(docker run --rm --entrypoint /reply9842-server "$img" -cert "" -key "" 2>&1 || true)"
+          if printf '%s' "$out" | grep -q "必须提供 -cert 与 -key"; then
             echo "✓ 参数校验生效"
           else
             echo "❌ 参数校验没触发" >&2
-            docker run --rm --entrypoint /reply9842-server "$img" 2>&1 | tail -20 >&2 || true
+            printf '%s\n' "$out" | tail -20 >&2
             exit 1
           fi
 
