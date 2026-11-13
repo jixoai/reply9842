@@ -3,7 +3,7 @@
 // 布局（2026-11-13 第二轮反馈后重排）：
 //
 //	titlebar  品牌标 + 应用名 + [面板｜设置] tabs + 复制地址徽标 + 启动/停止图标开关
-//	面板 tab  上行压缩图（吃掉剩余高度）· 启动失败说明（仅失败时）· 统计行 + 复制地址
+//	面板 tab  上行压缩图（吃掉剩余高度）· 启动失败说明（仅失败时）· 统计摘要
 //	设置 tab  上游 / 监听 / 传输方式 / 开机自启
 //	footer    运行态 + 传输方式 + 上游 + 版本号（版本号只在这里出现）
 //
@@ -53,26 +53,22 @@ func (a *app) view(c *ui.Context) {
 
 	a.pal.Page(c).Children(func() {
 		a.titleBar(c, p)
-		// 内容滚动、footer 钉底、复制按钮钉在内容区底部。
-		//
-		// 为什么把复制按钮从内容流里拿出来钉底：两个 tab 的内容高度差很大
-		// （面板运行态约 350px，空态只有约 235px），窗口高度是固定的，
-		// 空态底部那 100+px 若直接留空会读成「没画完」。让次要操作贴住
-		// 内容区的下沿，这段空白就变成「上面是主体、下面是动作」的结构，
-		// 而不是漏画的区域。
+		// 内容区吃掉剩余高度，footer 钉在窗口底部。
 		ui.Column(c).Grow(1).Children(func() {
 			// 面板 tab 用 Column(Grow) 而不是 Scroll：图表要占满窗口剩下的高度
 			// （用户把窗口拉大时，该变高的是图，不是空白）。设置 tab 用 Scroll——
 			// 它的内容高度固定，窗口太矮时宁可滚也不能把「开机自启」切掉。
 			if a.tab == tabSettings {
 				ui.Scroll(c).Grow(1).Children(func() {
-					ui.Column(c).Padding(16, 16, 10).Gap(10).Children(func() {
+					// 底边距与左右同为 16：卡片的大扩散阴影会往下吃掉 8-10px，
+					// 10 的底边距在截图里会读成「卡片贴着 footer，被裁了一点」。
+					ui.Column(c).Padding(16, 16, 16).Gap(10).Children(func() {
 						a.settingsPane(c, p)
 						a.noticeLine(c, p)
 					})
 				})
 			} else {
-				ui.Column(c).Grow(1).Padding(16, 16, 10).Gap(10).Children(func() {
+				ui.Column(c).Grow(1).Padding(16, 16, 16).Gap(10).Children(func() {
 					a.panelPane(c, p)
 					a.noticeLine(c, p)
 				})
@@ -188,10 +184,12 @@ func (a *app) brandMark(c *ui.Context, p *glass.Palette) {
 //
 // 交互契约：
 //
-//	默认   地址（mono，可截断）+ 复制图标
+//	默认   地址（mono，可截断）+ 复制图标（图标在 inline-end）
 //	悬停   底色抬亮一档、文字提到正文色 —— 整块都是可点区域
-//	点击   复制纯 URL 到剪贴板，图标变对勾、文字变「已复制」，1.6 秒后复原
+//	点击   复制纯 URL 到剪贴板，文字变「已复制」、图标变对勾，1.6 秒后复原
 //
+// 底栏不再放第二个复制入口：同一个动作在一屏里出现两次会稀释主次，
+// 顶栏这枚徽标已经覆盖了「核对地址 + 复制」。回显也只在这里做，口径唯一。
 // 为什么显示时去掉 scheme：这一栏只有 480 宽，`http://` 要吃掉约 40px，
 // 而复制出去的内容仍是完整 URL（footer 的提示与这里显示同源，见 localURL）。
 // 显示上截断用 TruncateMiddle：`127.0.0.…:18899` 保住端口那一半——
@@ -229,11 +227,17 @@ func (a *app) hostChip(c *ui.Context, p *glass.Palette) {
 		text = p.Foreground
 	}
 	chip.Children(func() {
-		ui.Icon(c, icon).Size(10, 10).Shrink(0).TextColor(fg)
+		// 文字在前、图标在后（icon 落在 inline-end）：图标是「点一下能复制」
+		// 的提示，跟在地址末尾读起来像它的一个后缀动作，放在行首则像另一个按钮。
 		if showText {
-			ui.Text(c, a.hostText()).FontSize(10).Font("monospace").
+			label := a.hostText()
+			if copied {
+				label = "已复制"
+			}
+			ui.Text(c, label).FontSize(10).Font("monospace").
 				TextColor(text).SingleLine().TruncateMiddle().MaxWidth(104)
 		}
+		ui.Icon(c, icon).Size(10, 10).Shrink(0).TextColor(fg)
 	})
 	if chip.Clicked() {
 		a.copyURL(c)
@@ -424,8 +428,8 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 		}
 
 		a.chartPlot(c, p)
-		ui.Text(c, a.chartSummary(g)).FontSize(11).
-			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(2)
+		ui.Text(c, a.chartSummary(g)).FontSize(10.5).
+			FontFeatures("tnum").TextColor(p.MutedForeground).SingleLine()
 	})
 }
 
@@ -434,6 +438,17 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 // 图上柱高表达压缩率，太矮时 5% 的差异只剩 2-3px、读不出来。110 是
 // 「25% 刻度间隔 27px」的下限：再矮，四档刻度就会与柱顶互相挤压。
 const chartMinHeight float32 = 110
+
+// chartAxisWidth / chartAxisGap 两张图共用的左侧刻度列与间距。
+//
+// 两张图上下叠在同一张卡片列里，绘图区必须共用同一组左右 gutter，否则
+// 横轴的刻度、柱子的落点会错位（上一版一张 28、一张 46，x 轴差 18px，
+// 叠在一起一眼就能看出没对齐）。46 是两张图里较宽的那个刻度文案
+// （"411.1 KB"）量出来的宽度，两处统一取它。
+const (
+	chartAxisWidth float32 = 46
+	chartAxisGap   float32 = 6
+)
 
 // trafficCard 流量与延迟图（第二张）。
 //
@@ -467,6 +482,12 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 				a.legendSwatch(c, p.UpBar, "上行")
 				a.legendSwatch(c, p.DownBar, "下行")
 				a.legendLine(c, p.Latency, "延迟")
+				// 折线在空桶处断开，不是渲染失败。有这种断点时在图例里
+				// 明说一句，否则读者会把「无样本」读成「线没画出来」。
+				if a.latencyHasGaps() {
+					ui.Text(c, "断点=无样本").FontSize(10).
+						TextColor(p.Tertiary).SingleLine()
+				}
 			}
 			a.liveBadge(c, p, running)
 		})
@@ -481,8 +502,8 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 		}
 
 		a.trafficPlot(c, p)
-		ui.Text(c, a.trafficSummary(g)).FontSize(11).
-			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(2)
+		ui.Text(c, a.trafficSummary(g)).FontSize(10.5).
+			FontFeatures("tnum").TextColor(p.MutedForeground).SingleLine()
 	})
 }
 
@@ -491,7 +512,12 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 // 与上面那张「吃掉剩余高度」的图不同，这张是定高的：两张图同时 grow 会让
 // 比例随窗口高度漂移（窗口拉大时两张图都变高，但谁该长得更多没有依据）。
 // 定高 + 上面那张 grow，结果是「主图随窗口长、副图稳定」——主次分明。
-const trafficPlotHeight float32 = 88
+//
+// 156 而不是 88：真实数据的单桶流量是重尾分布——一个 2MB 的桶旁边常跟着
+// 十几个 100-300KB 的桶，88px 时后者只剩 4-12px，读者会以为它们「没有流量」。
+// 加高到 156 后常态柱有 15-30px，足以读出高低差；峰值仍是满高，但不靠
+// 压扁其它柱来成立（另见 trafficPlot 里的最小可见高度）。
+const trafficPlotHeight float32 = 156
 
 // hasTraffic 是否有可画的流量数据（上下行任一非零即可）
 func (a *app) hasTraffic() bool {
@@ -504,6 +530,18 @@ func (a *app) hasTraffic() bool {
 }
 
 // trafficPlot 画流量柱 + 延迟折线。
+//
+// 三条渲染契约（都来自「延迟被画成一堆碎划线」的反馈）：
+//
+//  1. 折线用 StrokePolyline（真斜线 + 圆头圆角），不是 Painter.Line——
+//     Line 只画水平/垂直，斜段会退化成一条短横线，整条曲线看起来像坏点。
+//  2. 相邻的非空桶必须连成一段；只有 Count==0 的桶才断开，并且由
+//     latencyHasGaps 在图例里说明「断点=无样本」，不让断线读成渲染失败。
+//  3. 单点数据画一段最小 7px 的圆头线，不小于一个可辨认的短划。
+//
+// 量纲不混轴：左轴只标字节（顶=峰值、中=峰值/2、底=0），延迟的数值
+// （当前/峰值/均值）由图下那行摘要给出。上一版在同一根左轴上同时标
+// "2.2 MB" 与 "101603 ms" 且没有刻度，读者无法判断折线的高度代表什么。
 func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 	series := a.agg.Series
 
@@ -511,7 +549,6 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 	// 两者各算各的，但都至少取 1，避免除零。
 	var maxBytes int64 = 1
 	var maxMs int64 = 1
-	var hsCount int64
 	for _, b := range series {
 		if v := b.UpWire + b.DownWire; v > maxBytes {
 			maxBytes = v
@@ -519,26 +556,18 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 		if v := b.AvgMs(); v > maxMs {
 			maxMs = v
 		}
-		hsCount += b.HsCount
 	}
 
 	ui.Row(c).Height(trafficPlotHeight).FillWidth().
-		AlignItems(ui.Stretch).Gap(6).Children(func() {
-		// 纵轴刻度只标峰值与 0：流量是动态范围极大的量（KB 到 MB），
-		// 中间刻度要人肉换算，不如只标「顶 = 本窗口峰值」。
-		// 34 宽装不下 "411.1 KB"（实测被截成 "411.1…"）。加到 46：
-		// 峰值标签是本图唯一的量级参照，截断它等于把纵轴读成无刻度。
-		// 纵轴三档：字节峰值（上）、延迟峰值（中，琥珀色对应折线）、0（下）。
-		//
-		// 只有两档（峰值/0）时，折线在图中间的位置完全没有参照——读者不知道该
-		// 按字节刻度还是按延迟刻度去读。中间那档用琥珀色 + "ms" 明确划清界限：
-		// 上半部分是流量刻度，这一行以下是延迟刻度。
-		ui.Column(c).Width(46).Shrink(0).AlignItems(ui.End).Children(func() {
+		AlignItems(ui.Stretch).Gap(chartAxisGap).Children(func() {
+		// 字节刻度三档：顶=本窗口峰值、中=峰值的一半、底=0。
+		// 延迟不在同一根轴上（见函数头注释），它的数值在摘要行里。
+		ui.Column(c).Width(chartAxisWidth).Shrink(0).AlignItems(ui.End).Children(func() {
 			ui.Text(c, humanBytes(maxBytes)).FontSize(8).FontFeatures("tnum").
 				TextColor(p.Tertiary).SingleLine()
 			ui.Box(c).Grow(1)
-			ui.Textf(c, "%d ms", maxMs).FontSize(8).FontFeatures("tnum").
-				TextColor(p.Latency).SingleLine()
+			ui.Text(c, humanBytes(maxBytes/2)).FontSize(8).FontFeatures("tnum").
+				TextColor(p.Tertiary).SingleLine()
 			ui.Box(c).Grow(1)
 			ui.Text(c, "0").FontSize(8).
 				TextColor(p.Tertiary).SingleLine()
@@ -563,8 +592,8 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 				bw = 1.5
 			}
 
-			var prevX, prevY float32
-			var hasPrev bool
+			// 先画完所有柱子，再画折线：折线必须在柱子之上，否则后画的
+			// 柱子会盖住它经过的那一段，看起来又像断线。
 			for i, b := range series {
 				x := r.X + float32(i)*slot + gap/2
 
@@ -572,17 +601,18 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 				// 更常见的读数，并排会让柱宽减半、48 根时几乎看不清。
 				up := float32(b.UpWire) / float32(maxBytes) * r.H
 				down := float32(b.DownWire) / float32(maxBytes) * r.H
-				if b.UpWire > 0 && up < 1 {
-					up = 1
+				if total := up + down; total > 0 && total < minTrafficBarPx {
+					// 非零桶至少要 3px：否则 2MB 峰值旁的小流量桶只剩 1px，
+					// 读者会把它读成「这一段时间没有数据」。
+					k := minTrafficBarPx / total
+					up *= k
+					down *= k
 				}
-				if b.DownWire > 0 && down < 1 {
-					down = 1
-				}
-				if up+down > r.H {
+				if up+down > r.H-1 {
 					// 峰值柱自己可能刚好满格；留 1px 让柱顶不贴边
-					scale := (r.H - 1) / (up + down)
-					up *= scale
-					down *= scale
+					k := (r.H - 1) / (up + down)
+					up *= k
+					down *= k
 				}
 				if up > 0 {
 					pt.Fill(ui.Rect{X: x, Y: r.Y + r.H - up, W: bw, H: up},
@@ -592,82 +622,131 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 					pt.Fill(ui.Rect{X: x, Y: r.Y + r.H - up - down, W: bw, H: down},
 						p.DownBar, 0.8)
 				}
-
-				// 延迟折线：只连有请求的桶，空桶处断开（不假装中间有数据）。
-				// 断开而不是插值：空转期延迟没有意义，连过去会画出一条
-				// 「延迟平稳」的假象。
-				if b.Count > 0 {
-					ms := b.AvgMs()
-					ly := r.Y + r.H - float32(ms)/float32(maxMs)*(r.H*0.92)
-					cx := x + bw/2
-					if hasPrev {
-						pt.Line(prevX, prevY, cx, ly, 1.4, p.Latency)
-					}
-					// 折点：2px 小方块，让稀疏点也可读
-					pt.Fill(ui.Rect{X: cx - 1, Y: ly - 1, W: 2, H: 2}, p.Latency, 0.5)
-					prevX, prevY, hasPrev = cx, ly, true
-				} else {
-					hasPrev = false
-				}
 			}
+
+			// 延迟折线：连续非空桶一段；空桶处断开（空转期没有延迟样本，
+			// 连过去会画出一条「延迟平稳」的假象）。
+			usable := r.H - 4 // 上下各留 2px，线帽不贴边
+			run := make([][2]float32, 0, len(series))
+			flush := func() {
+				if len(run) == 0 {
+					return
+				}
+				if len(run) == 1 {
+					// 单点：一段 7px 的圆头短划，不是一个 2×2 的点。
+					x, y := run[0][0], run[0][1]
+					pt.StrokePolyline([][2]float32{{x - 3.5, y}, {x + 3.5, y}},
+						latencyLineWidth, p.Latency)
+				} else {
+					pt.StrokePolyline(run, latencyLineWidth, p.Latency)
+				}
+				run = run[:0]
+			}
+			for i, b := range series {
+				if b.Count <= 0 {
+					flush()
+					continue
+				}
+				frac := clampF(float64(b.AvgMs())/float64(maxMs), 0, 1)
+				cx := r.X + float32(i)*slot + slot/2
+				ly := r.Y + r.H - 2 - float32(frac)*usable
+				run = append(run, [2]float32{cx, ly})
+			}
+			flush()
 		})
 	})
 }
 
+// latencyLineWidth 延迟折线的线宽（DIPs）。
+//
+// 2.0 而不是 1.4：1.4 的线在玻璃卡的低对比底色上会被抗锯齿冲淡成一条
+// 若隐若现的虚影；2 加上圆头，稀疏点也读得出来。
+const latencyLineWidth float32 = 2
+
+// minTrafficBarPx 非零流量桶的最小总高度。
+const minTrafficBarPx float32 = 3
+
 // trafficSummary 流量图下面那行摘要。
+//
+// 必须是一行（渲染处 SingleLine）。上一版把「握手 N 次 · 均 X ms」放在末尾，
+// 560 宽时最后一个单位词被折到第二行、独占一个字——读起来像排版事故。
+// 现在的取舍：去掉「首字节」与「握手均值」（它们都可以从别处推出，且不是
+// 这张图要回答的问题），换成延迟的三档读数「当前 / 峰值 / 均值」——
+// 折线本身没有独立右轴，这三个数就是它的量纲。
 func (a *app) trafficSummary(g stats.Agg) string {
-	var up, down, n int64
-	var msSum, ttfbSum int64
-	var hsN int64
-	var hsSum int64
+	var up, down, n, msSum, hsN int64
+	var latest, peak int64
 	for _, b := range g.Series {
 		up += b.UpWire
 		down += b.DownWire
+		if b.Count <= 0 {
+			continue
+		}
 		n += b.Count
 		msSum += b.MsSum
-		ttfbSum += b.TTFbSum
 		hsN += b.HsCount
-		hsSum += b.HsSum
+		if ms := b.AvgMs(); ms > peak {
+			peak = ms
+		}
+		latest = b.AvgMs()
 	}
 	if n == 0 {
 		return "这段时间没有请求"
 	}
-	avgMs := msSum / n
-	avgTTFB := ttfbSum / n
 
 	span := int(g.WindowSec)
 	if span <= 0 {
 		span = int(stats.DefaultWindow / time.Second)
 	}
 
+	// 上行/下行用箭头：图例就在上方（上行=蓝柱、下行=绿柱），这里再用四个
+	// 汉字会把「延迟 当前/峰值/均值」这组更重要的读数挤出单行。
+	text := fmt.Sprintf("最近 %s · ↑%s · ↓%s · 延迟 当前 %s / 峰值 %s / 均值 %s",
+		humanWindow(span), humanBytes(up), humanBytes(down),
+		humanMs(latest), humanMs(peak), humanMs(msSum/n))
 	// 握手：0 次是好事（复用生效），所以措辞要中性偏正面，而不是「无数据」。
-	var hs string
+	// 均值不写：一个数已经够回答「有没有在反复握手」，具体耗时不是这行的问题。
 	if hsN == 0 {
-		hs = "全程复用连接"
+		text += " · 全程复用连接"
 	} else {
-		hs = fmt.Sprintf("握手 %s 次 · 均 %d ms", groupDigits(hsN), hsSum/hsN)
+		text += fmt.Sprintf(" · 握手 %s 次", groupDigits(hsN))
 	}
-
-	return fmt.Sprintf("最近 %s：上行 %s · 下行 %s · 延迟 %d ms（首字节 %d ms）· %s",
-		humanWindow(span), humanBytes(up), humanBytes(down), avgMs, avgTTFB, hs)
+	return text
 }
 
-// 图表配色。绿 = 省下的（赚到的），蓝 = 实际发出去的（花掉的）。
+// latencyHasGaps 非空延迟样本之间是否存在空洞（折线因此断开）。
 //
-// 为什么不用 p.Foreground / p.Tertiary 这套中性灰：柱状图里两段必须能**在
-// 一秒内分辨**是哪一段，而灰度差在中灰底的小面积上会被抗锯齿冲淡。蓝绿是
-// 色相差异，比明度差异更抗干扰；两者都对深色底有足够对比（实测 #4ADE80
-// 在 #202020 上约 9.8:1，#3B82F6 约 5.1:1），都在 4.5:1 以上。
+// 只关心「两个非空桶之间夹着空桶」：开头/结尾的空桶不会让折线断在中间，
+// 不构成视觉上的断点。
+func (a *app) latencyHasGaps() bool {
+	seen, gap := false, false
+	for _, b := range a.agg.Series {
+		if b.Count > 0 {
+			if gap {
+				return true
+			}
+			seen = true
+			continue
+		}
+		if seen {
+			gap = true
+		}
+	}
+	return false
+}
+
+// 图表配色：直接引用色板里的系列色，不在视图里另立一套十六进制值。
 //
-// 绿用偏亮的一档（#4ADE80 而非 #22C55E）：它是柱子的主体面积，太暗会让
-// 整张图在深色页面上显得「没点亮」。蓝保持中等亮度，避免与绿争夺注意力。
-var (
-	chartSaved = ui.Hex("#4ADE80")
-	chartWire  = ui.Hex("#3B82F6")
-)
+// 语义分工（两张图共用同一组常量）：
+//
+//	p.DownBar 绿 = 产出/赚到：压缩图里的「省下」、流量图里的「下行」
+//	p.UpBar   蓝 = 成本/花掉：压缩图里的「实际发送」、流量图里的「上行」
+//
+// 上一版这里硬编码了 #4ADE80/#3B82F6，而色板是 #4ec38a/#4c9ef0——同一屏
+// 出现两种「同色系」，叠在一起像没对齐的两种主题。系列色本来就该只有一处定义。
 
 // minWirePx 蓝段（实际发送）的最小可见高度。
-//
+
 // 压缩 99.9% 时它按比例只有 0.2px，抗锯齿后会完全消失，整根柱子读成纯亮色——
 // 那会丢失「仍然发了东西」这个事实。3px 是 Retina 上能稳定看见一条线的高度。
 const minWirePx float32 = 3
@@ -716,8 +795,8 @@ func (a *app) emptyChartNote() string {
 // 而方块是画出来的，任何字体下都在。
 func (a *app) legend(c *ui.Context, p *glass.Palette) {
 	ui.Row(c).Gap(9).AlignItems(ui.Center).Shrink(0).Children(func() {
-		a.legendSwatch(c, chartSaved, "省下")
-		a.legendSwatch(c, chartWire, "实际发送")
+		a.legendSwatch(c, p.DownBar, "省下")
+		a.legendSwatch(c, p.UpBar, "实际发送")
 	})
 }
 
@@ -765,12 +844,13 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 	// 绘图区吃掉卡片里的剩余高度，但有下限：窗口被拉到最小高度时
 	// 图仍有 chartMinHeight，不至于压成一条线（此时由外层 Scroll 兜底）。
 	plot := ui.Row(c).Grow(1).MinHeight(chartMinHeight).FillWidth().
-		AlignItems(ui.Stretch).Gap(6)
+		AlignItems(ui.Stretch).Gap(chartAxisGap)
 
 	plot.Children(func() {
 		// 纵轴刻度：0/25/50/75/100%。五档是因为柱高直接读作百分数，
-		// 少一档就得靠目测插值；26px 宽的标签列装得下「100%」。
-		ui.Column(c).Width(28).Shrink(0).AlignItems(ui.End).Children(func() {
+		// 少一档就得靠目测插值。列宽与流量图共用 chartAxisWidth，
+		// 两张图的绘图区因此左右对齐（同一屏叠放时 x 轴不错位）。
+		ui.Column(c).Width(chartAxisWidth).Shrink(0).AlignItems(ui.End).Children(func() {
 			for i, label := range []string{"100%", "75%", "50%", "25%", "0"} {
 				if i > 0 {
 					ui.Box(c).Grow(1)
@@ -830,11 +910,11 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 				// 绿段（省下）：柱子的主体，从上沿往下
 				if savedH > 0 {
 					pt.Fill(ui.Rect{X: x, Y: bottom - barH, W: bw, H: savedH},
-						chartSaved, min(2, bw/2))
+						p.DownBar, min(2, bw/2))
 				}
 				// 蓝段（实际发送）：贴底
 				pt.Fill(ui.Rect{X: x, Y: bottom - wireH, W: bw, H: wireH},
-					chartWire, min(2, bw/2))
+					p.UpBar, min(2, bw/2))
 			}
 		})
 	})
@@ -1023,19 +1103,25 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		a.mirrorRow(c, p)
 		a.configRule(c, p)
 		a.updateRow(c, p)
-	})
 
-	// 运行中不可改：说清「为什么点不动」+「怎么做」，而不是让输入框静静失效。
-	// 只针对上面那五个「连接类」字段——统计跨度与更新偏好随时可改。
-	if running {
-		ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
-			ui.Text(c, "连接设置在运行中不可修改，先停止再改").
-				FontSize(11).TextColor(p.Warning).MaxLines(1).Grow(1)
-			if a.actionButton(c, p, "stop-settings", "停止", false).Clicked() {
-				a.stop()
-			}
-		})
-	}
+		// 运行中不可改：说清「为什么点不动」+「怎么做」，而不是让输入框静静失效。
+		// 只针对上面那五个「连接类」字段——统计跨度与更新偏好随时可改。
+		//
+		// 这一行必须留在卡片内：上一版它跟在卡片外面，整行左缘比卡片内容列
+		// 左凸 14px，而且 28px 高的「停止」按钮会悬在卡片底边之下约 11px，
+		// 读起来像一个没有容器承接的浮层。放进卡片后它和字段共用同一条
+		// 内容栅格，分隔线也把它明确归到「连接」这一组的尾部。
+		if running {
+			a.configRule(c, p)
+			ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(6).Children(func() {
+				ui.Text(c, "连接设置在运行中不可修改，先停止再改").
+					FontSize(11).TextColor(p.Warning).MaxLines(1).Grow(1)
+				if a.actionButton(c, p, "stop-settings", "停止", false).Clicked() {
+					a.stop()
+				}
+			})
+		}
+	})
 }
 
 // groupTitle 设置卡内的分区标题（分隔靠「标题 + 上方加高留白」，不靠第二张卡）。
@@ -1193,11 +1279,52 @@ func (a *app) autoStartRow(c *ui.Context, p *glass.Palette) {
 			ui.Text(c, "登录后自动驻留托盘，下次登录生效").
 				FontSize(11).TextColor(p.Tertiary).SingleLine()
 		})
-		// Switch 直接切 a.autoStart；OnChange 在绑定值变化后、重绘之前触发，
+		// 开关直接切 a.autoStart；OnChange 在绑定值变化后、重绘之前触发，
 		// 所以 applyAutostart 写盘 + 读回的结果会立刻反映到下一个帧；
 		// 写失败时它会把 a.autoStart 翻回去，开关自己弹回原位。
-		ui.Switch(c, &a.autoStart).OnChange(a.applyAutostart)
+		a.stateSwitch(c, p, &a.autoStart, false, "开机自启").OnChange(a.applyAutostart)
 	})
+}
+
+// stateSwitch 开关的绘制：状态必须靠**位置 + 颜色**两件事表达，而不是只靠亮度。
+//
+// 框架自带的 ui.Switch 用 140ms 动画把拇指从左滑到右，但截图/首帧落在动画
+// 起点，开与关都会画成「拇指在左」，只剩轨道亮度的差别；两个开关并排时，
+// 关着的那个（或禁用的那个）还会因为亮度低被读成「禁用」而不是「关」。
+// 这里直接从绑定值取位置：关 → 拇指在左、灰轨道；开 → 拇指在右、成功色轨道。
+// 缩到一半尺寸时，16px 的横向位移仍是可辨认的差异。
+func (a *app) stateSwitch(c *ui.Context, p *glass.Palette, value *bool, disabled bool, label string) ui.Element {
+	on := *value
+	sw := ui.SwitchBase(c, value).Size(36, 20).Shrink(0).
+		Label(label).Disabled(disabled).
+		Cursor(ui.CursorPointer)
+	sw.Draw(func(pt *ui.Painter, r ui.Rect) {
+		track, thumb := p.MutedForeground.Alpha(0.38), p.Tertiary
+		if on {
+			track, thumb = p.Success, ui.Hex("#ffffff")
+		}
+		if disabled {
+			track, thumb = track.Alpha(0.55), thumb.Alpha(0.55)
+		}
+		pt.Fill(r, track, r.H/2)
+
+		knob := switchKnobRect(r, on)
+		pt.Shadow(knob, knob.H/2, 0, 1, 3, 0, ui.RGBA(0, 0, 0, 0.25))
+		pt.Fill(knob, thumb, knob.H/2)
+	})
+	return sw
+}
+
+// switchKnobRect 拇指的落点：关在左、开在右（两端各内缩 2px）。
+//
+// 抽成纯函数是为了能被测试盯住：状态不能只靠亮度，位置差必须真实存在。
+func switchKnobRect(r ui.Rect, on bool) ui.Rect {
+	d := r.H - 4
+	x := r.X + 2
+	if on {
+		x = r.X + r.W - d - 2
+	}
+	return ui.Rect{X: x, Y: r.Y + 2, W: d, H: d}
 }
 
 // ---- footer ----
@@ -1219,7 +1346,7 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 			state += " " + humanDuration(time.Since(up))
 		}
 	}
-	// 单栏：状态 · 传输 · 统计摘要 ……… 复制按钮 · 版本号
+	// 单栏：状态 · 传输 · 统计摘要 ……… 版本号
 	//
 	// 2026-11-13 owner 要求「窗口做大，底部就不用两栏、合并成一栏」。原来的两栏是
 	// 「内容区末尾的统计+复制」和「窗口底部状态条」——它们都只有一行高，各占
@@ -1227,7 +1354,8 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 	// 用户在同一个水平线上从左到右读到「跑没跑 → 走的什么 → 效果如何」。
 	//
 	// 顺序是有意义的，不是随便排：状态是「最常看」，统计摘要是「顺带看」，
-	// 复制是动作，版本是最不需要看的（放最右，视线最少落到那里）。
+	// 版本是最不需要看的（放最右，视线最少落到那里）。底栏不再有复制按钮：
+	// 那是一个动作，放在顶栏徽标上；状态栏保持纯读取。
 	ui.Row(c).Height(32).FillWidth().Padding(0, 16).
 		AlignItems(ui.Center).Background(p.PageDim).Gap(10).Children(func() {
 		ui.Textf(c, "%s · %s", state, a.transportLabel()).
@@ -1243,20 +1371,9 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 			ui.Box(c).Grow(1)
 		}
 
-		// 复制按钮：顶栏那个 10px 小徽标在这一行看成效时够不着，
-		// 所以在动作区再给一个入口。两处走同一条 copyURL，口径不会漂。
-		copied := a.copyFlashing()
-		label := "复制地址"
-		if copied {
-			label = "已复制"
-		}
-		btn := a.actionButton(c, p, "copy", label, false)
-		if copied {
-			btn = btn.TextColor(p.Success)
-		}
-		if btn.Clicked() {
-			a.copyURL(c)
-		}
+		// 复制入口只在顶栏徽标：底栏不再放第二个按钮（owner 2026-11-13：
+		// 「底部状态栏不需要"复制地址"这个按钮」）。状态栏只负责「读」，
+		// 动作留在用户视线最先落到的那枚地址徽标上。
 
 		// 用 displayVersion 统一（注入源有的带 v 有的不带），且开发构建
 		// （"dev"）不显示版本号——"vdev" 对用户零信息量，只会被读成异常。

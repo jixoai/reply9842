@@ -43,6 +43,18 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
+// humanMs 延迟的显示口径：1000ms 以下保留毫秒，以上换秒。
+//
+// 真实链路的延迟会到几十秒（首包/大包），"28771 ms" 读起来要先数位数；
+// "28.8 s" 一眼就是「很慢」。阈值取 1000 而不是 60000：4 位数的毫秒
+// 在任何摘要行里都太长。
+func humanMs(ms int64) string {
+	if ms >= 1000 {
+		return fmt.Sprintf("%.1f s", float64(ms)/1000)
+	}
+	return fmt.Sprintf("%d ms", ms)
+}
+
 // displayVersion 版本号的显示形态，统一成一个前导 v。
 //
 // 注入源有两套口径：Makefile 用 `patsubst v%,%` 去掉了 v，GitHub release

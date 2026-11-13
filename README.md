@@ -208,7 +208,7 @@ CLI 与 GUI 是同一套逻辑的两条外壳：托盘常驻、关窗不退出�
 </p>
 
 截图不是画上去的：`cmd/gui/site_shots_test.go` 读真实的 `client-<date>.jsonl`，
-用 `stats.Open` 流式重放出一小时的 30 个时间桶，再离屏渲染成 PNG。
+用 `stats.Open` 把最近两小时的日志流式重放成时间桶，再离屏渲染成 PNG。
 
 ```bash
 SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v

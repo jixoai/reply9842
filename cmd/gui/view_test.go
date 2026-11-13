@@ -96,7 +96,7 @@ func TestViewBuilds(t *testing.T) {
 	a := newTestApp(t)
 	tt := ui.NewTester(a.view, 560, 640)
 
-	// 空态：顶栏开关（"启动代理" 是它的无障碍名）+ 图表卡 + 复制按钮，
+	// 空态：顶栏开关（"启动代理" 是它的无障碍名）+ 图表卡 + 顶栏复制徽标，
 	// 不该出现统计三格，也没有独立的状态行。
 	for _, want := range []string{"启动代理", "上行体积对比", "已暂停", "复制地址"} {
 		if !tt.HasText(want) {
@@ -545,7 +545,7 @@ func TestSnapshotFrames(t *testing.T) {
 			a.snap = func() stats.Agg { return a.agg }
 		}},
 		{"panel-copied", 560, 660, func(a *app) {
-			// 复制成功后的回显：徽标换对勾、footer 按钮变「已复制」。
+			// 复制成功后的回显：徽标文字变「已复制」、图标换对勾。
 			setRunning(a, true)
 			a.copiedAt = time.Now()
 		}},
@@ -834,7 +834,7 @@ func TestCopyChipCopiesPlainURL(t *testing.T) {
 			t.Errorf("复制内容含 %q：%q", banned, tt.Clipboard())
 		}
 	}
-	// 回显必须真的亮起来：徽标换对勾、footer 按钮换词
+	// 回显必须真的亮起来：徽标文字换「已复制」、图标换对勾
 	if !a.copyFlashing() {
 		t.Errorf("复制后 copiedAt 没置上（copyFlashing() = false）")
 	}
@@ -1114,5 +1114,113 @@ func TestSettingsHasTwoGroups(t *testing.T) {
 	}
 	if head.Y >= label.Y {
 		t.Errorf("分区标题应在行标签之上：head.Y=%.1f label.Y=%.1f", head.Y, label.Y)
+	}
+}
+
+// TestFooterHasNoCopyEntry 底栏不再有「复制地址」按钮。
+//
+// 复制入口只保留顶栏徽标一个；底栏是纯读取的状态条。这条断言数的是
+// accessible label：底栏按钮去掉后，页面上只剩徽标那一个同名元素。
+func TestFooterHasNoCopyEntry(t *testing.T) {
+	for _, tab := range []int{tabPanel, tabSettings} {
+		a := newTestApp(t)
+		a.tab = tab
+		tt := ui.NewTester(a.view, 560, 660)
+		n := 0
+		for _, s := range tt.Texts() {
+			if s == "复制地址" {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("tab=%d: 「复制地址」出现 %d 次，期望只有顶栏徽标 1 次：%q", tab, n, tt.Texts())
+		}
+	}
+}
+
+// TestTrafficSummaryOneLine 摘要必须单行，且延迟的三个读数都在。
+//
+// 守的是一个实际缺陷：「握手 N 次 · 均 X ms」太长，560 宽时最后一个
+// 单位词被折到第二行、独占一个字。现在改成「当前/峰值/均值」，并用
+// SingleLine 兜底；这里同时断言文案字段与渲染高度（单行约 13px）。
+func TestTrafficSummaryOneLine(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{
+		Requests: 6, UpRaw: 4000, UpWire: 3000,
+		WindowSec: 3600, BucketSec: 120,
+		Series: []stats.Bucket{
+			{UpRaw: 1000, UpWire: 1000, DownWire: 2000, Count: 2, MsSum: 400},
+			{UpRaw: 1200, UpWire: 1200, DownWire: 1800, Count: 3, MsSum: 1500},
+			{UpRaw: 0, UpWire: 0, DownWire: 0},
+			{UpRaw: 800, UpWire: 800, DownWire: 1200, Count: 1, MsSum: 100},
+		},
+	}
+	a.snap = func() stats.Agg { return a.agg }
+
+	text := a.trafficSummary(a.agg)
+	for _, want := range []string{"延迟 当前", "/ 峰值", "/ 均值"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("trafficSummary = %q，缺少 %q", text, want)
+		}
+	}
+	// 旧格式的「 · 均 2449 ms」是折行的元凶：不允许它回来。
+	if strings.Contains(text, " 均 ") {
+		t.Errorf("trafficSummary = %q，仍带「 均 X ms」尾巴", text)
+	}
+
+	tt := ui.NewTester(a.view, 560, 660)
+	r, ok := tt.Find(text)
+	if !ok {
+		t.Fatalf("找不到摘要文本：%q", tt.Texts())
+	}
+	if r.H > 16 {
+		t.Errorf("摘要高度 %.1f（>16px）说明折成了多行：%q", r.H, text)
+	}
+}
+
+// TestLatencyHasGaps 折线断点只在「两个非空桶之间夹着空桶」时成立。
+func TestLatencyHasGaps(t *testing.T) {
+	cases := []struct {
+		name   string
+		counts []int64
+		want   bool
+	}{
+		{"中间有洞", []int64{1, 0, 1}, true},
+		{"连续", []int64{1, 1, 1}, false},
+		{"两端为空不算断点", []int64{0, 1, 1, 0}, false},
+		{"尾部为空不算断点", []int64{1, 0, 0, 0}, false},
+		{"全空", []int64{0, 0, 0}, false},
+	}
+	for _, tc := range cases {
+		a := &app{agg: stats.Agg{Series: make([]stats.Bucket, len(tc.counts))}}
+		for i, c := range tc.counts {
+			a.agg.Series[i].Count = c
+		}
+		if got := a.latencyHasGaps(); got != tc.want {
+			t.Errorf("%s: latencyHasGaps() = %v，期望 %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestSwitchKnobPositions 开关的开/关必须靠位置区分，而不只是亮度。
+func TestSwitchKnobPositions(t *testing.T) {
+	r := ui.Rect{X: 10, Y: 5, W: 36, H: 20}
+	off, on := switchKnobRect(r, false), switchKnobRect(r, true)
+	if on.X <= off.X+8 {
+		t.Errorf("拇指位移只有 %.1fpx（off.X=%.1f on.X=%.1f），不靠亮度也能分辨要求至少 8px",
+			on.X-off.X, off.X, on.X)
+	}
+	if off.X < r.X || on.X+on.W > r.X+r.W {
+		t.Errorf("拇指越出轨道：track=%+v off=%+v on=%+v", r, off, on)
+	}
+}
+
+// TestHumanMs 延迟口径：4 位数的毫秒换秒。
+func TestHumanMs(t *testing.T) {
+	for in, want := range map[int64]string{0: "0 ms", 999: "999 ms", 1000: "1.0 s", 28771: "28.8 s"} {
+		if got := humanMs(in); got != want {
+			t.Errorf("humanMs(%d) = %q，期望 %q", in, got, want)
+		}
 	}
 }

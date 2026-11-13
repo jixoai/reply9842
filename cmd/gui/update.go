@@ -721,7 +721,7 @@ func (a *app) autoUpdateRow(c *ui.Context, p *glass.Palette) {
 			hint = "源码构建不可自动替换自己"
 		}
 		ui.Text(c, hint).FontSize(10.5).TextColor(p.Tertiary).MaxLines(1).Grow(1)
-		sw := ui.Switch(c, &a.autoUpdate).Disabled(dev)
+		sw := a.stateSwitch(c, p, &a.autoUpdate, dev, "自动更新")
 		if !dev {
 			// OnChange 在绑定值变化后、重绘前触发：写盘失败会在这里被看到。
 			sw.OnChange(a.applyUpdateSettings)
