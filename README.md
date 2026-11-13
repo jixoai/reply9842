@@ -196,6 +196,35 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 | `-health-addr` | 空 | 健康检查监听（如 `127.0.0.1:8080`）；留空不启用 |
 | `-health-probe` | `false` | 探针模式：GET 自己的 `/healthz`，成功 exit 0。给 scratch 镜像的 HEALTHCHECK 用（容器内无 curl）|
 
+## 图形界面
+
+CLI 与 GUI 是同一套逻辑的两条外壳：托盘常驻、关窗不退出、单实例。
+面板把压缩率与上下行流量画成两张图，底栏一行给出实时速率、握手延迟与累计节省；
+设置页管连接参数、开机自启与自动更新。
+
+<p>
+  <img src="site/img/panel.png" width="380" alt="面板：压缩率与流量/延迟双图，底栏实时速率" />
+  <img src="site/img/settings.png" width="380" alt="设置：连接参数与自动更新开关" />
+</p>
+
+截图不是画上去的：`cmd/gui/site_shots_test.go` 读真实的 `client-<date>.jsonl`，
+用 `stats.Open` 流式重放出一小时的 30 个时间桶，再离屏渲染成 PNG。
+
+```bash
+SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v
+```
+
+### 自动更新（默认关闭）
+
+设置页里是一个开关，默认**关**。打开后按与 npm 引导器完全一致的镜像链下载
+（`REPLY9842_MIRROR` 同一个环境变量、同样的 CSV 规则、同样的直连兜底），
+并强制校验 `SHA256SUMS.txt`。替换前会先试跑新二进制：能启动、退出码 0、
+输出里含产品标识 `reply9842`——三条都过才在同一目录内原子替换，旧版本留成
+`.old-<version>` 供回滚，随后重启并恢复更新前的运行/停止状态。
+
+源码构建（版本为 `dev` / `git describe` 形态 / 带 `-dirty`）**一律不参与**自动替换，
+连下载都不会发生——避免开发机上把自己编译的二进制换成发布版。
+
 ## 三个关键设计决策
 
 ### 1. 不做块级去重，做整文档 delta
@@ -294,6 +323,23 @@ RFC 9842 之所以存活，是把「字典老化」转成了 HTTP 缓存问题�
 因此回退逻辑实现在应用层（`transport.DialAuto`）：先试 QUIC（默认 1 s 超时），
 失败降级 TCP+TLS，并记住结果用于后续连接的优先级。
 
+### 连接复用：把每个请求的握手成本摊掉
+
+本机→香港实测单次 TCP+TLS 握手 **747 / 2330 / 2821 / 773 / 3188 ms**（均值约 2 s），
+而最早的实现每个请求都新建连接、用完即关——等于每个请求白扔一到三秒，
+比隧道省下的带宽更值钱。
+
+现在走**串行复用池**（`internal/transport/pool.go`）：LIFO 取用、空闲 90 秒淘汰、
+最多 4 条常驻，同一个请求的出入口仍是「一条连接上一问一答」。选串行而不做多路复用，
+是因为多路复用要引入请求 ID、乱序重组与流量控制，改动面覆盖帧格式、双端流控和
+服务端 accept 循环，出错就是数据串台；而串行复用已经吃掉绝大部分收益。
+
+两条安全边界：**续传不归还连接**（`FrameResume` 之后连接状态未知），
+**响应没读完只丢弃不归还**（否则下一个请求会读到上一个的残留帧）。
+
+握手耗时进逐请求统计（`ms_handshake`），复用命中时记为 0——池子有没有生效是可观测的，
+不靠一次性基准测试。
+
 ## 观测
 
 ### `~/.reply9842/client-stats.json`（每次请求后覆盖）
@@ -356,7 +402,8 @@ internal/
 ├── downlink/         下行响应压缩
 ├── store/            内容寻址 LRU（零协商）
 ├── basefind/         客户端基线选择（4KB 块哈希命中率）
-├── transport/        QUIC + TCP 双栈 + auto 回退 + 源地址绑定
+├── transport/        QUIC + TCP 双栈 + auto 回退 + 源地址绑定 + 连接池
+├── update/           版本检查 / 镜像下载 / sha256 / 原子替换 / 重启恢复
 ├── relayclient/      客户端运行时（配置归一化、runner、设置持久化）
 ├── spool/            磁盘双区域流式缓冲（tmp / idem + 字节预算淘汰）
 ├── idem/             幂等键（callerKeyId + 请求指纹）
@@ -365,6 +412,9 @@ internal/
 ├── glass/            GUI 玻璃材质调色板与 Surface
 ├── e2e/              断线续传端到端测试
 └── stats/            逐请求与汇总统计（JSONL 为事实来源，重启不清零）
+npm/                  纯启动器：镜像链 + 断点续传 + 校验，按需下载平台二进制
+site/                 官网（单文件 HTML + CSS + 两张真实 GUI 截图）
+tools/probe-proxy/    测上游各阶段耗时的透明流式代理（排障用，不参与构建）
 ```
 
 ## 已知限制

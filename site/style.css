@@ -1,7 +1,8 @@
 /* ============================================================
    reply9842 — site styles
    jixoai design language: one brand hue, OKLCH, mono-first,
-   pure-black background. No external fonts, no images.
+   pure-black background. No external fonts. The only images are the two
+   real GUI screenshots, regenerated from production logs by a Go test.
    ============================================================ */
 
 :root {
@@ -793,6 +794,46 @@ sup.fn {
 .bar-row.best .bar-val {
   color: var(--primary);
   font-weight: 600;
+}
+
+/* ---------- app screenshots ---------- */
+
+.shots {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: clamp(1rem, 3vw, 1.75rem);
+  align-items: start;
+}
+
+.shot {
+  margin: 0;
+}
+
+.shot img {
+  display: block;
+  width: 100%;
+  height: auto;
+  border: 1px solid var(--line);
+  border-radius: 10px;
+  background: var(--panel);
+}
+
+.shot figcaption {
+  margin-top: 0.6rem;
+  color: var(--fg-dim);
+  font-size: 0.85rem;
+  line-height: 1.6;
+}
+
+@media (max-width: 720px) {
+  .shots {
+    grid-template-columns: 1fr;
+    justify-items: center;
+  }
+
+  .shot {
+    width: min(100%, 340px);
+  }
 }
 
 /* ---------- decision cards ---------- */

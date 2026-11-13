@@ -35,6 +35,7 @@
           <a class="nav-hide" href="#how">原理</a>
           <a href="#results">实测</a>
           <a class="nav-hide" href="#start">快速开始</a>
+          <a class="nav-hide" href="#app">界面</a>
           <a href="https://github.com/jixoai/reply9842">GitHub ↗</a>
         </nav>
       </div>
@@ -323,11 +324,58 @@ ANTHROPIC_BASE_URL=<i>http://127.0.0.1:18899</i></pre>
         </div>
       </section>
 
+      <!-- ───────────────────────── app ───────────────────────── -->
+      <section id="app">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">05 / 界面</span>
+            <h2>同一套隧道，桌面上看得见</h2>
+            <p class="sec-sub">
+              GUI 与 CLI 共用同一套逻辑：托盘常驻、关窗不退、单实例。面板把压缩率与上下行流量画成两张图，
+              底栏一行给出实时速率、握手延迟与累计节省；设置页管连接、开机自启与自动更新。
+            </p>
+          </div>
+
+          <div class="shots">
+            <figure class="shot">
+              <img
+                src="img/panel.png"
+                width="560"
+                height="660"
+                loading="lazy"
+                alt="面板页：压缩率柱状图、上下行流量与延迟折线图，底栏给出实时速率与累计节省"
+              />
+              <figcaption>
+                面板：压缩率与流量/延迟双图；底栏单行合并状态、实时速率与握手延迟
+              </figcaption>
+            </figure>
+            <figure class="shot">
+              <img
+                src="img/settings.png"
+                width="560"
+                height="660"
+                loading="lazy"
+                alt="设置页：连接分组、开机自启，以及默认关闭的自动更新开关与镜像输入框"
+              />
+              <figcaption>
+                设置：连接参数与自动更新（默认关闭，可手动检查、可配镜像）
+              </figcaption>
+            </figure>
+          </div>
+
+          <p class="footnote">
+            这两张图由 <code>cmd/gui/site_shots_test.go</code> 用<strong>真实生产日志</strong>重放生成：
+            <code>SITE_SHOTS_DIR=… go test ./cmd/gui -run TestSiteShots</code>。图表里的 30 个时间桶是从
+            <code>client-&lt;date&gt;.jsonl</code> 逐条重建的，不是画上去的假曲线。
+          </p>
+        </div>
+      </section>
+
       <!-- ───────────────────────── decisions ───────────────────────── -->
       <section id="design">
         <div class="wrap">
           <div class="sec-head">
-            <span class="sec-num">05 / 设计决策</span>
+            <span class="sec-num">06 / 设计决策</span>
             <h2>三个被实测数据钉住的取舍</h2>
             <p class="sec-sub">
               这套方案看起来可以更复杂——块级去重、多候选基线、字典目录。三个方向都做了实测，都被数据否决了。
@@ -375,7 +423,7 @@ ANTHROPIC_BASE_URL=<i>http://127.0.0.1:18899</i></pre>
       <section id="reliability">
         <div class="wrap">
           <div class="sec-head">
-            <span class="sec-num">06 / 正确性</span>
+            <span class="sec-num">07 / 正确性</span>
             <h2>防静默损坏 + 断线续传</h2>
             <p class="sec-sub">
               有状态压缩最危险的失败模式不是报错，而是「解出来了一个语义合理但内容错乱的请求」。模型不会报警，只会给奇怪回答，几天后才发现。
@@ -420,7 +468,7 @@ ANTHROPIC_BASE_URL=<i>http://127.0.0.1:18899</i></pre>
       <section id="limits">
         <div class="wrap">
           <div class="sec-head">
-            <span class="sec-num">07 / 边界</span>
+            <span class="sec-num">08 / 边界</span>
             <h2>已知限制</h2>
             <p class="sec-sub">写清楚边界比多列几个优点有用。</p>
           </div>
@@ -441,7 +489,7 @@ ANTHROPIC_BASE_URL=<i>http://127.0.0.1:18899</i></pre>
       <section id="specs">
         <div class="wrap">
           <div class="sec-head">
-            <span class="sec-num">08 / 规范</span>
+            <span class="sec-num">09 / 规范</span>
             <h2>站在 RFC 9842 的肩上</h2>
             <p class="sec-sub">
               线格式直接沿用 Compression Dictionary Transport 的 dcz 语义，只是把「按需下载字典」换成了「隧道两端各自持有历史请求」。
