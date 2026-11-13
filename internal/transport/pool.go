@@ -101,11 +101,16 @@ func (p *PooledDialer) Get(ctx context.Context) (*Conn, error) {
 		}
 		p.hits++
 		p.mu.Unlock()
+		ic.c.reused = true
 		return ic.c, nil
 	}
 	p.misses++
 	p.mu.Unlock()
-	return p.Dial(ctx)
+	c, err := p.Dial(ctx)
+	if c != nil {
+		c.reused = false // 新建连接：调用方按「这次付了握手钱」记录
+	}
+	return c, err
 }
 
 // Put 归还一条连接。

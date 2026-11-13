@@ -69,7 +69,19 @@ type Conn struct {
 	send    func([]byte) error
 	recv    func() ([]byte, error)
 	closeFn func() error
+
+	// reused 表示这条连接是从池里复用的（true）还是本次新建的（false）。
+	// 由 PooledDialer 在 Get 时设置，供上层统计「这次请求是否付了握手代价」。
+	reused bool
+	// handshake 建立这条连接所花的握手时间（新建才有意义；复用时为 0）。
+	handshake time.Duration
 }
+
+// Reused 这条连接是否来自连接池复用。
+func (c *Conn) Reused() bool { return c.reused }
+
+// Handshake 建立连接所花的握手时间；复用连接返回 0。
+func (c *Conn) Handshake() time.Duration { return c.handshake }
 
 // Kind 当前连接使用的传输
 func (c *Conn) Kind() Kind { return c.kind }
@@ -163,6 +175,9 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 		InsecureSkipVerify: d.Insecure,
 		MinVersion:         tls.VersionTLS13,
 	}
+	// 握手计时：只统计到 QUIC 连接建立为止（不含后面的 OpenStreamSync），
+	// 因为用户感知的「连接慢」就是这一段。
+	hsStart := time.Now()
 	// quic-go v0.65 的 *quic.Conn 内部 ctx 派生自 DialAddr 的入参 ctx
 	// （connection.go: context.WithCancelCause(context.WithoutCancel(ctx))
 	// → 实际用 WithoutCancel 脱钩，但 OpenStreamSync/AcceptStream 等仍吃传进去的 ctx）。
@@ -220,9 +235,10 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 		return nil, fmt.Errorf("quic stream: %w", err)
 	}
 	return &Conn{
-		kind: KindQUIC,
-		send: func(b []byte) error { return writeAll(st, b) },
-		recv: func() ([]byte, error) { return readFrame(st) },
+		kind:      KindQUIC,
+		handshake: time.Since(hsStart),
+		send:      func(b []byte) error { return writeAll(st, b) },
+		recv:      func() ([]byte, error) { return readFrame(st) },
 		closeFn: func() error {
 			st.Close()
 			return qc.CloseWithError(0, "bye")
@@ -241,6 +257,7 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 	if err != nil {
 		return nil, fmt.Errorf("tcp local addr: %w", err)
 	}
+	hsStart := time.Now()
 	nd := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: la}
 	raw, err := nd.DialContext(ctx, "tcp", d.Addr)
 	if err != nil {
@@ -252,10 +269,11 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 		return nil, fmt.Errorf("tcp tls: %w", err)
 	}
 	return &Conn{
-		kind:    KindTCP,
-		send:    func(b []byte) error { return writeAll(tc, b) },
-		recv:    func() ([]byte, error) { return readFrame(tc) },
-		closeFn: tc.Close,
+		kind:      KindTCP,
+		handshake: time.Since(hsStart),
+		send:      func(b []byte) error { return writeAll(tc, b) },
+		recv:      func() ([]byte, error) { return readFrame(tc) },
+		closeFn:   tc.Close,
 	}, nil
 }
 

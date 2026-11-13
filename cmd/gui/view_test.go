@@ -93,7 +93,7 @@ func newTestApp(t *testing.T) *app {
 // 纳入了 go test。
 func TestViewBuilds(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 
 	// 空态：顶栏开关（"启动代理" 是它的无障碍名）+ 图表卡 + 复制按钮，
 	// 不该出现统计三格，也没有独立的状态行。
@@ -118,7 +118,7 @@ func TestViewBuilds(t *testing.T) {
 // 这是本轮改版最重要的一条视觉约束，用文本 + 像素双重断言守住。
 func TestIdleHasNoHeroNumber(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 
 	for _, banned := range []string{"—", "0×", "0.0×"} {
 		if tt.HasText(banned) {
@@ -134,7 +134,7 @@ func TestIdleHasNoHeroNumber(t *testing.T) {
 // 空态的信息由 hero 的一句话承担，同一件事不用两处说。
 func TestNoEmptyTalkRow(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	for _, banned := range []string{"尚无流量", "运行后这里显示"} {
 		if tt.HasText(banned) {
 			t.Errorf("出现了已删除的空话横条 %q：%q", banned, tt.Texts())
@@ -148,7 +148,7 @@ func TestNoEmptyTalkRow(t *testing.T) {
 // 给用户看 "vdev" 没有意义。
 func TestVersionShownOnce(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	want := displayVersion(version)
 	n := 0
 	for _, s := range tt.Texts() {
@@ -172,7 +172,7 @@ func TestVersionShownOnce(t *testing.T) {
 // 这样主面板不需要滚动就能看完。
 func TestPanelTabHasNoConfig(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	for _, banned := range []string{"上游地址", "监听地址", "传输方式", "开机自启"} {
 		if tt.HasText(banned) {
 			t.Errorf("面板 tab 出现了设置项 %q：%q", banned, tt.Texts())
@@ -184,7 +184,7 @@ func TestPanelTabHasNoConfig(t *testing.T) {
 func TestSettingsTab(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 
 	for _, want := range []string{"上游地址", "监听地址", "传输方式", "日志保留", "显示区间"} {
 		if !tt.HasText(want) {
@@ -306,7 +306,7 @@ func TestSettingsWhileRunning(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
 	setRunning(a, true)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 
 	if !tt.HasText("运行中不可修改") {
 		t.Errorf("运行中未提示不可修改：%q", tt.Texts())
@@ -320,7 +320,7 @@ func TestViewRunning(t *testing.T) {
 	a.agg = stats.Agg{Requests: 12847, UpRaw: 1400 * 1024, UpWire: 1024,
 		UpRatio: 1024.0 / (1400 * 1024), P50Ms: 28}
 	a.snap = func() stats.Agg { return a.agg }
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 
 	// 统计口径是「近 <保留期>」（统计从磁盘重建，重启不清零），不是「本次会话」
 	for _, want := range []string{"停止代理", "上行体积对比", "实时", "12,847 请求", "p50 28 ms"} {
@@ -435,7 +435,7 @@ func TestNoTakeoverPane(t *testing.T) {
 func TestLightPaletteBuilds(t *testing.T) {
 	a := newTestApp(t)
 	a.pal = glass.Light()
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	if !tt.HasText("启动代理") {
 		t.Errorf("亮色板未渲染：%q", tt.Texts())
 	}
@@ -528,8 +528,8 @@ func TestSnapshotFrames(t *testing.T) {
 		// 尺寸与 main.go 的 createWindow 一致：480×480，且带上真机同一份
 		// TitleBar 让位量（红绿灯 x 到 78.5、栏高由 NSToolbar 撑到 66）。
 		// 不带 SetTitleBar 的话顶栏左边距退回 14，截图会比真机「宽」出一大截。
-		{"panel-idle", 480, 480, func(a *app) {}},
-		{"panel-running", 480, 480, func(a *app) {
+		{"panel-idle", 560, 640, func(a *app) {}},
+		{"panel-running", 560, 640, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1204, UpRaw: 1400 * 1024, UpWire: 70 * 1024,
 				UpRatio: 70.0 / 1400, P50Ms: 28}
@@ -537,24 +537,24 @@ func TestSnapshotFrames(t *testing.T) {
 			a.snap = func() stats.Agg { return a.agg }
 			a.transport = "quic"
 		}},
-		{"panel-sparse", 480, 480, func(a *app) {
+		{"panel-sparse", 560, 640, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1, UpRaw: 524847, UpWire: 392, UpRatio: 392.0 / 524847, P50Ms: 18}
 			a.agg.Series = sparseSeries()
 			a.snap = func() stats.Agg { return a.agg }
 		}},
-		{"panel-copied", 480, 480, func(a *app) {
+		{"panel-copied", 560, 640, func(a *app) {
 			// 复制成功后的回显：徽标换对勾、footer 按钮变「已复制」。
 			setRunning(a, true)
 			a.copiedAt = time.Now()
 		}},
-		{"settings", 480, 480, func(a *app) { a.tab = tabSettings }},
-		{"settings-running", 480, 480, func(a *app) {
+		{"settings", 560, 640, func(a *app) { a.tab = tabSettings }},
+		{"settings-running", 560, 640, func(a *app) {
 			a.tab = tabSettings
 			setRunning(a, true)
 		}},
-		{"panel-light", 480, 480, func(a *app) { a.pal = glass.Light() }},
-		{"panel-error", 480, 480, func(a *app) {
+		{"panel-light", 560, 640, func(a *app) { a.pal = glass.Light() }},
+		{"panel-error", 560, 640, func(a *app) {
 			// 制造一次真实的 bind 失败：占住端口再让 Runner 去监听
 			a.listen = "127.0.0.1:1" // 1024 以下的端口在 macOS 上需要权限
 			a.start()
@@ -612,7 +612,17 @@ func fakeSeries() []stats.Bucket {
 	for i := range out {
 		raw, wire := shape[i%len(shape)].raw, shape[i%len(shape)].wire
 		if raw > 0 {
-			out[i] = stats.Bucket{UpRaw: raw, UpWire: wire, Count: 1}
+			// 下行与延迟也要填：流量图与「延迟 / 首字节」摘要都靠它们。
+			// 之前只填上行，导致第二张图的折线全贴在底部、摘要显示 0 ms——
+			// 那是假数据造成的假象，会让视觉验收误判成「图画错了」。
+			// 数值按真实形态取：下行通常是上行的 1~3 倍，延迟 20~300ms。
+			out[i] = stats.Bucket{
+				UpRaw: raw, UpWire: wire,
+				DownRaw: raw / 40, DownWire: raw / 45,
+				Count:   1,
+				MsSum:   20 + int64(i*13)%280,
+				TTFbSum: 15 + int64(i*11)%240,
+			}
 		}
 	}
 	return out
@@ -621,7 +631,11 @@ func fakeSeries() []stats.Bucket {
 // sparseSeries 只有一个请求（验证「1 个数据点时图仍然可读」）
 func sparseSeries() []stats.Bucket {
 	out := make([]stats.Bucket, stats.SeriesBuckets)
-	out[stats.SeriesBuckets-3] = stats.Bucket{UpRaw: 524847, UpWire: 392, Count: 1}
+	out[stats.SeriesBuckets-3] = stats.Bucket{
+		UpRaw: 524847, UpWire: 392,
+		DownRaw: 31000, DownWire: 28000,
+		Count: 1, MsSum: 210, TTFbSum: 180,
+	}
 	return out
 }
 
@@ -646,25 +660,13 @@ func TestAutoStartSwitchWiring(t *testing.T) {
 		t.Fatalf("初始 Open() = (%v, %v)", on, err)
 	}
 
-	tt := ui.NewTester(a.view, 480, 400)
-	r, ok := tt.Find("登录后自动驻留托盘，下次登录生效")
-	if !ok {
-		t.Fatalf("找不到开关行：%q", tt.Texts())
+	tt := ui.NewTester(a.view, 560, 640)
+	// 开关在这行的最右。定位逻辑抽在 findSwitchCenter 里，两次点击共用。
+	cx, cy, ok2 := findSwitchCenter(tt, "登录后自动驻留托盘，下次登录生效")
+	if !ok2 {
+		t.Fatalf("找不到开关：%q", tt.Texts())
 	}
-	// 开关在这行的最右：扫这一行找亮色胶囊，点它的中心。
-	img := tt.Image()
-	yy := int(r.Y + r.H/2)
-	var xs []int
-	for x := 380; x < 480; x++ {
-		cr, cg, _, _ := img.At(x, yy).RGBA()
-		if cr>>8 > 150 && cg>>8 > 150 {
-			xs = append(xs, x)
-		}
-	}
-	if len(xs) == 0 {
-		t.Fatalf("这一行右侧没有开关胶囊（y=%d）", yy)
-	}
-	tt.ClickAt(float32(xs[0]+xs[len(xs)-1])/2, float32(yy))
+	tt.ClickAt(cx, cy)
 
 	if !a.autoStart {
 		t.Fatalf("点击后 a.autoStart 仍为 false")
@@ -679,21 +681,11 @@ func TestAutoStartSwitchWiring(t *testing.T) {
 		t.Fatalf("plist 未生成：%v", err)
 	}
 
-	// 再点一次：关掉，plist 消失
-	tt = ui.NewTester(a.view, 480, 400)
-	if r2, ok := tt.Find("登录后自动驻留托盘，下次登录生效"); ok {
-		img = tt.Image()
-		y2 := int(r2.Y + r2.H/2)
-		xs = nil
-		for x := 380; x < 480; x++ {
-			cr, cg, _, _ := img.At(x, y2).RGBA()
-			if cr>>8 > 150 && cg>>8 > 150 {
-				xs = append(xs, x)
-			}
-		}
-		if len(xs) > 0 {
-			tt.ClickAt(float32(xs[0]+xs[len(xs)-1])/2, float32(y2))
-		}
+	// 再点一次：关掉，plist 消失。用同一个定位函数——两处各写一遍像素扫描
+	// 是上一版的教训：改了一处忘了另一处，第二次点击就静默点空。
+	tt = ui.NewTester(a.view, 560, 640)
+	if cx, cy, ok := findSwitchCenter(tt, "登录后自动驻留托盘，下次登录生效"); ok {
+		tt.ClickAt(cx, cy)
 	}
 	if a.autoStart {
 		t.Fatalf("再点击后 a.autoStart 仍为 true")
@@ -768,7 +760,7 @@ func TestSelectChangesWindow(t *testing.T) {
 // 「控件接上了状态」，而真机截图只证明「画出来了」。
 func TestTabsSwitchByClick(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	if a.tab != tabPanel {
 		t.Fatalf("初始 tab = %d，期望面板", a.tab)
 	}
@@ -808,7 +800,7 @@ func TestTabsSwitchByClick(t *testing.T) {
 // 这条测试同时守住「不许再出现 AI 相关字样」这个解耦要求。
 func TestCopyChipCopiesPlainURL(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	if err := tt.Click("复制地址"); err != nil {
 		t.Fatalf("点复制徽标失败：%v", err)
 	}
@@ -857,7 +849,7 @@ func TestNoAIPromptsInUI(t *testing.T) {
 	for _, tab := range []int{tabPanel, tabSettings} {
 		a := newTestApp(t)
 		a.tab = tab
-		tt := ui.NewTester(a.view, 480, 400)
+		tt := ui.NewTester(a.view, 560, 640)
 		for _, banned := range []string{"ANTHROPIC", "Anthropic", "anthropic", "OPENAI", "OPENAI_API_KEY", "BASE_URL", "export "} {
 			if tt.HasText(banned) {
 				t.Errorf("tab=%d 出现 AI 相关提示 %q：%q", tab, banned, tt.Texts())
@@ -877,7 +869,7 @@ func TestRunToggleSwitchesStateAndIcon(t *testing.T) {
 	a.listen = "127.0.0.1:0"
 	t.Cleanup(func() { _ = a.runner.Stop(context.Background()) })
 
-	tt := ui.NewTester(a.view, 480, 400)
+	tt := ui.NewTester(a.view, 560, 640)
 	if !tt.HasText("启动代理") {
 		t.Fatalf("停止态应显示「启动代理」：%q", tt.Texts())
 	}
@@ -962,4 +954,64 @@ func TestTitleBarDropsNameWhenNarrow(t *testing.T) {
 	if tg.X+tg.W > 440 {
 		t.Errorf("开关右缘 %.1f 超出窗口（440）", tg.X+tg.W)
 	}
+}
+
+// findSwitchCenter 定位某一行最右侧开关胶囊的中心坐标。
+//
+// 为什么需要它（三条都是实测踩出来的）：
+//  1. `tt.Find(文字)` 返回的是**文字标签**的矩形，不是整行。拿 r.X+r.W/2
+//     当「行中点」会落在文字中间，扫到的全是字形像素。
+//  2. 扫描区间不能写死像素：窗口宽度改过（480→560），写死的 [380,480)
+//     直接扫不到开关。
+//  3. 不能用「亮度 > 150」当判据：关闭态的轨道是灰色（约 #525252），
+//     亮色阈值只找得到开启态；而白色圆钮在关闭态也亮，会把 14px 的圆
+//     当成整个开关，点击落点偏左。
+//
+// 做法：以「与行背景色差 > 18」扫出连续像素段，取**最右**那段（开关是行内
+// 最右元素），返回它水平中点。太窄的段（<6px）是字形笔画，先滤掉。
+func findSwitchCenter(tt *ui.Tester, label string) (x, y float32, ok bool) {
+	r, found := tt.Find(label)
+	if !found {
+		return 0, 0, false
+	}
+	img := tt.Image()
+	w := img.Bounds().Max.X
+	yy := int(r.Y + r.H/2)
+	// 行背景取字符左侧 100px（那一带是纯行底，无文字无控件）
+	br, _, _, _ := img.At(int(r.X)-100, yy).RGBA()
+	bg := int(br >> 8)
+
+	var segs [][2]int
+	runStart := -1
+	for px := int(r.X) - 120; px < w; px++ {
+		cr, _, _, _ := img.At(px, yy).RGBA()
+		d := int(cr>>8) - bg
+		hit := d > 18 || d < -18
+		if hit && runStart < 0 {
+			runStart = px
+		}
+		if !hit && runStart >= 0 {
+			if px-runStart >= 6 {
+				segs = append(segs, [2]int{runStart, px - 1})
+			}
+			runStart = -1
+		}
+	}
+	if runStart >= 0 && w-runStart >= 6 {
+		segs = append(segs, [2]int{runStart, w - 1})
+	}
+	if len(segs) == 0 {
+		return 0, 0, false
+	}
+	// 从右往左找第一个「够宽」的段。
+	//
+	// 不能直接取最右那段：行底右侧还有卡片边框之类的窄条
+	// （实测最右段是 545..550、宽 6，那是卡片右边框；开关在 494..529、宽 36）。
+	// 取「最右且宽 >= 12」才对——开关胶囊是圆钮 + 轨道，至少 30px。
+	for i := len(segs) - 1; i >= 0; i-- {
+		if w := segs[i][1] - segs[i][0] + 1; w >= 12 {
+			return float32(segs[i][0]+segs[i][1]) / 2, float32(yy), true
+		}
+	}
+	return 0, 0, false
 }

@@ -45,37 +45,80 @@ const (
 
 // Record 单次请求观测
 type Record struct {
-	Time      string  `json:"t"`
-	Method    string  `json:"method"`
-	Path      string  `json:"path"`
-	Status    int     `json:"status"`
-	Encoding  string  `json:"enc"`
-	BaseHit   bool    `json:"base_hit"`
-	UpRaw     int64   `json:"up_raw"`  // 明文请求体
-	UpWire    int64   `json:"up_wire"` // 隧道上实际传输（编码后）
-	DownRaw   int64   `json:"down_raw"`
-	DownWire  int64   `json:"down_wire"`
-	MsTotal   int64   `json:"ms_total"`
-	MsEncode  int64   `json:"ms_encode"`
-	MsWire    int64   `json:"ms_wire"` // 隧道往返
-	MsDecode  int64   `json:"ms_decode"`
-	MsUpstrm  int64   `json:"ms_upstream"` // 上游 TTFB
-	UpBps     float64 `json:"up_bps"`
-	DownBps   float64 `json:"down_bps"`
-	Transport string  `json:"transport"` // quic / tcp
-	Err       string  `json:"err,omitempty"`
+	Time     string `json:"t"`
+	Method   string `json:"method"`
+	Path     string `json:"path"`
+	Status   int    `json:"status"`
+	Encoding string `json:"enc"`
+	BaseHit  bool   `json:"base_hit"`
+	UpRaw    int64  `json:"up_raw"`  // 明文请求体
+	UpWire   int64  `json:"up_wire"` // 隧道上实际传输（编码后）
+	DownRaw  int64  `json:"down_raw"`
+	DownWire int64  `json:"down_wire"`
+	MsTotal  int64  `json:"ms_total"`
+	MsEncode int64  `json:"ms_encode"`
+	MsWire   int64  `json:"ms_wire"` // 隧道往返
+	MsDecode int64  `json:"ms_decode"`
+	MsUpstrm int64  `json:"ms_upstream"` // 上游 TTFB
+	// MsHandshake 本次请求在传输层建立新连接所花的时间（毫秒）。
+	// 连接复用命中时为 0——这是「复用是否真的生效」的度量：
+	// 若每个请求都 >0，说明池没命中，每个请求都在付握手钱（实测约 2 秒）。
+	MsHandshake int64   `json:"ms_handshake,omitempty"`
+	UpBps       float64 `json:"up_bps"`
+	DownBps     float64 `json:"down_bps"`
+	Transport   string  `json:"transport"` // quic / tcp
+	Err         string  `json:"err,omitempty"`
 }
 
-// Bucket 一个时间桶里的上行体积。
+// Bucket 一个时间桶里的流量与延迟。
 //
 // 为什么按时间桶而不是「按请求」：请求的到达是不均匀的（空转几分钟后突然
 // 一串），按请求画会让横轴撒谎——它看起来像匀速，实际是突发的。
+//
+// 延迟存「和 + 次数」而不是每桶一个均值：同一桶里可能先来一条 20ms 再来一条
+// 2000ms，逐条求均值会把极端值抹平；保留和在读时再除，调用方还能自己选口径。
 type Bucket struct {
 	// At 桶的起点（对齐到桶边界），便于调用方判断这一桶是否落在自己的时间窗里。
-	At     time.Time `json:"at"`
-	UpRaw  int64     `json:"up_raw"`
-	UpWire int64     `json:"up_wire"`
-	Count  int64     `json:"count"`
+	At       time.Time `json:"at"`
+	UpRaw    int64     `json:"up_raw"`
+	UpWire   int64     `json:"up_wire"`
+	DownRaw  int64     `json:"down_raw"`
+	DownWire int64     `json:"down_wire"`
+	Count    int64     `json:"count"`
+
+	// 延迟累加。MsSum = 隧道往返合计，TTFbSum = 上游首字节合计。
+	// 除以 Count 才是均值；Count 为 0 时调用方不应做除法（见 AvgMs/AvgTTFB）。
+	MsSum   int64 `json:"ms_sum"`
+	TTFbSum int64 `json:"ttfb_sum"`
+
+	// 握手耗时。连接复用后大多数请求不再新建连接，所以它经常是 0——
+	// 这不是缺数据，而是「这一桶里一个握手都没发生」的可视证据。
+	HsSum   int64 `json:"hs_sum"`
+	HsCount int64 `json:"hs_count"`
+}
+
+// AvgMs 桶内平均隧道往返（毫秒）。Count 为 0 时返回 0。
+func (b Bucket) AvgMs() int64 {
+	if b.Count <= 0 {
+		return 0
+	}
+	return b.MsSum / b.Count
+}
+
+// AvgTTFB 桶内平均上游首字节延迟（毫秒）。
+func (b Bucket) AvgTTFB() int64 {
+	if b.Count <= 0 {
+		return 0
+	}
+	return b.TTFbSum / b.Count
+}
+
+// AvgHandshake 桶内平均握手耗时（毫秒）。HsCount 为 0 时返回 0。
+func (b Bucket) AvgHandshake() int64 {
+	if b.HsCount <= 0 {
+		return 0
+	}
+	return b.HsSum / b.HsCount
 }
 
 // Agg 汇总视图
@@ -417,7 +460,17 @@ func (c *Collector) bucketLocked(t time.Time, r *Record) {
 	}
 	slot.UpRaw += r.UpRaw
 	slot.UpWire += r.UpWire
+	slot.DownRaw += r.DownRaw
+	slot.DownWire += r.DownWire
 	slot.Count++
+	slot.MsSum += r.MsTotal
+	slot.TTFbSum += r.MsUpstrm
+	// 只有真的发生过握手才累加（MsHandshake 由传输层在新建连接时填）。
+	// 复用命中时该值为 0，HsCount 不增——图上看得出「这一桶没握手」。
+	if r.MsHandshake > 0 {
+		slot.HsSum += r.MsHandshake
+		slot.HsCount++
+	}
 }
 
 // seriesLocked 取最近 SeriesBuckets 个桶，旧 → 新，长度恒为 SeriesBuckets。

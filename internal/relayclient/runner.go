@@ -706,6 +706,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	rec.MsWire = time.Since(wireStart).Milliseconds()
 	rec.Transport = string(h.dialer.LastKind())
+	// 握手耗时：只有本次请求真的新建了连接才有值。复用时恒为 0，
+	// 这正是「池在起作用」的度量——若这里经常非零，说明池没命中，
+	// 每个请求都在付实测约 2 秒的握手钱。
+	if !conn.Reused() {
+		rec.MsHandshake = conn.Handshake().Milliseconds()
+	}
 	rec.Status = stream.Status
 	rec.DownRaw = stream.Bytes
 	// down_wire 是隧道实际承载量（含帧头/续片头），不是 body 长度。

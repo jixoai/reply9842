@@ -77,7 +77,6 @@ func (a *app) view(c *ui.Context) {
 					a.noticeLine(c, p)
 				})
 			}
-			a.footerPane(c, p)
 		})
 		a.footer(c, p)
 	})
@@ -302,8 +301,15 @@ var (
 // 「效果如何」——图占满剩余高度，失败时在上面补一句原因。
 func (a *app) panelPane(c *ui.Context, p *glass.Palette) {
 	a.failureLine(c, p)
-	// 图表卡片吃掉剩余高度：窗口拉高时变高的是图，不是底部空白。
+	// 两张图的分工（owner 2026-11-13 要求）：
+	//   上：压缩率——「省了多少」，本产品的卖点
+	//   下：流量与延迟——「现在顺不顺」，压缩率图完全看不见的维度
+	//
+	// 高度分配：上图 Grow(1) 吃满剩余，下图定高。两张都 grow 的话比例会随
+	// 窗口高度漂移，而「谁该长得更多」没有依据；定高副图 + 主图 grow 让
+	// 窗口拉大时变高的是主图，主次分明。
 	a.chartCard(c, p)
+	a.trafficCard(c, p)
 }
 
 // failureLine 启动失败那一句（仅失败时出现）。
@@ -421,6 +427,223 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 // 「25% 刻度间隔 27px」的下限：再矮，四档刻度就会与柱顶互相挤压。
 const chartMinHeight float32 = 110
 
+// trafficCard 流量与延迟图（第二张）。
+//
+// ── 为什么需要第二张图 ────────────────────────────────────────────────────
+// 上面那张图只回答「省了多少」——它是本产品的卖点，但不是全部事实。用户还要
+// 知道「现在跑得顺不顺」：每秒上下行多少字节、延迟是不是在恶化。这两件事在
+// 压缩率图上完全看不见（压缩率 99.9% 时连接可能同时卡得要死）。
+//
+// ── 纵轴设计（核心，和上一张图不同）────────────────────────────────────────
+// 上一张图的纵轴是百分比，0-100% 天然有界。流量是无界的：一次 30MB 的请求
+// 能把 1KB 的请求压成 0.003%。所以：
+//   - 柱：上下行流量，**对同一个桶取同一个比例尺**（两条量共用纵轴基准），
+//     否则「上行比下行小」这种判断会失真
+//   - 线：延迟（毫秒），单独按本窗口的峰值归一，画在同样的绘图区里
+//   - 两者的比例尺各自独立，所以图例必须写清楚「柱=字节，线=毫秒」
+//
+// ── 为什么不画握手延迟 ────────────────────────────────────────────────────
+// 连接复用生效后，绝大多数桶的握手次数是 0（那正是复用的证据）。把它画成柱会
+// 得到一片空白，读者会以为「数据丢了」。改为在摘要行里报「本窗口握手 N 次」：
+// 0 次读作「复用正常」，非 0 时才值得看具体值。
+func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
+	g := a.agg
+	running := a.running()
+	hasData := a.hasTraffic()
+
+	glass.Surface(ui.Column(c).Padding(12, 14, 12).Gap(8), p, glass.Card).Children(func() {
+		ui.Row(c).AlignItems(ui.Center).Gap(10).Children(func() {
+			glass.Heading(c, p, "流量与延迟")
+			ui.Box(c).Grow(1)
+			if hasData {
+				a.legendSwatch(c, p.UpBar, "上行")
+				a.legendSwatch(c, p.DownBar, "下行")
+				a.legendLine(c, p.Latency, "延迟")
+			}
+			a.liveBadge(c, p, running)
+		})
+
+		if !hasData {
+			ui.Box(c).Height(trafficPlotHeight).FillWidth().
+				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
+				ui.Text(c, "等待流量数据").FontSize(11.5).
+					TextColor(p.MutedForeground).SingleLine()
+			})
+			return
+		}
+
+		a.trafficPlot(c, p)
+		ui.Text(c, a.trafficSummary(g)).FontSize(11).
+			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(2)
+	})
+}
+
+// trafficPlotHeight 流量图绘图区的固定高度。
+//
+// 与上面那张「吃掉剩余高度」的图不同，这张是定高的：两张图同时 grow 会让
+// 比例随窗口高度漂移（窗口拉大时两张图都变高，但谁该长得更多没有依据）。
+// 定高 + 上面那张 grow，结果是「主图随窗口长、副图稳定」——主次分明。
+const trafficPlotHeight float32 = 88
+
+// hasTraffic 是否有可画的流量数据（上下行任一非零即可）
+func (a *app) hasTraffic() bool {
+	for _, b := range a.agg.Series {
+		if b.UpWire > 0 || b.DownWire > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// trafficPlot 画流量柱 + 延迟折线。
+func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
+	series := a.agg.Series
+
+	// 比例尺：柱的基准取「本窗口最大单桶字节」，线的基准取「本窗口最大平均延迟」。
+	// 两者各算各的，但都至少取 1，避免除零。
+	var maxBytes int64 = 1
+	var maxMs int64 = 1
+	var hsCount int64
+	for _, b := range series {
+		if v := b.UpWire + b.DownWire; v > maxBytes {
+			maxBytes = v
+		}
+		if v := b.AvgMs(); v > maxMs {
+			maxMs = v
+		}
+		hsCount += b.HsCount
+	}
+
+	ui.Row(c).Height(trafficPlotHeight).FillWidth().
+		AlignItems(ui.Stretch).Gap(6).Children(func() {
+		// 纵轴刻度只标峰值与 0：流量是动态范围极大的量（KB 到 MB），
+		// 中间刻度要人肉换算，不如只标「顶 = 本窗口峰值」。
+		// 34 宽装不下 "411.1 KB"（实测被截成 "411.1…"）。加到 46：
+		// 峰值标签是本图唯一的量级参照，截断它等于把纵轴读成无刻度。
+		// 纵轴三档：字节峰值（上）、延迟峰值（中，琥珀色对应折线）、0（下）。
+		//
+		// 只有两档（峰值/0）时，折线在图中间的位置完全没有参照——读者不知道该
+		// 按字节刻度还是按延迟刻度去读。中间那档用琥珀色 + "ms" 明确划清界限：
+		// 上半部分是流量刻度，这一行以下是延迟刻度。
+		ui.Column(c).Width(46).Shrink(0).AlignItems(ui.End).Children(func() {
+			ui.Text(c, humanBytes(maxBytes)).FontSize(8).FontFeatures("tnum").
+				TextColor(p.Tertiary).SingleLine()
+			ui.Box(c).Grow(1)
+			ui.Textf(c, "%d ms", maxMs).FontSize(8).FontFeatures("tnum").
+				TextColor(p.Latency).SingleLine()
+			ui.Box(c).Grow(1)
+			ui.Text(c, "0").FontSize(8).
+				TextColor(p.Tertiary).SingleLine()
+		})
+
+		ui.Box(c).Grow(1).Draw(func(pt *ui.Painter, r ui.Rect) {
+			if r.W <= 0 || r.H <= 0 {
+				return
+			}
+			// 基线
+			pt.Fill(ui.Rect{X: r.X, Y: r.Y + r.H - 1, W: r.W, H: 1}, p.Edge, 0)
+
+			n := len(series)
+			if n == 0 {
+				return
+			}
+			// 柱宽：留 2px 间隙，但不小于 1.5px（48 根柱子时仍要看得见）
+			slot := r.W / float32(n)
+			gap := slot * 0.22
+			bw := slot - gap
+			if bw < 1.5 {
+				bw = 1.5
+			}
+
+			var prevX, prevY float32
+			var hasPrev bool
+			for i, b := range series {
+				x := r.X + float32(i)*slot + gap/2
+
+				// 上行与下行**堆叠**而不是并排：「这一桶总共走了多少」是
+				// 更常见的读数，并排会让柱宽减半、48 根时几乎看不清。
+				up := float32(b.UpWire) / float32(maxBytes) * r.H
+				down := float32(b.DownWire) / float32(maxBytes) * r.H
+				if b.UpWire > 0 && up < 1 {
+					up = 1
+				}
+				if b.DownWire > 0 && down < 1 {
+					down = 1
+				}
+				if up+down > r.H {
+					// 峰值柱自己可能刚好满格；留 1px 让柱顶不贴边
+					scale := (r.H - 1) / (up + down)
+					up *= scale
+					down *= scale
+				}
+				if up > 0 {
+					pt.Fill(ui.Rect{X: x, Y: r.Y + r.H - up, W: bw, H: up},
+						p.UpBar, 0.8)
+				}
+				if down > 0 {
+					pt.Fill(ui.Rect{X: x, Y: r.Y + r.H - up - down, W: bw, H: down},
+						p.DownBar, 0.8)
+				}
+
+				// 延迟折线：只连有请求的桶，空桶处断开（不假装中间有数据）。
+				// 断开而不是插值：空转期延迟没有意义，连过去会画出一条
+				// 「延迟平稳」的假象。
+				if b.Count > 0 {
+					ms := b.AvgMs()
+					ly := r.Y + r.H - float32(ms)/float32(maxMs)*(r.H*0.92)
+					cx := x + bw/2
+					if hasPrev {
+						pt.Line(prevX, prevY, cx, ly, 1.4, p.Latency)
+					}
+					// 折点：2px 小方块，让稀疏点也可读
+					pt.Fill(ui.Rect{X: cx - 1, Y: ly - 1, W: 2, H: 2}, p.Latency, 0.5)
+					prevX, prevY, hasPrev = cx, ly, true
+				} else {
+					hasPrev = false
+				}
+			}
+		})
+	})
+}
+
+// trafficSummary 流量图下面那行摘要。
+func (a *app) trafficSummary(g stats.Agg) string {
+	var up, down, n int64
+	var msSum, ttfbSum int64
+	var hsN int64
+	var hsSum int64
+	for _, b := range g.Series {
+		up += b.UpWire
+		down += b.DownWire
+		n += b.Count
+		msSum += b.MsSum
+		ttfbSum += b.TTFbSum
+		hsN += b.HsCount
+		hsSum += b.HsSum
+	}
+	if n == 0 {
+		return "这段时间没有请求"
+	}
+	avgMs := msSum / n
+	avgTTFB := ttfbSum / n
+
+	span := int(g.WindowSec)
+	if span <= 0 {
+		span = int(stats.DefaultWindow / time.Second)
+	}
+
+	// 握手：0 次是好事（复用生效），所以措辞要中性偏正面，而不是「无数据」。
+	var hs string
+	if hsN == 0 {
+		hs = "全程复用连接"
+	} else {
+		hs = fmt.Sprintf("握手 %s 次 · 均 %d ms", groupDigits(hsN), hsSum/hsN)
+	}
+
+	return fmt.Sprintf("最近 %s：上行 %s · 下行 %s · 延迟 %d ms（首字节 %d ms）· %s",
+		humanWindow(span), humanBytes(up), humanBytes(down), avgMs, avgTTFB, hs)
+}
+
 // 图表配色。绿 = 省下的（赚到的），蓝 = 实际发出去的（花掉的）。
 //
 // 为什么不用 p.Foreground / p.Tertiary 这套中性灰：柱状图里两段必须能**在
@@ -493,6 +716,19 @@ func (a *app) legend(c *ui.Context, p *glass.Palette) {
 func (a *app) legendSwatch(c *ui.Context, col ui.Color, label string) {
 	ui.Row(c).Gap(4).AlignItems(ui.Center).Shrink(0).Children(func() {
 		ui.Box(c).Size(7, 7).Radius(1.5).Shrink(0).Background(col)
+		ui.Text(c, label).FontSize(10).TextColor(a.pal.Tertiary).SingleLine()
+	})
+}
+
+// legendLine 折线类图例：画一小段横线而不是色块。
+//
+// 形状必须与柱状图例区分：同一张图里既有柱又有线时，两种图例都画成方块会让
+// 人以为有三组柱子。线段在这里是「这是个折线」的直接提示。
+func (a *app) legendLine(c *ui.Context, col ui.Color, label string) {
+	ui.Row(c).Gap(4).AlignItems(ui.Center).Shrink(0).Children(func() {
+		ui.Box(c).Size(11, 7).Shrink(0).Draw(func(pt *ui.Painter, r ui.Rect) {
+			pt.Line(r.X, r.Y+r.H/2, r.X+r.W, r.Y+r.H/2, 1.4, col)
+		})
 		ui.Text(c, label).FontSize(10).TextColor(a.pal.Tertiary).SingleLine()
 	})
 }
@@ -678,60 +914,6 @@ func (a *app) heroNote(g stats.Agg, running bool) string {
 	}
 	return fmt.Sprintf("节省 %.1f%% · 每 1KB 只发 %dB",
 		(1-g.UpRatio)*100, rawBytesPerKilo(g.UpRatio))
-}
-
-// footerPane 内容区底部的一行：左侧三格统计压成的文字摘要，右侧复制按钮。
-//
-// 为什么统计压成一行文字：三格卡片要占 60px 高，而它们的信息（请求数、
-// 节省量、p50）在有图表之后是次要的——图表已经回答了「效果如何」，
-// 这些数字是「顺带看一眼」的量级。腾出来的高度给图表。
-//
-// 顶栏那个徽标已经能复制地址，这个按钮仍留着：它挨着统计数字，用户在
-// 「看成效」时顺手就要 `http://…` 去贴到别处，回顶栏找一个 10px 的小徽标
-// 反而是绕路。两处复制同一个东西、用同一条路径（copyURL），口径不会漂。
-func (a *app) footerPane(c *ui.Context, p *glass.Palette) {
-	copied := a.copyFlashing()
-	g := a.agg
-	saved := g.UpRaw - g.UpWire
-	if saved < 0 {
-		saved = 0
-	}
-
-	ui.Row(c).FillWidth().Padding(0, 16, 12).AlignItems(ui.Center).Gap(10).Children(func() {
-		ui.Text(c, a.statsLine(g, saved)).FontSize(11).
-			FontFeatures("tnum").TextColor(p.MutedForeground).MaxLines(1).Grow(1)
-
-		label := "复制地址"
-		if copied {
-			label = "已复制"
-		}
-		btn := a.actionButton(c, p, "copy", label, false)
-		if copied {
-			// 成功反馈靠换一个词 + 换成成功色，而不是弹一个 toast：
-			// 复制是低风险动作，用户只需要知道「刚才那下生效了」。
-			btn = btn.TextColor(p.Success)
-		}
-		if btn.Clicked() {
-			a.copyURL(c)
-		}
-	})
-}
-
-// statsLine 三格统计的一行写法。
-//
-// 口径从「本次会话」改成「近 N 小时」：统计自 2026-11-13 起从磁盘日志重建，
-// 重启不清零，所以「本次会话」已经名不副实。前缀写明保留期，让这一行的
-// 时间跨度可见——它和图上方那段窗口是两件不同的事，必须各自说清。
-func (a *app) statsLine(g stats.Agg, saved int64) string {
-	if g.Requests == 0 {
-		return "还没有请求记录（启动代理后开始统计）"
-	}
-	retain := int(g.RetainSec)
-	if retain <= 0 {
-		retain = int(stats.DefaultRetain / time.Second)
-	}
-	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %d ms",
-		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), g.P50Ms)
 }
 
 // actionButton 一个套了 solid-glass 边光的按钮。
@@ -996,11 +1178,45 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 			state += " " + humanDuration(time.Since(up))
 		}
 	}
-	ui.Row(c).Height(27).FillWidth().Padding(0, 16).
-		AlignItems(ui.Center).Background(p.PageDim).Children(func() {
+	// 单栏：状态 · 传输 · 统计摘要 ……… 复制按钮 · 版本号
+	//
+	// 2026-11-13 owner 要求「窗口做大，底部就不用两栏、合并成一栏」。原来的两栏是
+	// 「内容区末尾的统计+复制」和「窗口底部状态条」——它们都只有一行高，各占
+	// 27~32px，合起来在一屏里读作两条重复的底边。合并后信息密度反而更高：
+	// 用户在同一个水平线上从左到右读到「跑没跑 → 走的什么 → 效果如何」。
+	//
+	// 顺序是有意义的，不是随便排：状态是「最常看」，统计摘要是「顺带看」，
+	// 复制是动作，版本是最不需要看的（放最右，视线最少落到那里）。
+	ui.Row(c).Height(32).FillWidth().Padding(0, 16).
+		AlignItems(ui.Center).Background(p.PageDim).Gap(10).Children(func() {
 		ui.Textf(c, "%s · %s", state, a.transportLabel()).
 			FontSize(10.5).TextColor(p.Tertiary).SingleLine()
-		ui.Box(c).Grow(1)
+
+		// 统计摘要：只在有数据时出现。空态下这一格是「还没有请求记录」，
+		// 而状态区已经说了「未运行」——同一件事说两遍只会稀释信息。
+		if line := a.footerStatsLine(); line != "" {
+			ui.Text(c, "·").FontSize(10.5).TextColor(p.Tertiary).SingleLine()
+			ui.Text(c, line).FontSize(10.5).FontFeatures("tnum").
+				TextColor(p.MutedForeground).MaxLines(1).Grow(1)
+		} else {
+			ui.Box(c).Grow(1)
+		}
+
+		// 复制按钮：顶栏那个 10px 小徽标在这一行看成效时够不着，
+		// 所以在动作区再给一个入口。两处走同一条 copyURL，口径不会漂。
+		copied := a.copyFlashing()
+		label := "复制地址"
+		if copied {
+			label = "已复制"
+		}
+		btn := a.actionButton(c, p, "copy", label, false)
+		if copied {
+			btn = btn.TextColor(p.Success)
+		}
+		if btn.Clicked() {
+			a.copyURL(c)
+		}
+
 		// 用 displayVersion 统一（注入源有的带 v 有的不带），且开发构建
 		// （"dev"）不显示版本号——"vdev" 对用户零信息量，只会被读成异常。
 		if v := displayVersion(version); v != "" {
@@ -1008,6 +1224,27 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 				Font("monospace").TextColor(p.Tertiary).SingleLine()
 		}
 	})
+}
+
+// footerStatsLine 底部那一行里的统计摘要（空态返回空串，让调用方跳过）。
+//
+// 口径从「本次会话」改成「近 N 小时」：统计自 2026-11-13 起从磁盘日志重建，
+// 重启不清零，所以「本次会话」已名不副实。前缀写明保留期，让时间跨度可见。
+func (a *app) footerStatsLine() string {
+	g := a.agg
+	if g.Requests == 0 {
+		return ""
+	}
+	saved := g.UpRaw - g.UpWire
+	if saved < 0 {
+		saved = 0
+	}
+	retain := int(g.RetainSec)
+	if retain <= 0 {
+		retain = int(stats.DefaultRetain / time.Second)
+	}
+	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %d ms",
+		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), g.P50Ms)
 }
 
 // transportLabel 传输方式的显示名
