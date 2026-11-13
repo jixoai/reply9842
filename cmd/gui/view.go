@@ -203,6 +203,12 @@ func (a *app) hostChip(c *ui.Context, p *glass.Palette) {
 		bg, fg, icon = p.Success.Alpha(0.12), p.Success, iconCheck
 	}
 
+	// 窄到 500 以下只留图标：中文字宽随平台字体浮动（Linux 的 fallback 比
+	// macOS 宽几个像素），只按 480 算的话右侧那一簇会在 Linux 上反推出窗口边
+	// （实测 475.5 > 480-8）。地址文字是便利，开关是主操作——空间紧时先让便利。
+	w, _ := c.Size()
+	showText := w >= 500
+
 	chip := ui.ButtonBase(c.Key("copy-host")).Shrink(0).Height(22).
 		Padding(0, 7).Gap(5).Radius(7).
 		AlignItems(ui.Center).Cursor(ui.CursorPointer).
@@ -224,8 +230,10 @@ func (a *app) hostChip(c *ui.Context, p *glass.Palette) {
 	}
 	chip.Children(func() {
 		ui.Icon(c, icon).Size(10, 10).Shrink(0).TextColor(fg)
-		ui.Text(c, a.hostText()).FontSize(10).Font("monospace").
-			TextColor(text).SingleLine().TruncateMiddle().MaxWidth(104)
+		if showText {
+			ui.Text(c, a.hostText()).FontSize(10).Font("monospace").
+				TextColor(text).SingleLine().TruncateMiddle().MaxWidth(104)
+		}
 	})
 	if chip.Clicked() {
 		a.copyURL(c)
