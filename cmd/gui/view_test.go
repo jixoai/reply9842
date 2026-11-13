@@ -17,6 +17,7 @@ import (
 	"github.com/jixoai/reply9842/internal/glass"
 	"github.com/jixoai/reply9842/internal/relayclient"
 	"github.com/jixoai/reply9842/internal/stats"
+	"github.com/jixoai/reply9842/internal/update"
 )
 
 // setRunning 让视图以「运行中」渲染（Runner 内部的 running 只有真起监听才为 true，
@@ -528,8 +529,8 @@ func TestSnapshotFrames(t *testing.T) {
 		// 尺寸与 main.go 的 createWindow 一致：480×480，且带上真机同一份
 		// TitleBar 让位量（红绿灯 x 到 78.5、栏高由 NSToolbar 撑到 66）。
 		// 不带 SetTitleBar 的话顶栏左边距退回 14，截图会比真机「宽」出一大截。
-		{"panel-idle", 560, 640, func(a *app) {}},
-		{"panel-running", 560, 640, func(a *app) {
+		{"panel-idle", 560, 660, func(a *app) {}},
+		{"panel-running", 560, 660, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1204, UpRaw: 1400 * 1024, UpWire: 70 * 1024,
 				UpRatio: 70.0 / 1400, P50Ms: 28}
@@ -537,24 +538,43 @@ func TestSnapshotFrames(t *testing.T) {
 			a.snap = func() stats.Agg { return a.agg }
 			a.transport = "quic"
 		}},
-		{"panel-sparse", 560, 640, func(a *app) {
+		{"panel-sparse", 560, 660, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1, UpRaw: 524847, UpWire: 392, UpRatio: 392.0 / 524847, P50Ms: 18}
 			a.agg.Series = sparseSeries()
 			a.snap = func() stats.Agg { return a.agg }
 		}},
-		{"panel-copied", 560, 640, func(a *app) {
+		{"panel-copied", 560, 660, func(a *app) {
 			// 复制成功后的回显：徽标换对勾、footer 按钮变「已复制」。
 			setRunning(a, true)
 			a.copiedAt = time.Now()
 		}},
-		{"settings", 560, 640, func(a *app) { a.tab = tabSettings }},
-		{"settings-running", 560, 640, func(a *app) {
+		{"settings", 560, 660, func(a *app) { a.tab = tabSettings }},
+		{"settings-running", 560, 660, func(a *app) {
 			a.tab = tabSettings
 			setRunning(a, true)
 		}},
-		{"panel-light", 560, 640, func(a *app) { a.pal = glass.Light() }},
-		{"panel-error", 560, 640, func(a *app) {
+		// 三种更新状态各一帧：检查结果的显示是需求「可以手动检查」的可见产物。
+		{"settings-update-available", 560, 660, func(a *app) {
+			a.tab = tabSettings
+			a.upd = updateSession{stage: updAvailable,
+				info: update.Info{Current: "0.2.0", Latest: "v0.3.0", LatestVersion: "0.3.0", HasUpdate: true}}
+		}},
+		{"settings-update-downloading", 560, 660, func(a *app) {
+			a.tab = tabSettings
+			// cancel 必须非 nil：真实下载时它永远存在，而它决定按钮显示「取消」
+			// 还是「检查更新（禁用）」。少了它，截图会展示一个实际不存在的状态。
+			a.upd = updateSession{stage: updDownloading, percent: 63,
+				downloaded: 5_800_000, total: 9_200_000, mirror: "gh-proxy.com",
+				cancel: func() {}}
+		}},
+		{"settings-update-failed", 560, 660, func(a *app) {
+			a.tab = tabSettings
+			a.upd = updateSession{stage: updFailed,
+				msg: "校验失败：下载内容与官方 sha256 不符，可能被中间人篡改或镜像返回了错误文件。当前版本未被改动，请换一个镜像重试"}
+		}},
+		{"panel-light", 560, 660, func(a *app) { a.pal = glass.Light() }},
+		{"panel-error", 560, 660, func(a *app) {
 			// 制造一次真实的 bind 失败：占住端口再让 Runner 去监听
 			a.listen = "127.0.0.1:1" // 1024 以下的端口在 macOS 上需要权限
 			a.start()
@@ -1014,4 +1034,85 @@ func findSwitchCenter(tt *ui.Tester, label string) (x, y float32, ok bool) {
 		}
 	}
 	return 0, 0, false
+}
+
+// TestSettingsFitsShippedWindow 设置页在**出货窗口尺寸**下必须全部可见。
+//
+// 为什么需要这条：设置页的行数只增不减（8 行 → 11 行），而窗口高度是常量。
+// 上一轮加两行时已经撞过一次「最后一行被顶出可视区」，那次靠人眼在真机截图上
+// 发现；同一件事发生第二次时，用户只会说「我的设置页被切了」。
+//
+// 判据是像素坐标而不是「HasText」：设置页包在 Scroll 里，被裁掉的行**仍然**
+// 在 Texts 里（只是不在可视区）。所以断言每一项的矩形底边都落在 footer 之上。
+// 取值用 main.go 里 createWindow 的真实宽度与高度（窄到 440 也要成立）。
+func TestSettingsFitsShippedWindow(t *testing.T) {
+	// 出货尺寸 + 一个「更新出错且保存也失败」的最坏情况（那时文案最长）。
+	const winW, winH = 560, 660
+	footerTop := float32(winH - 33) // footer 32 + 发丝线 1
+
+	type scenario struct {
+		name string
+		prep func(a *app)
+	}
+	cases := []scenario{
+		{"空闲", func(a *app) {}},
+		{"运行中", func(a *app) { setRunning(a, true) }},
+		{"运行中+长错误+提示", func(a *app) {
+			setRunning(a, true)
+			a.upd.stage = updFailed
+			a.upd.msg = "校验失败：下载内容与官方 sha256 不符，可能被中间人篡改或镜像返回了错误文件。当前版本未被改动，请换一个镜像重试"
+			a.setNotice("保存设置失败：open /Users/someone/.reply9842/settings.json.tmp: permission denied，请检查目录属主与权限后重试", true)
+		}},
+	}
+	// 每一项都必须可见。前五项是「连接」组，其余在「其他」组——
+	// 任何一项被切掉都说明分区把行顶出了窗口。
+	rows := []string{
+		"连接", "上游地址", "服务器域名", "源地址", "监听地址", "传输方式",
+		"其他", "开机自启", "日志保留", "显示区间", "自动更新", "更新镜像", "软件更新",
+		"检查更新",
+	}
+	for _, tc := range cases {
+		for _, w := range []int{440, winW} {
+			a := newTestApp(t)
+			a.tab = tabSettings
+			tc.prep(a)
+			tt := ui.NewTester(a.view, w, winH)
+			tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
+			for _, name := range rows {
+				r, ok := tt.Find(name)
+				if !ok {
+					t.Errorf("%s w=%d: 设置页缺少 %q", tc.name, w, name)
+					continue
+				}
+				if r.Y+r.H > footerTop {
+					t.Errorf("%s w=%d: %q 底边 %.1f 越过了 footer 顶边 %.1f（被切掉）",
+						tc.name, w, name, r.Y+r.H, footerTop)
+				}
+			}
+		}
+	}
+}
+
+// TestSettingsHasTwoGroups 两个分区的标题都在，而面板 tab 里没有。
+//
+// 需求原文：「设置页内两个分区，不用滚」。分组是可见的结构，不是内部实现。
+func TestSettingsHasTwoGroups(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	tt := ui.NewTester(a.view, 560, 660)
+	for _, want := range []string{"连接", "其他"} {
+		if !tt.HasText(want) {
+			t.Errorf("设置页缺少分区标题 %q：%q", want, tt.Texts())
+		}
+	}
+	// 分区标题的字重必须高于行标签（否则它读起来就是个字段名）。
+	// 用「颜色不同」间接验证：标题用 Foreground，行标签用 MutedForeground。
+	head, okH := tt.Find("连接")
+	label, okL := tt.Find("上游地址")
+	if !okH || !okL {
+		t.Fatalf("找不到标题或行标签")
+	}
+	if head.Y >= label.Y {
+		t.Errorf("分区标题应在行标签之上：head.Y=%.1f label.Y=%.1f", head.Y, label.Y)
+	}
 }

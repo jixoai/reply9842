@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/jixoai/reply9842/internal/stats"
@@ -54,13 +55,33 @@ const DefaultWindow = stats.DefaultWindow
 type Settings struct {
 	RetainSec int64 `json:"retain_sec"`
 	WindowSec int64 `json:"window_sec"`
+
+	// AutoUpdate 自动更新开关。
+	//
+	// 默认**关闭**是刻意的安全默认：自我替换是这个程序里唯一会动自己二进制的
+	// 动作，一旦中途出错用户连命令行都没有。所以必须由用户显式打开。
+	//
+	// 老配置文件没有这个字段时反序列化得到零值 false，正好就是想要的默认——
+	// 不需要写迁移代码（这也是「用 bool 而不是 *bool」的取舍：区分「没配过」
+	// 与「配过且关闭」在这里没有行为差异）。
+	AutoUpdate bool `json:"auto_update"`
+
+	// UpdateMirror 用户配置的下载镜像前缀（英文逗号分隔，顺序即回退顺序）。
+	//
+	// 空串 = 未配置，退回 REPLY9842_MIRROR 环境变量再退回内置默认列表；
+	// 非空 = 用户显式配置，语义与 update.Options.Mirrors 的「非 nil」一致。
+	// 合法性不在这里校验：用户可能在输入中途被写盘（"https://g" 不是合法前缀），
+	// 那不该让保存失败。真正的解析发生在 update.New，错误会显示在设置页的
+	// 更新状态行里。
+	UpdateMirror string `json:"update_mirror"`
 }
 
-// DefaultSettings 默认偏好：保留一天、看最近 30 分钟
+// DefaultSettings 默认偏好：保留一天、看最近 30 分钟、不自动更新、镜像留空
 func DefaultSettings() Settings {
 	return Settings{
-		RetainSec: int64(DefaultRetain / time.Second),
-		WindowSec: int64(DefaultWindow / time.Second),
+		RetainSec:  int64(DefaultRetain / time.Second),
+		WindowSec:  int64(DefaultWindow / time.Second),
+		AutoUpdate: false,
 	}
 }
 
@@ -91,6 +112,10 @@ func (s *Settings) Normalize() {
 			s.WindowSec = int64(w / time.Second)
 		}
 	}
+	// 镜像串只做 trim：合法性（是不是 http(s)、有没有主机名）由 update 包在
+	// 真正构造 Updater 时校验。这里也**不**把空白串规整成某种「默认」标记——
+	// 空串本身就是「未配置」的表达，与 update.ResolveMirrors(nil) 的语义对得上。
+	s.UpdateMirror = strings.TrimSpace(s.UpdateMirror)
 }
 
 // nearestOption 找与 d 最接近的档位；空表时原样返回

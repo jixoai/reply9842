@@ -168,3 +168,54 @@ func TestSetStatsSettingsApplies(t *testing.T) {
 		t.Errorf("快照 window_sec=%d，期望 %d", got.WindowSec, int64(6*time.Hour/time.Second))
 	}
 }
+
+// TestSettingsUpdateFieldsRoundTrip 两个新增的更新偏好也要往返一致。
+func TestSettingsUpdateFieldsRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	want := Settings{
+		RetainSec:    int64(DefaultRetain / time.Second),
+		WindowSec:    int64(DefaultWindow / time.Second),
+		AutoUpdate:   true,
+		UpdateMirror: "https://gh-proxy.com/,https://ghfast.top/",
+	}
+	if err := SaveSettings(path, want); err != nil {
+		t.Fatal(err)
+	}
+	if got := LoadSettings(path); got != want {
+		t.Fatalf("读回 %+v，期望 %+v", got, want)
+	}
+}
+
+// TestSettingsOldFileHasUpdateOff 老的 settings.json（没有更新字段）必须能正常
+// 读取，且自动更新**默认关闭**。
+//
+// 这条守的是向后兼容：用户升级到带自动更新的版本时，磁盘上那份文件是旧的。
+// 若默认值写成 true，升级那一刻就等于「用户同意了自我替换」——而他从未同意过。
+func TestSettingsOldFileHasUpdateOff(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	// 升级前的真实文件形态（只有两个时间跨度字段）
+	os.WriteFile(path, []byte(`{"retain_sec":3600,"window_sec":1800}`), 0o644)
+
+	got := LoadSettings(path)
+	if got.AutoUpdate {
+		t.Error("老配置文件读出的 auto_update 是 true——升级不该默认开启自我替换")
+	}
+	if got.UpdateMirror != "" {
+		t.Errorf("老配置文件读出的 update_mirror = %q，期望空（未配置）", got.UpdateMirror)
+	}
+	if got.Retain() != time.Hour || got.Window() != 30*time.Minute {
+		t.Errorf("老字段被影响：retain=%s window=%s", got.Retain(), got.Window())
+	}
+}
+
+// TestSettingsMirrorTrimmed 镜像串两端空白被去掉（用户从网页复制常带空格），
+// 但中间内容原样保留——合法性校验是 update 包的事，这里不做。
+func TestSettingsMirrorTrimmed(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "settings.json")
+	os.WriteFile(path, []byte(`{"update_mirror":"  https://a.example/ , https://b.example/  "}`), 0o644)
+	got := LoadSettings(path)
+	want := "https://a.example/ , https://b.example/"
+	if got.UpdateMirror != want {
+		t.Fatalf("update_mirror = %q，期望 %q", got.UpdateMirror, want)
+	}
+}

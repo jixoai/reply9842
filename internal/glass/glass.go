@@ -113,6 +113,17 @@ type Palette struct {
 	Success ui.Color
 	Danger  ui.Color
 	Warning ui.Color
+
+	// 图表系列色。三个角色语义固定，不可互换：
+	//   UpBar   上行实际发出的字节（蓝）——「成本」
+	//   DownBar 下行收到的字节（绿）——「产出」
+	//   Latency 延迟折线（琥珀）——「体验」，色相必须与两条流量柱分开，
+	//           否则在同一张图里会被读成第三种流量。
+	// 独立字段而非直接复用 Success/Danger：暗色与亮色两套板需要不同的明度
+	// 补偿（亮底上的绿柱要更深才够对比），复用会让其中一套不可读。
+	UpBar   ui.Color
+	DownBar ui.Color
+	Latency ui.Color
 }
 
 // Dark 暗色板：solid-glass 的设计原型（中性灰玻璃）
@@ -185,6 +196,12 @@ func Dark() *Palette {
 		Success: ui.Hex("#54bf5c"), // oklch(0.72 0.17 145)
 		Danger:  ui.Hex("#ed413b"), // oklch(0.63 0.21 27)
 		Warning: ui.Hex("#f79c40"), // oklch(0.77 0.15 62)
+
+		// 图表系列（暗底）：蓝/绿/琥珀三色在 #0d0d0d 上的相对亮度接近，
+		// 谁也不抢谁的视线；饱和度都压到 0.15 上下，避免在玻璃卡上发荧光。
+		UpBar:   ui.Hex("#4c9ef0"), // oklch(0.70 0.14 250) 蓝
+		DownBar: ui.Hex("#4ec38a"), // oklch(0.76 0.13 160) 绿
+		Latency: ui.Hex("#e0a94a"), // oklch(0.79 0.12 75)  琥珀
 	}
 }
 
@@ -246,6 +263,11 @@ func Light() *Palette {
 		Success: ui.Hex("#2f9e57"), // 亮底上加深，保证对比度
 		Danger:  ui.Hex("#c9342f"),
 		Warning: ui.Hex("#b8730f"),
+
+		// 图表系列（亮底）：全部压暗一档，否则白底上会「发光」且对比不足。
+		UpBar:   ui.Hex("#2f6fb5"), // oklch(0.55 0.14 250)
+		DownBar: ui.Hex("#2f8f63"), // oklch(0.58 0.11 160)
+		Latency: ui.Hex("#96681f"), // oklch(0.56 0.10 75)
 	}
 }
 

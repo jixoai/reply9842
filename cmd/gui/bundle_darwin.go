@@ -82,6 +82,7 @@ func ensureAppBundle(version string) (target string, needed bool, err error) {
 	}
 	// 已经跑在某个 .app 里（不管是本程序建的还是用户自己打包的）就别再套一层。
 	if strings.Contains(exe, ".app/Contents/MacOS/") {
+		refreshOwnPlist(exe, version)
 		return exe, false, nil
 	}
 	home, err := os.UserHomeDir()
@@ -114,17 +115,60 @@ func ensureAppBundle(version string) (target string, needed bool, err error) {
 	return target, true, nil
 }
 
+// refreshOwnPlist 在「已经跑在 bundle 里」时刷新 Info.plist 的版本号。
+//
+// 为什么需要：自动更新替换的是 bundle 内的可执行文件，而 Info.plist 里的
+// CFBundleShortVersionString 是构建时写死的。不刷新的后果是 Finder 的「简介」、
+// 系统报告、以及 Dock 的关于窗口长期显示更新前的版本号——用户会以为更新没生效
+// （而进程的 --version 明明是新的）。
+//
+// 只在**本程序自己的 bundle 布局**上动手（可执行文件名匹配 execName），
+// 不碰用户自己打包的 .app：那些的 Info.plist 可能有签名或额外字段。
+//
+// 失败静默：版本号显示是装饰性的，不该影响启动。
+func refreshOwnPlist(exe, version string) {
+	if filepath.Base(exe) != execName {
+		return
+	}
+	contents := filepath.Dir(filepath.Dir(exe))
+	if filepath.Base(filepath.Dir(exe)) != "MacOS" {
+		return
+	}
+	_ = writeIfChanged(filepath.Join(contents, "Info.plist"),
+		[]byte(infoPlist(shortVersion(version))), 0o644)
+}
+
 // copyIfChanged 只在新源更新或大小不同时替换 bundle 里的副本。
 //
 // 为什么不能每次都覆盖：正在运行的进程映像被替换会导致后续页错误崩溃；
 // 而且每次启动重写几个 MB 纯属浪费。
+//
+// # 更新器写过的副本优先（防回滚）
+//
+// 自动更新替换的就是 bundle 副本本身（见 update.SelfPath）。此时若用户下次
+// 双击的是**下载目录里那个旧版裸二进制**，朴素比较会得出「源比副本更新」
+// （其实只是大小不同 / mtime 更晚）→ 把新副本覆盖回旧版 → 一次更新白做。
+//
+// 所以更新器在 Contents/ 写一个 .reply9842-updated 标记（cmd/gui/update.go 的
+// markBundleUpdated）。有标记时：
+//
+//	标记比源文件更新 → 跳过覆盖（副本是更新的那一份）
+//	源文件比标记更新 → 照常覆盖（用户编译/下载了更新的版本，尊重它）
+//
+// 用 mtime 比较而不是「有标记就永不覆盖」：否则开发者的 `go build` 再也
+// 送不进 bundle，本地迭代会被一个陈旧的标记卡住。
 func copyIfChanged(src, dst string) error {
 	srcInfo, err := os.Stat(src)
 	if err != nil {
 		return err
 	}
 	if dstInfo, statErr := os.Stat(dst); statErr == nil {
-		if dstInfo.Size() == srcInfo.Size() && !srcInfo.ModTime().After(dstInfo.ModTime()) {
+		stampMod := time.Time{}
+		if stamp, serr := os.Stat(filepath.Join(filepath.Dir(filepath.Dir(dst)), bundleUpdateStamp)); serr == nil {
+			stampMod = stamp.ModTime()
+		}
+		if updatedBundleBeats(srcInfo.ModTime(), stampMod) ||
+			(stampMod.IsZero() && dstInfo.Size() == srcInfo.Size() && !srcInfo.ModTime().After(dstInfo.ModTime())) {
 			return nil
 		}
 	}

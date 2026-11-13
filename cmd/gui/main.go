@@ -45,6 +45,7 @@ import (
 	"github.com/jixoai/reply9842/internal/glass"
 	"github.com/jixoai/reply9842/internal/relayclient"
 	"github.com/jixoai/reply9842/internal/stats"
+	"github.com/jixoai/reply9842/internal/update"
 )
 
 // version 由 -ldflags "-X main.version=..." 注入
@@ -138,6 +139,35 @@ type app struct {
 	// settingsErr 上次保存偏好失败的原因（nil 表示正常）
 	settingsErr error
 
+	// 自动更新偏好（持久化在 settings.json，默认关闭——自我替换有风险，
+	// 必须由用户显式打开）。
+	autoUpdate   bool
+	updateMirror string
+
+	// upd 更新会话的可见状态（阶段 / 进度 / 结果文案）。只在主线程读写。
+	//
+	// 与 runner 的状态分开：更新可以随时开始，与「relay 是否在跑」无关，
+	// 而它的生命周期（下载几分钟、替换几秒）也完全不同于每秒刷新的统计。
+	upd updateSession
+
+	// skipAutoUpdate 表示本次启动不做自动检查。
+	//
+	// 由自动更新自己重启时注入（一个仅本次有效的一次性标记）：新版起来后若
+	// 又查到同一个版本（替换没生效的病理情况），没有这个闸门就会无限重启。
+	skipAutoUpdate bool
+
+	// ---- 更新流程的注入点（测试与自动化用；生产路径永远为 nil）----
+	//
+	// 与 a.snap / a.fakeRun 同一套做法。不加这些钩子，「检查 → 下载 → 替换 →
+	// 重启」整条链路就只能靠真下载真替换来验证——那会毁掉跑测试的机器。
+	asyncFn    func(func())
+	mainFn     func(func())
+	checkFn    func(context.Context, update.Options) (update.Info, error)
+	downloadFn func(context.Context, update.Options, update.Info) (string, error)
+	applyFn    func(update.Options, string, string) (string, error)
+	selfPathFn func() (string, error)
+	relaunchFn func([]string)
+
 	// quitting 已进入退出流程。托盘/Dock 的「显示窗口」在退出途中不该再建窗。
 	quitting bool
 
@@ -185,6 +215,12 @@ func main() {
 	// 「启动后立即转发」）。登录项用的是双横线 --autostart，两者互不干扰。
 	startAlias := flag.Bool("autostart", false, "与 -start 相同（旧名字，保留兼容）")
 	light := flag.Bool("light", false, "使用亮色玻璃（默认深色）")
+	// 自动更新自己重启时注入的一次性标记：本次启动不再检查更新。
+	//
+	// 不用环境变量（bundle 的 re-exec 会转发 argv，但 launchd 启动不会），
+	// 也不用持久状态：它要表达的只是「这一次」。把同一个 flag 从 argv 里摘掉
+	// 由 update.RestartArgsFrom 的 exclude 完成（见 restoreArgs 的调用方）。
+	noAutoUpdate := flag.Bool("no-auto-update", false, "本次启动不检查更新（自动更新重启时内部使用）")
 	// 时间跨度覆盖（自动化截图、临时放大窗口用）。0 = 用 settings.json 里的值；
 	// 时间跨度覆盖（自动化截图、临时放大窗口用）。0 = 用 settings.json 里的值。
 	//
@@ -194,7 +230,7 @@ func main() {
 	window := flag.Duration("window", 0, "本次运行的图表显示区间（覆盖设置页：1m|5m|30m|1h|6h|24h）")
 	flag.Parse()
 	if *printVersion {
-		fmt.Printf("relay-gui %s\n", version)
+		fmt.Println(versionLine(version))
 		return
 	}
 	// macOS：裸二进制没有 bundle，Dock 只会显示通用黑色方块。首次 GUI 启动时
@@ -205,6 +241,30 @@ func main() {
 	// 位置很关键：要在 flag.Parse 之后（--version 这类纯命令行用法不该产生
 	// 副作用）、建窗口之前（窗口一旦创建就绑定了当前进程身份）。
 	if relaunchIntoBundleIfNeeded(version) {
+		return
+	}
+	// Windows 的延迟替换：上次更新因目标被占用而降级成「待应用」时，在这里补完。
+	//
+	// 位置与理由（与 bundle re-exec 同一类约束）：
+	//   - 必须在 flag.Parse 之后（--version 不该有副作用）
+	//   - 必须在跑在 bundle 副本之后（要替换的是「下次启动会执行的那个文件」，
+	//     macOS 上它是副本）
+	//   - 必须远早于建窗口：替换完成后内存里跑的还是旧映像，必须立刻重新 exec，
+	//     否则用户看到的版本号与磁盘不一致，且下次替换会撞同一个问题
+	//
+	// 只在 Windows 上真的可能返回 applied=true；其它平台这个调用是一次 stat。
+	if applied, err := update.ApplyPendingIfAny(selfPathOrEmpty()); err != nil {
+		logRing.Write([]byte("待应用的更新未能完成：" + err.Error() + "\n"))
+	} else if applied {
+		// 替换已经完成 → 立刻以新映像重启。这一步不能省：内存里跑的还是旧映像，
+		// 不重启会让用户看到的版本号与磁盘不一致，且下次替换撞同一个问题。
+		//
+		// 此刻还**没有**取单实例锁（那在下面），所以直接 spawn 是安全的，
+		// 不需要先释放锁——这正是它必须放在 RequestSingleInstanceLock 之前的原因。
+		logRing.Write([]byte("已应用待替换的更新，正在重启\n"))
+		if err := spawnSelfRestarted(); err != nil {
+			logRing.Write([]byte("重启失败，请手工启动：" + err.Error() + "\n"))
+		}
 		return
 	}
 	cfg.Listen, cfg.Server, cfg.Transport = *listen, *server, *transport
@@ -230,17 +290,20 @@ func main() {
 	cfg.Retain, cfg.Window = st.Retain(), st.Window()
 
 	a := &app{
-		logs:         logRing,
-		listen:       cfg.Listen,
-		server:       cfg.Server,
-		transport:    cfg.Transport,
-		serverName:   cfg.ServerName,
-		localAddr:    cfg.LocalAddr,
-		insecure:     cfg.Insecure,
-		pal:          pal,
-		retainIdx:    relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
-		windowIdx:    relayclient.OptionIndex(st.Window(), relayclient.WindowOptions),
-		settingsPath: settingsPath,
+		logs:           logRing,
+		listen:         cfg.Listen,
+		server:         cfg.Server,
+		transport:      cfg.Transport,
+		serverName:     cfg.ServerName,
+		localAddr:      cfg.LocalAddr,
+		insecure:       cfg.Insecure,
+		pal:            pal,
+		retainIdx:      relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
+		windowIdx:      relayclient.OptionIndex(st.Window(), relayclient.WindowOptions),
+		settingsPath:   settingsPath,
+		autoUpdate:     st.AutoUpdate,
+		updateMirror:   st.UpdateMirror,
+		skipAutoUpdate: *noAutoUpdate,
 	}
 	a.runner = relayclient.New(cfg)
 	a.runner.SetLogger(logger)
@@ -291,11 +354,22 @@ func main() {
 		if login || *startNow || *startAlias {
 			a.start()
 		}
+		// 自动更新：只在用户打开开关、且不是被自己重启起来的这次启动时检查。
+		//
+		// 放在 WhenReady 的最后：检查要发网络请求，而窗口与托盘应该先出现——
+		// 让用户先看到界面，而不是盯着一个空窗口等 GitHub 的响应。
+		a.maybeAutoUpdate()
 	})
 
 	// 退出流程开始：先标记，挡住退出途中冒出来的「显示窗口」
 	mygo.App.OnBeforeQuit(func(e *mygo.QuitEvent) {
 		a.quitting = true
+		// 更新正在进行时退出：立刻取消后台下载/校验。
+		//
+		// 这个顺序不能反：替换（Apply）是原子 rename，被中断只会留下 .new 与
+		// 备份，目标文件完好；而下载的 ctx 若不取消，进程退出会留下一个半截
+		// .part（下次能续传，但白占磁盘）。所以在关监听之前先停下载。
+		a.cancelUpdateQuietly()
 		// 系统要关机/注销：从这里返回后进程可能立刻没了，别做 5 秒排空
 		// （那会把 logout 拖住）。监听端口随进程一起消失，无需善后。
 		if e.SessionEnding {
@@ -327,6 +401,23 @@ func main() {
 		fmt.Fprintln(os.Stderr, "mygo:", err)
 		os.Exit(1)
 	}
+}
+
+// versionLine 是 `--version` 输出的那一行。
+//
+// 必须含产品名 `reply9842`：自动更新的自检（internal/update 的 selfCheck）
+// 用它拦「下载到了别的产品的二进制」——只验退出码的话，一个被替换成 /bin/true
+// 的产物也会通过。
+//
+// 这里曾经只打 `relay-gui <ver>`，于是**每一次真实更新都会在替换前中止**
+// （「新二进制自检失败：输出里没有产品标识」）。这是端到端实测抓到的：
+// 真下载 v0.2.1 的产物 → 沙箱 Apply → ErrSelfCheck。
+//
+// 保留 relay-gui 前缀（INSTALL.md 与用户既有习惯），把产品名放进括号：
+// 一行输出同时满足「人读得懂」与「机器认得出」。抽成函数是为了让测试断言的是
+// 这一段真实代码，而不是在测试里重抄一遍格式串。
+func versionLine(v string) string {
+	return fmt.Sprintf("relay-gui %s (reply9842)", v)
 }
 
 // envLogin 把「本次是登录启动」这个事实传给 bundle 副本。
@@ -458,21 +549,34 @@ func (a *app) createWindow() {
 		Title: "reply9842",
 		// 480×496。
 		//
-		// 560×640。
+		// 560×660。
 		//
 		// 2026-11-13 owner 要求「默认窗口做大一点，底部就不用两栏、合并成一栏」，
 		// 同时面板要放两张图。这两个要求一起决定了尺寸：
 		//
 		//  1. 高度：顶栏 48 + 主图(最小 110 + 卡片装饰 56) + 副图(88 + 56)
-		//     + 底栏 32 + 上下内边距 26 + 卡片间距 ≈ 610，取 640 留余量。
-		//     底部两栏合并成一栏后省了约 32px，正好抵掉副图的额外开销。
+		//     + 底栏 32 + 上下内边距 26 + 卡片间距 ≈ 610。
 		//  2. 宽度：两张图的纵轴标签列（34px）+ 绘图区在 480 宽时只剩约 370，
 		//     48 根柱子每根不到 8px，堆叠柱会糊成一片。560 让单柱约 9.5px。
 		//     560 也是「不再是手机比例」的下限，桌面应用该有的样子。
 		//
+		// # 为什么从 640 加到 660（同日设置页多了三行更新配置）
+		//
+		// 不是拍的，是量出来的（ui.Tester 无界高度渲染后逐元素取底边）：
+		//
+		//	设置页空闲                        内容底 518 → 需要 ≈561
+		//	设置页运行中                      内容底 568 → 需要 ≈611
+		//	运行中 + 两行更新错误              内容底 568 → 需要 ≈611
+		//	运行中 + 两行更新错误 + 两行保存失败提示
+		//	                                  内容底 611 → 需要 ≈654  ← 640 时被 footer 压住
+		//
+		// 最后一行是唯一超出 640 的组合，而它恰好是「更新失败、设置也存不下来」
+		// 时用户最需要读到的那句话。加 20 让最坏情况仍有余量；面板 tab 多出的
+		// 高度由主图 Grow(1) 吃掉，不损失任何东西。
+		//
 		// 主图 Grow(1) 吃满剩余高度，副图定高 88——窗口继续拉高时变高的是主图。
 		Width:  560,
-		Height: 640,
+		Height: 660,
 		// 窗口可以拉大，但别小到把顶栏右侧那一簇挤成两行（顶栏靠收起应用名
 		// 兜到 468，见 titleBar 的 showName）。
 		MinWidth: 440,
@@ -633,6 +737,28 @@ func (a *app) copyFlashing() bool {
 	return !a.copiedAt.IsZero() && time.Since(a.copiedAt) < copyFlash
 }
 
+// currentSettings 把 app 上的全部偏好收成一个 Settings（写盘与「写后读回」共用）。
+//
+// 存在的理由：偏好现在有 4 个来源不同的状态（两个下拉的档位下标、一个开关、
+// 一个文本框），任何一处漏写都会在下次启动时悄悄退回默认值——那类 bug 用户
+// 只会描述成「设置没保存」。
+func (a *app) currentSettings() relayclient.Settings {
+	retain := relayclient.RetainOptions[clampIndex(a.retainIdx, len(relayclient.RetainOptions))]
+	window := relayclient.WindowOptions[clampIndex(a.windowIdx, len(relayclient.WindowOptions))]
+	return relayclient.Settings{
+		RetainSec:    int64(retain / time.Second),
+		WindowSec:    int64(window / time.Second),
+		AutoUpdate:   a.autoUpdate,
+		UpdateMirror: strings.TrimSpace(a.updateMirror),
+	}
+}
+
+// saveSettings 落盘（失败记在 settingsErr 并返回，调用方决定怎么提示）。
+func (a *app) saveSettings() error {
+	a.settingsErr = relayclient.SaveSettings(a.settingsPath, a.currentSettings())
+	return a.settingsErr
+}
+
 // applyTimeSettings 把两个下拉的选择写盘并立刻生效。
 //
 // 顺序：先收敛约束 → 写文件 → 通知 Runner 重算。
@@ -653,11 +779,9 @@ func (a *app) applyTimeSettings() {
 		a.setNotice("显示区间不能超过日志保留时长（"+humanWindow(int(retain/time.Second))+"），已按上限设置", true)
 	}
 
-	a.settingsErr = relayclient.SaveSettings(a.settingsPath, relayclient.Settings{
-		RetainSec: int64(retain / time.Second),
-		WindowSec: int64(window / time.Second),
-	})
-	if a.settingsErr != nil {
+	// 两个时间跨度与更新偏好共用一份文件，所以这里也必须把更新字段一并写进去
+	// （currentSettings 已包含它们）——否则调一次下拉就会把开关状态冲掉。
+	if err := a.saveSettings(); err != nil {
 		a.setNotice("保存设置失败："+a.settingsErr.Error(), true)
 	}
 

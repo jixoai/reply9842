@@ -18,4 +18,11 @@
 
 # 图标构建的中间产物（iconset 十张 PNG 只是制作过程，最终只留 .icns）
 /cmd/gui/assets/AppIcon.iconset/
+
+# `go build ./cmd/<kind>` 在仓库根产出与目录同名的二进制。
+# 2026-11-13 实测：跑一次 `go build ./cmd/gui` 直接在工作区留下 21MB 的 `gui`，
+# git status 显示为未跟踪文件——差点被 `git add -A` 卷进提交（本项目已有同类
+# 事故先例：opentray 发布时 -A 卷入工具副产物）。
+/cli
+/gui
 /server

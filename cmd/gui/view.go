@@ -965,23 +965,24 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 
 // ---- 设置 tab ----
 
-// settingsPane 「设置」tab：连接配置（上游 / 监听 / 传输方式 / 开机自启）
-// + 统计显示（日志保留 / 显示区间）。
+// settingsPane 「设置」tab：两个视觉分区（连接 / 其他），仍在**一张**卡片里。
 //
-// 拆成两张卡（2026-11-13）：上一版把它们塞进同一张卡，于是「运行中不可修改」
-// 那句提示横跨两张内容——可两个时间跨度根本不碰监听，运行中改它们完全安全
-// （只影响读盘范围与分桶粒度）。一张卡会逼出一个错误的全局约束，两张卡各自
-// 说自己的前置条件才准确。
+// 分组是需求（owner：「设置页内两个分区，不用滚」）。做法上刻意**不**拆成两张
+// 卡片：上一版拆过一次，两张卡各自的圆角、内边距与卡间距吃掉约 40px，正好把
+// 最后一行「显示区间」顶出 400px 窗口的可视区（见本文件历史）。
+//
+// 现在用「组标题 + 组间加高间隙」表达分区：
+//
+//	连接  上游地址 / 服务器域名 / 源地址 / 监听地址 / 传输方式
+//	其他  开机自启 / 日志保留 / 显示区间 / 自动更新 / 更新镜像 / 软件更新
+//
+// 组标题本身只有一行 11px 文字（约 26px 含上下留白），比一张卡的装饰开销小一个
+// 数量级；卡片的厚度语义也保持单层，不会读成「两张卡上下堆着」。
 func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 	running := a.running()
 
-	// 一张卡装全部 7 行，不拆成两张。
-	//
-	// 曾经拆成「连接设置」+「统计跨度」两张卡，理由是两类设置的前置条件不同
-	// （前者运行中不可改，后者随时可改）。但拆开后两张卡的圆角、内边距、卡间
-	// 间距吃掉了约 40px，在 400px 的窗口里正好把最后一行「显示区间」顶出可视区。
-	// 前置条件的差异用一句提示说清就够了，不值得用一整张卡的面积来换。
 	glass.Surface(ui.Column(c).Padding(3, 14, 6), p, glass.Card).Children(func() {
+		a.groupTitle(c, p, "连接", true)
 		a.configField(c, p, "上游地址", &a.server, relayclient.DefaultServer, running)
 		a.configRule(c, p)
 		// TLS SNI：用 IP 连服务器时必须填证书上的域名，否则 x509 校验失败
@@ -999,18 +1000,25 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		a.configField(c, p, "监听地址", &a.listen, relayclient.DefaultListen, running)
 		a.configRule(c, p)
 		a.transportRow(c, p, running)
-		a.configRule(c, p)
+
+		a.groupTitle(c, p, "其他", false)
 		a.autoStartRow(c, p)
+		a.configRule(c, p)
 		// 两个时间跨度不碰监听，运行中改也安全：它们的提示在各自行内，
 		// 不参与下面那句「先停止再改」。
-		a.configRule(c, p)
 		a.retainRow(c, p)
 		a.configRule(c, p)
 		a.windowRow(c, p)
+		a.configRule(c, p)
+		a.autoUpdateRow(c, p)
+		a.configRule(c, p)
+		a.mirrorRow(c, p)
+		a.configRule(c, p)
+		a.updateRow(c, p)
 	})
 
 	// 运行中不可改：说清「为什么点不动」+「怎么做」，而不是让输入框静静失效。
-	// 只针对上面那五个「连接类」字段——统计跨度随时可改。
+	// 只针对上面那五个「连接类」字段——统计跨度与更新偏好随时可改。
 	if running {
 		ui.Row(c).AlignItems(ui.Center).Gap(6).Children(func() {
 			ui.Text(c, "连接设置在运行中不可修改，先停止再改").
@@ -1020,6 +1028,31 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 			}
 		})
 	}
+}
+
+// groupTitle 设置卡内的分区标题（分隔靠「标题 + 上方加高留白」，不靠第二张卡）。
+//
+// 只有 11px 文字 + 少量留白（不做背景块、不加边框）：分区要在扫视时被认出来，
+// 而不是被读成一张新卡片。
+//
+// # 为什么颜色是 Foreground 而不是 MutedForeground
+//
+// 行标签（「上游地址」这些）用的就是 MutedForeground + 11px，字号与色相都和
+// 分区标题一样，只差字重——实测截图里「连接」「其他」读起来就是两个额外字段名，
+// 分组等于没有（判读依据：分组的落点找不到「停一下」的视觉重量差）。
+//
+// 换成 Foreground（卡片里除输入值以外最亮的一档）之后标题在层级上确实高于行
+// 标签，读者先看到「连接」再往下读字段。同时给首组之外的标题加 14 的顶部留白：
+// 留白比加一条发丝线更能表达「换了一组」——那个位置本来就已经有一条行间线，
+// 再加一条同色的只会读成又多了一行。
+func (a *app) groupTitle(c *ui.Context, p *glass.Palette, text string, first bool) {
+	top, bottom := float32(14), float32(5)
+	if first {
+		top, bottom = 4, 4
+	}
+	ui.Text(c, text).FontSize(11).FontWeight(620).LetterSpacing(0.8).
+		TextColor(p.Foreground).SingleLine().
+		Padding(top, 0, bottom, 0)
 }
 
 // retainRow 日志保留时长：磁盘上留多久的数据（同时决定重启重建的扫描范围）。
