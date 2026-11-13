@@ -257,15 +257,27 @@ jobs:
       - name: Upgrade npm (Trusted Publishing 需要 CLI 11+)
         run: npm install -g npm@latest
 
+      - name: OIDC preconditions
+        # 诊断：npm 的 oidc() 在四个前置条件失败时静默 return undefined，
+        # 最终表现为 ENEEDAUTH。先把这些条件逐个打印出来。
+        run: |
+          echo "npm version: $(npm --version)"
+          echo "ACTIONS_ID_TOKEN_REQUEST_URL set: ${ACTIONS_ID_TOKEN_REQUEST_URL:+yes}"
+          echo "ACTIONS_ID_TOKEN_REQUEST_TOKEN set: ${ACTIONS_ID_TOKEN_REQUEST_TOKEN:+yes}"
+          echo "GITHUB_ACTIONS: ${GITHUB_ACTIONS:-unset}"
+          echo "NODE_AUTH_TOKEN: ${NODE_AUTH_TOKEN:-unset}"
+          echo "--- npmrc ---"
+          cat ~/.npmrc 2>/dev/null || echo "(no ~/.npmrc)"
+          cat .npmrc 2>/dev/null || echo "(no ./.npmrc)"
+          echo "--- registry ---"
+          npm config get registry
+
       - name: Publish via OIDC
         working-directory: npm
-        # Trusted Publishing：npm CLI 11+ 用 Actions 的 id-token 换短期凭证，
-        # 自动生成 provenance。必须确保环境里没有 NODE_AUTH_TOKEN——一旦存在，
-        # npm 优先用它做 Basic Auth，OIDC 不生效（实测 E404）。
-        env:
-          NODE_AUTH_TOKEN: ""
-          NPM_CONFIG_PROVENANCE: "true"
+        # Trusted Publishing：npm CLI 11+ 用 Actions 的 id-token 换短期凭证。
+        # 关键：环境里绝不能有 NODE_AUTH_TOKEN（哪怕是空串）——npm 会认为
+        # 已有凭据配置，OIDC 分支被跳过，最后报 ENEEDAUTH。
         run: |
-          unset NODE_AUTH_TOKEN || true
           rm -f ~/.npmrc .npmrc 2>/dev/null || true
-          npm publish --provenance --access public
+          echo "NODE_AUTH_TOKEN=${NODE_AUTH_TOKEN:-unset}"
+          npm publish --provenance --access public --loglevel verbose
