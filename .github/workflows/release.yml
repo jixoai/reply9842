@@ -157,14 +157,41 @@ jobs:
       - name: Self-check binaries
         run: |
           set -euo pipefail
-          # 每一类至少能在本机跑（跨架构的用 file 检查格式）
-          ./dist/cli-darwin-arm64 version
+          set -euo pipefail
+          # 自检分两层：
+          #  1) 格式层——全部 13 个产物都用 file 看一遍，确认架构/子系统正确
+          #  2) 执行层——只跑「宿主平台 + 宿主架构」那一份
+          #
+          # 第 2 层不能写死 cli-darwin-arm64：pick-runner 回退到 ubuntu-latest
+          # 时那是个 Mach-O，Linux 执行会报 Exec format error（exit 126），
+          # 而这一步排在发 Release 之前，会连带挡掉整个发版。2026-11-13 实证。
           for f in dist/*; do
             file "$f" | sed 's/^/  /'
           done
+
           # GUI 的 Windows 产物必须是 GUI 子系统
           file dist/gui-windows-amd64.exe | grep -q "GUI" \
             || { echo "gui-windows 不是 GUI 子系统"; exit 1; }
+
+          # 找一份能在本机直接执行的 cli 产物
+          case "$(uname -s)" in
+            Darwin) host_os=darwin ;;
+            Linux)  host_os=linux ;;
+            *)      host_os=unknown ;;
+          esac
+          case "$(uname -m)" in
+            arm64|aarch64) host_arch=arm64 ;;
+            x86_64|amd64)  host_arch=amd64 ;;
+            *)             host_arch=unknown ;;
+          esac
+          host_bin="dist/cli-${host_os}-${host_arch}"
+          if [ -x "$host_bin" ]; then
+            echo "执行自检: $host_bin"
+            "$host_bin" version
+          else
+            echo "宿主 ${host_os}/${host_arch} 没有对应的 cli 产物，跳过执行层自检"
+            echo "（格式层已全部检查）"
+          fi
 
       - name: Upload artifacts (给 npm job 用)
         if: startsWith(github.ref, 'refs/tags/v')
