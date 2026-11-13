@@ -197,6 +197,11 @@ jobs:
     needs: build
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: ubuntu-latest
+    # 必须与 npmjs.com 上 Trusted Publisher 的 Environment name 完全一致。
+    # GitHub 的 OIDC token 里带 environment claim，npm 用它匹配 Trusted
+    # Publisher 配置；job 不声明 environment 时该 claim 为空，匹配失败的表现
+    # 是 404「package not found」（而不是权限错误，极具迷惑性）。
+    environment: npm-publish
     permissions:
       contents: read
       # OIDC 发布必需：npm 用这个令牌换短期凭证
