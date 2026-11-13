@@ -15,6 +15,10 @@
 mkdir -p certs
 cp /etc/letsencrypt/live/example.com/fullchain.pem certs/
 cp /etc/letsencrypt/live/example.com/privkey.pem certs/
+# 容器内以 UID 65532 运行：私钥必须让这个 UID 读得到。
+# 只 chmod 600 不够——属主还是 root，容器会报
+#   listen: load cert: open /certs/privkey.pem: permission denied
+chown 65532:65532 certs/privkey.pem certs/fullchain.pem
 chmod 600 certs/privkey.pem
 ```
 

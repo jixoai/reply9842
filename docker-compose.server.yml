@@ -3,6 +3,8 @@
 #   docker compose -f docker-compose.server.yml up -d
 #
 # 前置：把 TLS 证书放进 ./certs/（fullchain.pem + privkey.pem）。
+# 容器以 UID 65532 运行，私钥要让它读得到：
+#   chown 65532:65532 certs/privkey.pem certs/fullchain.pem && chmod 600 certs/privkey.pem
 # 证书必须是客户端信任的域名证书（客户端用 -server-name 校验），
 # 自签证书需要客户端加 -insecure。
 services:

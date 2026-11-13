@@ -513,7 +513,9 @@ jobs:
           img="ghcr.io/${{ github.repository }}-server:latest"
           docker pull "$img"
 
-          if docker run --rm --entrypoint /reply9842-server "$img" 2>&1 | grep -q "必须提供 -cert 与 -key"; then
+          # 必须把 -cert/-key 显式传空：--entrypoint 只覆盖 ENTRYPOINT，
+          # 镜像的 CMD 仍会作为参数追加进来，于是「不带参数」根本测不到。
+          if docker run --rm --entrypoint /reply9842-server "$img" -cert "" -key "" 2>&1 | grep -q "必须提供 -cert 与 -key"; then
             echo "✓ 参数校验生效"
           else
             echo "❌ 参数校验没触发" >&2
@@ -525,6 +527,8 @@ jobs:
           openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
             -subj "/CN=localhost" -addext "subjectAltName=DNS:localhost,IP:127.0.0.1" \
             -keyout "$workdir/key.pem" -out "$workdir/cert.pem" 2>/dev/null
+          # 容器里是 UID 65532：临时证书必须让它读得到（生产部署同理，见 DEPLOY.md）
+          chmod 644 "$workdir/key.pem" "$workdir/cert.pem"
           docker run -d --name r9842-smoke \
             -v "$workdir/cert.pem:/certs/fullchain.pem:ro" \
             -v "$workdir/key.pem:/certs/privkey.pem:ro" \
