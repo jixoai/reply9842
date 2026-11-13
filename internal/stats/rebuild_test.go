@@ -35,7 +35,9 @@ func writeRecords(t *testing.T, path string, at time.Time, recs []Record) {
 // 第二个 Collector 从同一个目录重建。断言的是「数字一模一样」。
 func TestRebuildFromDisk(t *testing.T) {
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "client-2026-11-13.jsonl")
+	// 文件名必须用「今天」：daily 模式下 openLogLocked 会把 logPath 重指到
+	// dailyPath(time.Now())，写死日期会让测试在第二天直接指向另一个文件。
+	logPath := filepath.Join(dir, "client-"+time.Now().Format("2006-01-02")+".jsonl")
 	statsPath := filepath.Join(dir, "client-stats.json")
 
 	recs := []Record{
@@ -264,7 +266,9 @@ func TestRetainPrunesOldDailyFiles(t *testing.T) {
 // 用 Retain=1 分钟 + 手写超过阈值的文件来触发（真实 32MB 太慢）。
 func TestCompactDropsOldLines(t *testing.T) {
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "client-2026-11-13.jsonl")
+	// 文件名必须用「今天」：daily 模式下 openLogLocked 会把 logPath 重指到
+	// dailyPath(time.Now())，写死日期会让测试在第二天直接指向另一个文件。
+	logPath := filepath.Join(dir, "client-"+time.Now().Format("2006-01-02")+".jsonl")
 	now := time.Now()
 
 	// 老记录：2 小时前，保留 1 分钟时全部该被删
@@ -442,7 +446,9 @@ func TestCompactReal32MB(t *testing.T) {
 		t.Skip("short 模式跳过（要写 33MB）")
 	}
 	dir := t.TempDir()
-	logPath := filepath.Join(dir, "client-2026-11-13.jsonl")
+	// 文件名必须用「今天」：daily 模式下 openLogLocked 会把 logPath 重指到
+	// dailyPath(time.Now())，写死日期会让测试在第二天直接指向另一个文件。
+	logPath := filepath.Join(dir, "client-"+time.Now().Format("2006-01-02")+".jsonl")
 	now := time.Now()
 
 	f, err := os.Create(logPath)
