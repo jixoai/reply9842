@@ -111,7 +111,7 @@ Agent 完全无感：只是把 `base_url` 指向 `http://127.0.0.1:18899`。
 ### 1. 服务端（部署在能直连上游的那台机器）
 
 ```bash
-go build -o relay-server ./cmd/relay-server
+go build -o relay-server ./cmd/server
 
 ./relay-server \
   -listen 0.0.0.0:28443 \

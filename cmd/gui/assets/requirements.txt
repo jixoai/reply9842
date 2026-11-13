@@ -1,0 +1,3 @@
+# 图标构建的 Python 依赖（make_icons.sh 调用 Pillow 合成 .ico 与预览图）。
+# 系统 python3 可能受 PEP 668 保护，建议用 venv 或 uv 安装。
+Pillow>=10

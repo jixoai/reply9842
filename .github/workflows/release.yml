@@ -88,6 +88,20 @@ jobs:
           fi
           echo "version=$v" >> "$GITHUB_OUTPUT"
 
+      # Windows 的图标与版本信息只能经 PE 资源段进入 exe，而 Go 只认同目录下
+      # 的 *.syso。该文件已入库（图标是稳定资产）；但版本号是构建期的，tag
+      # 构建必须用当次 VERSION 重新生成一次，否则 exe 属性里的版本会永远停在
+      # 入库那一刻。图标本身不依赖这一步——重新生成只是重打包同一个 .ico。
+      - name: Generate Windows resources
+        if: matrix.kind == 'gui' && matrix.os == 'windows'
+        env:
+          VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          go install github.com/tc-hib/go-winres@latest
+          export PATH="$(go env GOPATH)/bin:$PATH"
+          ./cmd/gui/make_winres.sh
+
       - name: Build
         env:
           GOOS: ${{ matrix.os }}

@@ -31,10 +31,10 @@ func sendReq(t *testing.T, c *transport.Conn, key [32]byte, body, path string) {
 	copy(mh[:], key[:])
 	h := &meta.RequestHead{
 		Method: "POST", Path: path,
-		Encoding:   meta.EncIdentity,
-		ResultHash: toMetaHash(codec.Sum([]byte(body))),
-		BodyLen:    int64(len(body)),
-		IdemKey:    mh,
+		Encoding:       meta.EncIdentity,
+		ResultHash:     toMetaHash(codec.Sum([]byte(body))),
+		BodyLen:        int64(len(body)),
+		IdemKey:        mh,
 		AcceptDownZstd: true,
 	}
 	hdr := meta.EncodeHeaders(map[string][]string{"Content-Type": {"application/json"}})

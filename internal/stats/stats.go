@@ -38,6 +38,35 @@ type Record struct {
 	Err       string  `json:"err,omitempty"`
 }
 
+// 时间序列的窗口：最近 30 分钟，按分钟聚合 = 30 个桶。
+//
+// 为什么是分钟而不是秒：实测日志（14.5 小时 / 1124 条请求）里，最近 30 分钟
+// 只有 46 个请求、18 个非空分钟。按秒聚合时 60 秒内常常只有 1-2 个请求，
+// 柱子稀稀落落到读不出任何趋势；按分钟聚合同样这 46 个请求会落进 18 根
+// 柱子，形状立刻清楚。
+//
+// 为什么是 30 分钟而不是更长：这是「刚才那一段」与「今天的全貌」之间的
+// 折中——足够看出一次任务（agent 连续跑几十个请求）的起伏，又短到不需要
+// 横轴刻度（左端就是半小时前）。
+const (
+	SeriesSeconds = 30 * 60
+	SeriesBuckets = 30
+	// SeriesBucket 每个桶覆盖的时长（秒）
+	SeriesBucket = SeriesSeconds / SeriesBuckets // 60 秒 = 1 分钟
+)
+
+// Bucket 一个时间桶里的上行体积（每桶 SeriesBucket 秒 = 1 分钟）。
+//
+// 为什么按时间桶而不是「按请求」：请求的到达是不均匀的（空转几分钟后突然
+// 一串），按请求画会让横轴撒谎——它看起来像匀速，实际是突发的。
+type Bucket struct {
+	// At 桶的起点（整秒），便于调用方判断这一桶是否落在自己的时间窗里。
+	At     time.Time `json:"at"`
+	UpRaw  int64     `json:"up_raw"`
+	UpWire int64     `json:"up_wire"`
+	Count  int64     `json:"count"`
+}
+
 // Agg 汇总视图
 type Agg struct {
 	StartedAt  string           `json:"started_at"`
@@ -61,6 +90,13 @@ type Agg struct {
 	Statuses   map[int]int64    `json:"statuses"`
 	Encodings  map[string]int64 `json:"encodings"`
 	Transport  map[string]int64 `json:"transport"`
+
+	// Series 最近一分钟的按秒分桶（旧 → 新），只给进程内的图表用。
+	//
+	// json:"-" 是有意的：这个字段每秒都在变，写进 client-stats.json 只会
+	// 让那份快照变得又大又无意义（回看历史的人要的是总量，不是最后一分钟的
+	// 秒级细节；秒级细节在 jsonl 里逐条都有）。
+	Series []Bucket `json:"-"`
 }
 
 // Collector 采集器
@@ -70,6 +106,14 @@ type Collector struct {
 	recent    []*Record
 	logPath   string
 	statsPath string
+
+	// series 是最近 30 分钟的分桶，环形复用：下标 = (Unix 秒 / 桶秒数) % SeriesBuckets。
+	//
+	// 为什么在内存里攒而不是回头读 jsonl：图表每秒要一次，读文件是 IO + 解析
+	// 一整天的日志；而这里的数据本来就都在 Observe 的入参里，顺手记一笔即可。
+	// 为什么复用固定长度而不是 append：桶数固定，长度天然有界，
+	// 不需要淘汰逻辑（槽位上的 At 对不同就说明它过期了）。
+	series [SeriesBuckets]Bucket
 
 	logFile *os.File
 }
@@ -115,10 +159,12 @@ func (c *Collector) Observe(r *Record) {
 	defer c.mu.Unlock()
 
 	r.Time = time.Now().Format(time.RFC3339Nano)
+	now := time.Now()
 	c.recent = append(c.recent, r)
 	if len(c.recent) > 500 {
 		c.recent = c.recent[len(c.recent)-500:]
 	}
+	c.bucketLocked(now, r)
 
 	a := c.agg
 	a.Requests++
@@ -200,7 +246,51 @@ func (c *Collector) Snapshot() Agg {
 	out.Statuses = cloneIntMap(c.agg.Statuses)
 	out.Encodings = cloneStrMap(c.agg.Encodings)
 	out.Transport = cloneStrMap(c.agg.Transport)
+	out.Series = c.seriesLocked(time.Now())
 	return out
+}
+
+// bucketLocked 把一次请求记进它所属的桶（c.mu 必须已持有）。
+func (c *Collector) bucketLocked(now time.Time, r *Record) {
+	at := bucketStart(now)
+	slot := &c.series[int(at.Unix()/SeriesBucket)%SeriesBuckets]
+	if !slot.At.Equal(at) {
+		// 槽位上躺的是同一圈之前的旧桶（或者从未写过）：整槽重置。
+		// 这一步就是「环形」的全部逻辑——不需要清空整个数组。
+		*slot = Bucket{At: at}
+	}
+	slot.UpRaw += r.UpRaw
+	slot.UpWire += r.UpWire
+	slot.Count++
+}
+
+// seriesLocked 取最近 SeriesBuckets 个桶，旧 → 新，长度恒为 SeriesBuckets。
+//
+// 槽位是「桶序号取模」，所以从最后一个桶往前逐桶回读，就自动得到正确顺序——
+// 不需要排序，也不会因为跨过数组边界而错位。空桶返回 UpRaw=0（而不是跳过），
+// 这样横轴的时间间隔是恒定的：空转期在图上是可见的空白，而不是被压缩掉的假密度。
+func (c *Collector) seriesLocked(now time.Time) []Bucket {
+	last := bucketStart(now)
+	out := make([]Bucket, SeriesBuckets)
+	for i := range out {
+		at := last.Add(time.Duration(i-(SeriesBuckets-1)) * SeriesBucket * time.Second)
+		b := c.series[int(at.Unix()/SeriesBucket)%SeriesBuckets]
+		if b.At.Equal(at) {
+			out[i] = b
+		} else {
+			out[i] = Bucket{At: at}
+		}
+	}
+	return out
+}
+
+// bucketStart 把时刻对齐到它所属桶的起点。
+//
+// 保留本地时区：Bucket.At 会进图表的调试输出，也可能被调用方拿去显示，
+// 用 UTC 会让「14:23:46 +08:00」变成「06:23:46」，对比日志时容易误判。
+func bucketStart(t time.Time) time.Time {
+	sec := t.Unix() / SeriesBucket * SeriesBucket
+	return time.Unix(sec, 0).In(t.Location())
 }
 
 func cloneStrMap(m map[string]int64) map[string]int64 {

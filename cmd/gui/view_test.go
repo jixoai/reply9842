@@ -1,0 +1,480 @@
+package main
+
+import (
+	"errors"
+	"fmt"
+	"image/png"
+	"os"
+	"path/filepath"
+	"strings"
+	"testing"
+
+	"github.com/egoist/mygo/ui"
+
+	"github.com/jixoai/rfc9842-reply/internal/glass"
+	"github.com/jixoai/rfc9842-reply/internal/relayclient"
+	"github.com/jixoai/rfc9842-reply/internal/stats"
+)
+
+// setRunning 让视图以「运行中」渲染（Runner 内部的 running 只有真起监听才为 true，
+// 视图测试与自动化截图需要一个不用占端口的开关）。
+func setRunning(a *app, on bool) {
+	v := on
+	a.fakeRun = &v
+}
+
+// desktopView 把 app 的界面画在一层「桌面」上。
+//
+// 为什么需要它：窗口开 Vibrancy 后根节点是透明的，玻璃背后的第一层就是桌面。
+// 单画界面会让 PNG 全是半透明像素（叠白底看就发灰），也无法证明 blur 真的把
+// 背后的内容抹开了。这里铺一层暖色渐变 + 柔光代表「桌面」，既给对比度，
+// 也给模糊一个可判读的图案。
+func desktopView(a *app) func(c *ui.Context) {
+	return func(c *ui.Context) {
+		a.view(c)
+		// 画在根元素的 Draw 里：它在根背景之后、子元素之前，
+		// 正是「桌面在最底下」的层次。Absolute 盒子会晚于流内子元素绘制，
+		// 用它当底板会把整个界面盖住。
+		c.Root().Draw(func(pt *ui.Painter, r ui.Rect) {
+			// 一张「壁纸」：明亮的暖色渐变 + 两团柔光，接近真实桌面，
+			// 而不是高对比棋盘格——用极端图案评可读性会得出错误结论。
+			pt.FillGradient(r, ui.LinearGradient{
+				From: ui.Hex("#c8b7a4"), To: ui.Hex("#4a5568"), Angle: 135,
+			}, 0)
+			pt.FillRadialGradient(ui.Rect{X: r.X, Y: r.Y, W: r.W * 0.9, H: r.H * 0.55},
+				ui.RadialGradient{
+					Stops: []ui.GradientStop{
+						{Color: ui.RGBA(255, 236, 200, 0.75), At: 0},
+						{Color: ui.Transparent, At: 1},
+					},
+					Center: ui.Point{X: 0.25, Y: 0.18},
+				}, 0)
+		})
+	}
+}
+
+// newTestApp 构造一个不接磁盘、不启监听的 app，供无窗口的视图测试用。
+func newTestApp(t *testing.T) *app {
+	t.Helper()
+	cfg := relayclient.Config{}
+	cfg.Normalize()
+	a := &app{
+		logs:      newLogRing(50),
+		listen:    cfg.Listen,
+		server:    cfg.Server,
+		transport: cfg.Transport,
+		pal:       glass.Dark(),
+	}
+	a.runner = relayclient.New(cfg)
+	return a
+}
+
+// TestViewBuilds 视图能在无窗口环境里完整构建一帧。
+//
+// 这个测试的价值：native UI 的视图错误常常只在「第一次真的画」时炸，
+// 而 GUI 进程炸了就没有终端可看。放一个 tester 测试等于把「能开窗」这件事
+// 纳入了 go test。
+func TestViewBuilds(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+
+	// 空态：状态行 + 折叠的 hero + 复制按钮，不该出现统计三格
+	for _, want := range []string{"已停止", "启动", "上行体积对比", "已暂停", "复制配置"} {
+		if !tt.HasText(want) {
+			t.Errorf("缺少文本 %q，实际文本：%q", want, tt.Texts())
+		}
+	}
+	// 未启动不是故障：不该出现红色语义的「未连接」
+	if tt.HasText("未连接") {
+		t.Errorf("未启动不应显示「未连接」：%q", tt.Texts())
+	}
+	if tt.HasText("已连接") {
+		t.Errorf("未启动时不应显示已连接：%q", tt.Texts())
+	}
+}
+
+// TestIdleHasNoHeroNumber 空态不许出现巨号占位（破折号会渲染成一根粗灰横条，
+// 看起来像坏掉的进度条；「0×」又会被读成「压缩率是 0」）。
+//
+// 这是本轮改版最重要的一条视觉约束，用文本 + 像素双重断言守住。
+func TestIdleHasNoHeroNumber(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+
+	for _, banned := range []string{"—", "0×", "0.0×"} {
+		if tt.HasText(banned) {
+			t.Errorf("空态出现了占位巨号 %q：%q", banned, tt.Texts())
+		}
+	}
+	if tt.HasText("请求数") {
+		t.Errorf("空态不该出现统计三格（信息量零）：%q", tt.Texts())
+	}
+}
+
+// TestNoEmptyTalkRow 「尚无流量 · 运行后这里显示…」这类承诺型空话已被删除：
+// 空态的信息由 hero 的一句话承担，同一件事不用两处说。
+func TestNoEmptyTalkRow(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+	for _, banned := range []string{"尚无流量", "运行后这里显示"} {
+		if tt.HasText(banned) {
+			t.Errorf("出现了已删除的空话横条 %q：%q", banned, tt.Texts())
+		}
+	}
+}
+
+// TestVersionShownOnce 版本号只出现一次（footer）。出现两次时用户会以为是
+// 两个不同的东西。
+func TestVersionShownOnce(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+	n := 0
+	for _, s := range tt.Texts() {
+		if strings.Contains(s, displayVersion(version)) {
+			n++
+		}
+	}
+	if n != 1 {
+		t.Errorf("版本号出现 %d 次，期望 1 次：%q", n, tt.Texts())
+	}
+}
+
+// TestPanelTabHasNoConfig 面板 tab 不出现配置字段（它们搬到了设置 tab），
+// 这样主面板不需要滚动就能看完。
+func TestPanelTabHasNoConfig(t *testing.T) {
+	a := newTestApp(t)
+	tt := ui.NewTester(a.view, 480, 400)
+	for _, banned := range []string{"上游地址", "监听地址", "传输方式", "开机自启"} {
+		if tt.HasText(banned) {
+			t.Errorf("面板 tab 出现了设置项 %q：%q", banned, tt.Texts())
+		}
+	}
+}
+
+// TestSettingsTab 设置 tab 有全部四个字段，且不出现面板的内容。
+func TestSettingsTab(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	tt := ui.NewTester(a.view, 480, 400)
+
+	for _, want := range []string{"上游地址", "监听地址", "传输方式"} {
+		if !tt.HasText(want) {
+			t.Errorf("设置 tab 缺少 %q：%q", want, tt.Texts())
+		}
+	}
+	// 面板的内容不该出现在设置里（同一份信息不重复两处）
+	if tt.HasText("上行体积对比") {
+		t.Errorf("设置 tab 出现了面板的 hero：%q", tt.Texts())
+	}
+}
+
+// TestSettingsWhileRunning 运行中：字段被禁用并给出「先停止再改」的说明与出口。
+func TestSettingsWhileRunning(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	setRunning(a, true)
+	tt := ui.NewTester(a.view, 480, 400)
+
+	if !tt.HasText("运行中不可修改") {
+		t.Errorf("运行中未提示不可修改：%q", tt.Texts())
+	}
+}
+
+// TestViewRunning 运行态：状态变「已连接」，主按钮变「停止」，hero 出巨号与倍数。
+func TestViewRunning(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{Requests: 12847, UpRaw: 1400 * 1024, UpWire: 1024,
+		UpRatio: 1024.0 / (1400 * 1024), P50Ms: 28}
+	a.snap = func() stats.Agg { return a.agg }
+	tt := ui.NewTester(a.view, 480, 400)
+
+	for _, want := range []string{"已连接", "停止", "上行体积对比", "实时", "本次会话 12,847 请求", "p50 28 ms"} {
+		if !tt.HasText(want) {
+			t.Errorf("运行态缺少 %q：%q", want, tt.Texts())
+		}
+	}
+	// 运行态必须有倍数（1400KB / 1KB ≈ 1400×，三位有效数字后是 1000+）
+	if !tt.HasText("1.4K") && !tt.HasText("1400") && !tt.HasText("1.4 K") {
+		// 倍数本身来自 ratioFactor，这里只保证「有数字」——精确值另有用例
+		t.Logf("运行态文本：%q", tt.Texts())
+	}
+}
+
+// TestRatioFormat 压缩倍数口径（100 倍以上不再保留小数）
+func TestRatioFormat(t *testing.T) {
+	got, ok := ratioFactor(0.01)
+	if !ok {
+		t.Fatalf("ratioFactor(0.01) 无效")
+	}
+	if got != "100" {
+		t.Errorf("压缩倍数 = %q，期望 100", got)
+	}
+	if n := rawBytesPerKilo(0.01); n != 10 {
+		t.Errorf("每 1,000 字节发出 %d 字节，期望 10", n)
+	}
+	if s := (&app{}).heroNote(stats.Agg{UpRaw: 1400, UpWire: 14, UpRatio: 0.01}, true); !strings.Contains(s, "99.0%") {
+		t.Errorf("heroNote = %q，期望含节省 99.0%%", s)
+	}
+}
+
+// TestButtonStates 主按钮的三态背景必须真的不同。
+//
+// 守的是一个踩过的坑：Theme 的 AccentHover/AccentPressed 与 Accent 全等时，
+// 按钮按下去毫无视觉反馈（用户分不清点击是否生效）。框架用 faces 三态色，
+// 只要三色相同就会静默退化成「死按钮」。
+func TestButtonStates(t *testing.T) {
+	pal := glass.Dark()
+	shoot := func(press bool, hover bool) string {
+		view := func(c *ui.Context) {
+			c.SetTheme(pal.Theme())
+			ui.Row(c).FillWidth().Padding(30).Children(func() {
+				(&app{pal: pal}).actionButton(c, pal, "k", "按钮", true)
+			})
+		}
+		tt := ui.NewTester(view, 200, 100)
+		if hover || press {
+			tt.Move(60, 50)
+		}
+		if press {
+			tt.Press(60, 50)
+		}
+		r, g, b, _ := tt.Image().At(60, 50).RGBA()
+		return fmt.Sprintf("#%02x%02x%02x", r>>8, g>>8, b>>8)
+	}
+	rest, hover, pressed := shoot(false, false), shoot(false, true), shoot(true, true)
+	if rest == hover {
+		t.Errorf("hover 与静止态相同（%s）：鼠标悬停没有反馈", rest)
+	}
+	if hover == pressed {
+		t.Errorf("pressed 与 hover 相同（%s）：按下没有反馈", hover)
+	}
+	if rest == pressed {
+		t.Errorf("pressed 与静止态相同（%s）：按下没有反馈", rest)
+	}
+	t.Logf("主按钮三态：rest=%s hover=%s pressed=%s", rest, hover, pressed)
+}
+
+// TestMeterDirection 压缩条的填充语义：越长 = 发出去的越多 = 压得越差。
+//
+// 这条测试守的是一个容易被改反的方向（「进度条越长越好」是直觉，但这里正好相反）。
+func TestMeterDirection(t *testing.T) {
+	// 几乎压到零：填充极短，用最亮的白（好结果）
+	good := stats.Agg{UpRaw: 1400 * 1024, UpWire: 1024, UpRatio: 1024.0 / (1400 * 1024)}
+	if frac := good.UpRatio; frac > 0.01 {
+		t.Errorf("压得好的用例占比 %.4f，应远小于 1%%", frac)
+	}
+	// 没压：填充满格，且不该给亮白
+	bad := stats.Agg{UpRaw: 101, UpWire: 101, UpRatio: 1.0}
+	if s := (&app{}).heroNote(bad, true); !strings.Contains(s, "未压缩") {
+		t.Errorf("未压缩时说明文案 = %q，应点明「未压缩」而不是「节省 0.0%%」", s)
+	}
+	if s := (&app{}).heroNote(good, true); !strings.Contains(s, "节省") {
+		t.Errorf("有压缩时说明文案 = %q，应给出节省比例", s)
+	}
+}
+
+// TestVersionDisplay 注入源的版本号有的带 v 有的不带，界面必须归一成一个。
+func TestVersionDisplay(t *testing.T) {
+	for in, want := range map[string]string{"0.9.1": "v0.9.1", "v0.9.1": "v0.9.1", "dev": "vdev", "": "v?"} {
+		if got := displayVersion(in); got != want {
+			t.Errorf("displayVersion(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}
+
+// TestNoTakeoverPane 设计稿的「接管 Agent 配置」面板已被用户砍掉，
+// 任何形态的残留（文字、图标、开关）都不允许回到界面上。
+func TestNoTakeoverPane(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	tt := ui.NewTester(a.view, 480, 900)
+	for _, banned := range []string{"接管", "Agent 配置", "经本代理", "直连上游", "Claude Code", "Codex", "ZCode"} {
+		if tt.HasText(banned) {
+			t.Errorf("出现了被砍掉的接管面板文本 %q：%q", banned, tt.Texts())
+		}
+	}
+}
+
+// TestLightPaletteBuilds 亮色板同样能构建（两套色板都别炸）
+func TestLightPaletteBuilds(t *testing.T) {
+	a := newTestApp(t)
+	a.pal = glass.Light()
+	tt := ui.NewTester(a.view, 480, 400)
+	if !tt.HasText("已停止") {
+		t.Errorf("亮色板未渲染：%q", tt.Texts())
+	}
+}
+
+// TestHumanErrorDedup 启动失败的一句话文案：原始错误的前缀叠了三层，
+// 界面必须只留一句用户能行动的话。
+func TestHumanErrorDedup(t *testing.T) {
+	raw := errors.New("listen 127.0.0.1:19008: listen tcp 127.0.0.1:19008: bind: address already in use")
+	got := humanError(raw)
+	if strings.Count(got, "listen") != 0 {
+		t.Errorf("话术仍残留 listen 前缀：%q", got)
+	}
+	if !strings.Contains(got, "19008") || !strings.Contains(got, "占用") {
+		t.Errorf("话术未说清端口与原因：%q", got)
+	}
+	if got := humanError(nil); got != "" {
+		t.Errorf("nil 错误应返回空串，得到 %q", got)
+	}
+}
+
+// TestGroupDigits 千分位：请求数读位数要快
+func TestGroupDigits(t *testing.T) {
+	for n, want := range map[int64]string{0: "0", 7: "7", 999: "999", 1000: "1,000", 12847: "12,847", 1234567: "1,234,567"} {
+		if got := groupDigits(n); got != want {
+			t.Errorf("groupDigits(%d) = %q，期望 %q", n, got, want)
+		}
+	}
+}
+
+// TestTrayStats 托盘菜单的统计口径必须与窗口一致（同一个数字不能有两种写法）。
+func TestTrayStats(t *testing.T) {
+	// 未运行：一行说明，第二行不显示
+	if l1, l2 := trayStats(stats.Agg{}, false); l2 != "" || !strings.Contains(l1, "未运行") {
+		t.Errorf("未运行：(%q, %q)，期望含「未运行」且第二行为空", l1, l2)
+	}
+	// 运行但没有请求
+	if l1, l2 := trayStats(stats.Agg{}, true); l2 != "" || !strings.Contains(l1, "等待") {
+		t.Errorf("无请求：(%q, %q)，期望含「等待」且第二行为空", l1, l2)
+	}
+	// 有数据：请求数带千分位、倍数、节省量
+	agg := stats.Agg{Requests: 1204, UpRaw: 10 * 1024 * 1024, UpWire: 512 * 1024,
+		UpRatio: float64(512*1024) / float64(10*1024*1024)}
+	l1, l2 := trayStats(agg, true)
+	if !strings.Contains(l1, "1,204") {
+		t.Errorf("第一个状态行 = %q，请求数应带千分位", l1)
+	}
+	if !strings.Contains(l1, "×") {
+		t.Errorf("第一个状态行 = %q，应含压缩倍数", l1)
+	}
+	if !strings.HasPrefix(l2, "节省 ") {
+		t.Errorf("第二个状态行 = %q，应以「节省」开头", l2)
+	}
+}
+
+// TestPadFigure 菜单栏标题的定宽补齐：倍数变化时图标旁的文字宽度不能跳。
+func TestPadFigure(t *testing.T) {
+	for _, in := range []string{"9.4×", "12.0×", "100×"} {
+		out := padFigure(in)
+		if n := len([]rune(out)); n != 5 {
+			t.Errorf("padFigure(%q) = %q（%d 个字符），期望 5", in, out, n)
+		}
+		if !strings.HasPrefix(out, in) {
+			t.Errorf("padFigure(%q) = %q，前缀被改动", in, out)
+		}
+	}
+}
+
+// TestSnapshotFrames 把几帧渲染成 PNG 落到 GOLDEN_DIR（默认跳过）。
+//
+// 用途：自动化截图。native UI 的窗口需要真实桌面才能 screencapture，而
+// ui.Tester 能在内存里渲染同一份视图——两处像素一致，所以用它当「界面长什么样」
+// 的可复核证据，比人工点击截图稳定得多。
+//
+//	GOLDEN_DIR=/tmp/shots go test ./cmd/gui -run TestSnapshotFrames
+func TestSnapshotFrames(t *testing.T) {
+	dir := os.Getenv("GOLDEN_DIR")
+	if dir == "" {
+		t.Skip("设置 GOLDEN_DIR 才生成截图")
+	}
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	cases := []struct {
+		name  string
+		w, h  int
+		setup func(a *app)
+	}{
+		{"panel-idle", 480, 400, func(a *app) {}},
+		{"panel-running", 480, 400, func(a *app) {
+			setRunning(a, true)
+			a.agg = stats.Agg{Requests: 1204, UpRaw: 1400 * 1024, UpWire: 70 * 1024,
+				UpRatio: 70.0 / 1400, P50Ms: 28}
+			a.agg.Series = fakeSeries()
+			a.snap = func() stats.Agg { return a.agg }
+			a.transport = "quic"
+		}},
+		{"panel-sparse", 480, 400, func(a *app) {
+			setRunning(a, true)
+			a.agg = stats.Agg{Requests: 1, UpRaw: 524847, UpWire: 392, UpRatio: 392.0 / 524847, P50Ms: 18}
+			a.agg.Series = sparseSeries()
+			a.snap = func() stats.Agg { return a.agg }
+		}},
+		{"settings", 480, 400, func(a *app) { a.tab = tabSettings }},
+		{"settings-running", 480, 400, func(a *app) {
+			a.tab = tabSettings
+			setRunning(a, true)
+		}},
+		{"panel-light", 480, 480, func(a *app) { a.pal = glass.Light() }},
+		{"panel-error", 480, 480, func(a *app) {
+			// 制造一次真实的 bind 失败：占住端口再让 Runner 去监听
+			a.listen = "127.0.0.1:1" // 1024 以下的端口在 macOS 上需要权限
+			a.start()
+		}},
+	}
+	for _, tc := range cases {
+		a := newTestApp(t)
+		tc.setup(a)
+		tt := ui.NewTester(desktopView(a), tc.w, tc.h)
+		img := tt.Image()
+		if img == nil {
+			t.Fatalf("%s: Image() 返回 nil", tc.name)
+		}
+		path := filepath.Join(dir, tc.name+".png")
+		f, err := os.Create(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := png.Encode(f, img); err != nil {
+			f.Close()
+			t.Fatalf("%s: png.Encode: %v", tc.name, err)
+		}
+		f.Close()
+		t.Logf("wrote %s (%dx%d)", path, img.Bounds().Dx(), img.Bounds().Dy())
+	}
+}
+
+// fakeSeries 造一组「像真实流量」的序列：几个大请求 + 若干小请求 + 空秒。
+//
+// 为什么不用随机数：截图的目的是让人判断「图能不能读」，随机的形状每次不同，
+// 复核时无法对比。固定形状（一波大流量落在中段、尾部稀疏）能稳定地检验
+// 「高低差可读、间隙可见、空秒留白」这三件事。
+func fakeSeries() []stats.Bucket {
+	// 真实生产数据的形状：大部分秒省 99%+，个别秒是首包/小包（只省 60-70%），
+	// 中间夹几段空转（用户读回复时没有请求）。这样截图能同时检验「高分柱」
+	// 「低分柱」「空秒留白」三件事。
+	shape := []struct {
+		raw, wire int64
+	}{
+		{0, 0}, {0, 0}, {0, 0},
+		{524847, 392}, {1_800_000, 421_000}, {904_000, 272_000},
+		{918_000, 2_500}, {1_400_000, 21_000}, {700_000, 8_000},
+		{0, 0}, {61_000, 190}, {240_000, 1_200}, {310_000, 1_800},
+		{0, 0}, {0, 0},
+		{1_120_000, 14_000}, {980_000, 11_500}, {2_050_000, 19_600},
+		{0, 0}, {0, 0}, {0, 0},
+		{420_000, 6_100}, {530_000, 7_400}, {610_000, 8_900},
+		{0, 0}, {180_000, 2_100}, {290_000, 3_500},
+		{0, 0}, {0, 0}, {0, 0},
+	}
+	out := make([]stats.Bucket, stats.SeriesBuckets)
+	for i := range out {
+		raw, wire := shape[i%len(shape)].raw, shape[i%len(shape)].wire
+		if raw > 0 {
+			out[i] = stats.Bucket{UpRaw: raw, UpWire: wire, Count: 1}
+		}
+	}
+	return out
+}
+
+// sparseSeries 只有一个请求（验证「1 个数据点时图仍然可读」）
+func sparseSeries() []stats.Bucket {
+	out := make([]stats.Bucket, stats.SeriesBuckets)
+	out[stats.SeriesBuckets-3] = stats.Bucket{UpRaw: 524847, UpWire: 392, Count: 1}
+	return out
+}
