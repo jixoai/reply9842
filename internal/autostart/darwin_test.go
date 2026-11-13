@@ -187,3 +187,27 @@ func TestAtomicallyReplaces(t *testing.T) {
 		}
 	}
 }
+
+// TestPlistKeepsAliveOnCrash 登录项必须带「崩溃才拉起」的 KeepAlive。
+//
+// 契约（owner 2026-11-14：「可以 let it crash，但关键是要有自恢复的机制」）：
+//   - 进程崩溃（非零退出）→ launchd 重新拉起；
+//   - 用户主动退出（exit 0）→ 不许复活，否则「退出」按钮形同虚设。
+//
+// 这两条正好对应 KeepAlive={SuccessfulExit=false}。少了它，一次 panic 就等于
+// 服务永久下线；写成 KeepAlive=true，用户就再也退不出这个应用。
+func TestPlistKeepsAliveOnCrash(t *testing.T) {
+	x := plistXML("/Applications/reply9842.app/Contents/MacOS/reply9842")
+	for _, want := range []string{
+		"<key>KeepAlive</key>",
+		"<key>SuccessfulExit</key><false/>",
+		"<key>ThrottleInterval</key><integer>5</integer>",
+	} {
+		if !strings.Contains(x, want) {
+			t.Errorf("plist 缺少 %q：\n%s", want, x)
+		}
+	}
+	if strings.Contains(x, "<key>KeepAlive</key><true/>") {
+		t.Errorf("KeepAlive 不能是 true：那会让用户退不出应用")
+	}
+}

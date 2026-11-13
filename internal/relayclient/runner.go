@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -310,18 +311,7 @@ func (r *Runner) Start() error {
 		logger.Printf("  日志        %s", c.LogPath)
 	}
 
-	go func(srv *http.Server, ln net.Listener) {
-		if err := srv.Serve(ln); err != nil && err != http.ErrServerClosed {
-			r.mu.Lock()
-			r.lastErr = fmt.Errorf("serve: %w", err)
-			r.running = false
-			r.mu.Unlock()
-			if logger != nil {
-				logger.Printf("监听异常退出: %v", err)
-			}
-			r.notify()
-		}
-	}(srv, ln)
+	go r.superviseServe(h, srv, ln, c.Listen, logger)
 
 	r.notify()
 	return nil
@@ -833,4 +823,83 @@ func pingConn(c *transport.Conn) error {
 	}
 	_, err = c.Recv()
 	return err
+}
+
+// superviseServe 守住本地监听：Serve 意外返回时自动重开，而不是让「运行中」
+// 变成一个没人服务的空壳。
+//
+// 为什么需要（2026-11-14 owner：「可以 let it crash，但关键是要有自恢复」）：
+//   - 单个请求里的 panic 由 net/http 自己 recover，进程不受影响；
+//   - 但 accept 循环出错（文件描述符耗尽、瞬时 EMFILE）会让 Serve 返回，
+//     旧实现只是把 running 置 false —— 用户看到「已停止」，服务就此下线，
+//     除非他自己点一次启动；
+//   - 真出了未捕获 panic，进程会死，那由 launchd 的 KeepAlive 兜（见
+//     internal/autostart：SuccessfulExit=false，崩溃才拉起）。
+//
+// 这里只负责「同一个进程内把监听重新拉起来」，退避 200ms 起、上限 5s，
+// 避免端口被别的进程占着时把 CPU 打满。
+func (r *Runner) superviseServe(h *handler, srv *http.Server, ln net.Listener, addr string, logger *log.Logger) {
+	backoff := 200 * time.Millisecond
+	for {
+		err, panicked := serveSafely(srv, ln)
+		if !r.isRunning() || err == http.ErrServerClosed {
+			return
+		}
+		r.mu.Lock()
+		r.lastErr = fmt.Errorf("serve: %w", err)
+		r.mu.Unlock()
+		if logger != nil {
+			if panicked {
+				logger.Printf("监听 goroutine panic: %v（%s 后重开）\n%s", err, backoff, debug.Stack())
+			} else {
+				logger.Printf("监听异常退出: %v（%s 后重开）", err, backoff)
+			}
+		}
+		r.notify()
+
+		time.Sleep(backoff)
+		if !r.isRunning() {
+			return
+		}
+		nln, e := net.Listen("tcp", addr)
+		if e != nil {
+			if logger != nil {
+				logger.Printf("重开监听失败: %v", e)
+			}
+			if backoff < 5*time.Second {
+				backoff *= 2
+			}
+			continue
+		}
+		backoff = 200 * time.Millisecond
+		ln = nln
+		srv = &http.Server{
+			Handler:           h,
+			ReadHeaderTimeout: 30 * time.Second,
+		}
+		r.mu.Lock()
+		r.ln, r.srv = nln, srv
+		r.mu.Unlock()
+	}
+}
+
+// serveSafely 跑一轮 Serve，并把 panic 变成普通错误。
+//
+// 单独抽出来是因为「panic 也要重开」：恢复后直接 return 等于把服务停掉，
+// 而 owner 的要求是自恢复——崩溃可以发生，但服务得自己回来。
+func serveSafely(srv *http.Server, ln net.Listener) (err error, panicked bool) {
+	defer func() {
+		if p := recover(); p != nil {
+			err = fmt.Errorf("panic: %v", p)
+			panicked = true
+		}
+	}()
+	return srv.Serve(ln), false
+}
+
+// isRunning 供 superviseServe 读运行态（持锁读，避免与 Stop 竞争）。
+func (r *Runner) isRunning() bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.running
 }

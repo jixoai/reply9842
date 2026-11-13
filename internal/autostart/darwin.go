@@ -127,6 +127,12 @@ func set(on bool) error {
 //   - Label                 launchd 的唯一标识，与文件名一致
 //   - ProgramArguments      要执行的命令行；第一项是可执行文件
 //   - RunAtLoad             登录时启动（这就是「开机自启」本身）
+//   - KeepAlive={SuccessfulExit=false}  进程**崩溃**（非零退出）时由 launchd
+//     自动拉起；用户主动退出（exit 0）不会被复活。2026-11-14 owner 要求
+//     「可以 let it crash，但关键是要有自恢复」——这是最外层的自恢复，
+//     隧道是否自动恢复运行由 settings.json 的 running 决定（见 gui 的
+//     shouldStartOnLaunch）。
+//   - ThrottleInterval=5   连续崩溃时至少间隔 5 秒，避免把 launchd 打成忙等
 //   - LimitLoadToSessionType=Aqua  只在图形会话里启动，ssh/守护进程会话不启
 //   - ProcessType=Interactive     告诉 launchd 这是个前台感受的应用，
 //     调度上不按后台批处理对待
@@ -145,6 +151,11 @@ func plistXML(exe string) string {
     <string>` + xmlEscape(Marker) + `</string>
   </array>
   <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+  </dict>
+  <key>ThrottleInterval</key><integer>5</integer>
   <key>LimitLoadToSessionType</key><string>Aqua</string>
   <key>ProcessType</key><string>Interactive</string>
 </dict>

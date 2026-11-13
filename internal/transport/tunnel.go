@@ -146,8 +146,11 @@ type connectResult struct {
 
 // Dial 建立连接。Mode=auto 时按 prefer → quic → tcp 顺序尝试。
 func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
-	if d.QuicProbe <= 0 {
-		d.QuicProbe = time.Second
+	// 不要写回 d.QuicProbe：Dial 会被多个请求 goroutine 并发调用，写共享字段
+	// 是数据竞争（-race 实测抓到过）。用局部值，语义完全一样。
+	probe := d.QuicProbe
+	if probe <= 0 {
+		probe = time.Second
 	}
 
 	var order []Kind
@@ -173,7 +176,7 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 		switch k {
 		case KindQUIC:
 			// auto 模式必须给 QUIC 一个明确的探测超时，否则握手失败会无限等
-			cctx, cancel := context.WithTimeout(ctx, d.QuicProbe)
+			cctx, cancel := context.WithTimeout(ctx, probe)
 			c, err = d.dialQUIC(cctx)
 			cancel()
 			if err != nil && d.Mode == KindAuto {

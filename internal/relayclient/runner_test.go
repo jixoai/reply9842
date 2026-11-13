@@ -3,6 +3,8 @@ package relayclient
 import (
 	"context"
 	"log"
+	"net"
+	"net/http"
 	"os"
 	"testing"
 	"time"
@@ -118,5 +120,28 @@ func TestSetConfigWhileRunning(t *testing.T) {
 
 	if err := r.SetConfig(Config{Listen: "127.0.0.1:1"}); err == nil {
 		t.Errorf("运行中 SetConfig 应返回错误")
+	}
+}
+
+// panicListener 在 Accept 时 panic，模拟「监听循环里冒出未捕获 panic」。
+type panicListener struct{}
+
+func (panicListener) Accept() (net.Conn, error) { panic("boom: accept") }
+func (panicListener) Close() error              { return nil }
+func (panicListener) Addr() net.Addr            { return &net.TCPAddr{} }
+
+// TestServeSafelyTurnsPanicIntoError 监听 goroutine 的 panic 必须变成普通错误。
+//
+// 契约（owner 2026-11-14：「可以 let it crash，但关键是要有自恢复」）：
+// serveSafely 恢复 panic 并返回 panicked=true，supervisor 据此走「退避 + 重开
+// 监听」，服务在同一个进程里自己回来，而不是把 running 置 false 就下线。
+func TestServeSafelyTurnsPanicIntoError(t *testing.T) {
+	srv := &http.Server{Handler: http.NewServeMux()}
+	err, panicked := serveSafely(srv, panicListener{})
+	if !panicked {
+		t.Fatalf("panic 没有被转成错误（panicked=false, err=%v）", err)
+	}
+	if err == nil {
+		t.Fatal("panicked 时 err 不能是 nil")
 	}
 }
