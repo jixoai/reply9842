@@ -3,13 +3,31 @@ name: Release
 # 打 tag（v*）时：构建全平台产物 → GitHub Release → npm（OIDC Trusted Publishing）
 #
 # ── 为什么要单 job + self-hosted ──────────────────────────────────────────
-# 早期版本把 13 个平台摊成 13 个 matrix job。实测本地串行交叉编译全部平台只要
-# 65 秒，而 13 个 job 每个都要 checkout + setup-go + 拉 Go 缓存 + 启动 runner，
-# 单次发布烧掉约 15 分钟免费额度。本项目的 Go 交叉编译不需要各平台 runner
-# （CGO_ENABLED=0，纯 Go），所以合成一个 job 反而快且省。
+# 早期版本把 16 个产物摊成 16 个 matrix job。实测本地串行交叉编译全部平台只要
+# 100 秒（本机 8 核首次冷缓存；热缓存 ~10s，改后并发版热缓存 ~4.4s），而 16 个
+# job 每个都要 checkout + setup-go + 拉 Go 缓存 + 启动 runner，单次发布烧掉约
+# 15 分钟免费额度。本项目的 Go 交叉编译不需要各平台 runner（CGO_ENABLED=0，
+# 纯 Go），所以合成一个 job 反而快且省。
 #
 # runner 选择：优先 self-hosted（jixoai 组织级 mac-ext-01，常驻且已有模块缓存），
 # 官方托管 runner 作为兜底——self-hosted 掉线时 CI 仍能跑完。
+#
+# ── 为什么是「单 job 内并发」而不是「多 job 并行」（2026-11-13 定稿） ──────
+# 单 job 串行 for 循环的问题是只吃一个核：本机 8 核实测 16 个产物串行
+# 9.0-10.2s（热缓存），期间 7 个核在睡觉。但把它摊回 matrix 是错的解法：
+#   - self-hosted 只有一台机器，多个 job 会在同一台 runner 上排队（job 之间没有
+#     共享缓存优势，却各自 checkout + setup-go），总墙钟时间不会变短；
+#   - 每个 matrix job 在官方 runner 上都单独计费，回到「15 分钟额度」老路。
+# 所以并发放在 job 内部（xargs -P），并发度按实际核数探测，官方 2 核 runner
+# 上自然退化成 2，不会被拖垮。详见 Build all platforms 步骤的注释。
+#
+# 冷缓存下的真实收益（2026-11-13 本机 8 核实测，含机器其它负载）：
+#   串行 108s / 并发 97s —— 只快 12%。原因不是并发无效，而是 16 个产物只有
+#   6 种 (OS,arch) 依赖图，冷缓存时 8 路会同时把同一份依赖图各编一遍，CPU
+#   时间反而从 360s 涨到 434s。所以本改动的价值主要在**热缓存**场景（self-hosted
+#   常驻、go 模块与 build cache 都在，实测 2.2 倍），这与 mac-ext-01 的实际
+#   使用方式一致（它是常驻 runner，不是每次新开）。冷缓存下并发也不会更慢到
+#   不可接受，故无需为它做两阶段预热（那会让热路径多花一次空转）。
 #
 # ── npm Trusted Publishing ────────────────────────────────────────────────
 # npmjs.com → reply9842 → Settings → Trusted Publisher 必须与本文件严格一致：
@@ -79,7 +97,7 @@ jobs:
             echo "→ self-hosted（$online 个 online）"
           else
             echo "label=ubuntu-latest" >> "$GITHUB_OUTPUT"
-            echo "→ ubuntu-latest（online=$online）"
+            echo "→ ubuntu-latest（online=${online}）"
           fi
 
   release:
@@ -126,40 +144,135 @@ jobs:
           VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
-          rm -rf dist && mkdir -p dist
-          ldflags="-s -w -X main.version=${VERSION}"
-          made=0
+
+          # ── 并发度探测（自适应核数） ────────────────────────────────────
+          # 探测顺序按「哪台机器都可能跑」排：
+          #   nproc        → coreutils（Linux / 官方 runner）
+          #   getconf      → macOS 自带，返回逻辑核数（self-hosted mac-ext-01 走这条）
+          #   sysctl       → macOS 兜底
+          # 注意 macOS 默认**没有 nproc**（2026-11-13 本机实测确认），只写 nproc
+          # 会让 self-hosted 一路掉到 fallback，等于没并发。
+          cores=""
+          if command -v nproc >/dev/null 2>&1; then
+            cores="$(nproc 2>/dev/null || true)"
+          fi
+          if [ -z "$cores" ] && command -v getconf >/dev/null 2>&1; then
+            cores="$(getconf _NPROCESSORS_ONLN 2>/dev/null || true)"
+          fi
+          if [ -z "$cores" ] && command -v sysctl >/dev/null 2>&1; then
+            cores="$(sysctl -n hw.ncpu 2>/dev/null || true)"
+          fi
+          case "$cores" in ''|*[!0-9]*) cores=2 ;; esac
+          if [ "$cores" -lt 1 ]; then cores=2; fi
+
+          # 产物清单（3 kinds × 3 os × 2 arch，去掉 gui/linux → 16 个）
+          targets=()
           for kind in cli gui server; do
             for os in linux darwin windows; do
               for arch in amd64 arm64; do
                 # GUI 只有 darwin / windows（mygo native UI 无 Linux 后端）
                 if [ "$kind" = "gui" ] && [ "$os" = "linux" ]; then continue; fi
-                ext=""; [ "$os" = "windows" ] && ext=".exe"
-                out="dist/${kind}-${os}-${arch}${ext}"
-
-                ld="$ldflags"
-                # Windows GUI 双击不弹控制台（go install 传不了，另有 console_windows.go 兜底）
-                if [ "$kind" = "gui" ] && [ "$os" = "windows" ]; then
-                  ld="$ld -H=windowsgui"
-                fi
-
-                echo "→ $out"
-                GOOS=$os GOARCH=$arch CGO_ENABLED=0 \
-                  go build -trimpath -ldflags "$ld" -o "$out" "./cmd/${kind}"
-                made=$((made+1))
+                targets+=("${kind} ${os} ${arch}")
               done
             done
           done
-          echo "built=$made" >> "$GITHUB_OUTPUT"
-          echo "共 $made 个产物"
+          total="${#targets[@]}"
+
+          # jobs = min(核数, 产物数, 8)
+          #   · 官方 runner（2-4 核）自然退化成 2-4，不会被并发拖垮；
+          #   · 上限 8 是内存护栏：单个 GUI 链接实测峰值 RSS ≈ 270MB，
+          #     8 路 ≈ 2.2GB 可接受；再往上只会在 32 核机上把 link 峰值叠到
+          #     4GB+，而墙钟时间已被「16 个产物 / link 耗时」主导，意义不大。
+          jobs="$cores"
+          if [ "$jobs" -gt "$total" ]; then jobs="$total"; fi
+          if [ "$jobs" -gt 8 ]; then jobs=8; fi
+          if [ "$jobs" -lt 1 ]; then jobs=2; fi
+
+          # 每个 go build 内部还能再并行编译包（-p 默认 = GOMAXPROCS）。
+          # 若不加约束，8 路 × 每路 8 线程 = 64 个编译进程互相抢核。
+          # 按 cores/jobs 上取整摊分（下取整会在 12 核这类非整数倍上白闲 4 个核），
+          # 钳在 1..4。
+          go_p=$(( (cores + jobs - 1) / jobs ))
+          if [ "$go_p" -lt 1 ]; then go_p=1; fi
+          if [ "$go_p" -gt 4 ]; then go_p=4; fi
+
+          echo "并发度: cores=$cores jobs=$jobs go_p=$go_p 产物=$total"
+
+          rm -rf dist && mkdir -p dist
+
+          # 单目标构建脚本：参数 $1 = "kind os arch"
+          # 写成文件而不是 xargs + bash -c，是为了避开三层引号转义（本项目已多次
+          # 被转义层坑过）。xargs -I '{}' 保证整行作为一个参数、绝不拆词。
+          log_dir="${RUNNER_TEMP:-${TMPDIR:-/tmp}}/r9842-build-logs"
+          rm -rf "$log_dir" && mkdir -p "$log_dir"
+          script="$log_dir/build-one.sh"
+          cat > "$script" <<'SH'
+          #!/usr/bin/env bash
+          # 由 release.yml 生成，勿手改。
+          set -euo pipefail
+          read -r kind os arch <<< "${1:?缺少目标参数}"
+
+          ext=""
+          if [ "$os" = "windows" ]; then ext=".exe"; fi
+          out="dist/${kind}-${os}-${arch}${ext}"
+
+          ld="-s -w -X main.version=${VERSION}"
+          # Windows GUI 双击不弹控制台（go install 传不了，另有 console_windows.go 兜底）
+          if [ "$kind" = "gui" ] && [ "$os" = "windows" ]; then
+            ld="$ld -H=windowsgui"
+          fi
+
+          # 日志必须落在 dist 之外：dist/* 会被整目录上传/发布。
+          log="${LOG_DIR}/${kind}-${os}-${arch}.log"
+          if ! GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -p "$GO_P" -trimpath -ldflags "$ld" -o "$out" "./cmd/${kind}" \
+              >"$log" 2>&1; then
+            echo "✗ 构建失败: $out" >&2
+            sed 's/^/    /' "$log" >&2 || true
+            exit 1
+          fi
+          printf '✓ %-24s %s\n' "$out" "$(du -h "$out" | cut -f1)"
+          SH
+
+          # 并发跑。xargs 在任一子进程非 0 时退出 123；这里**不**让 set -e 立刻
+          # 中断，而是记下状态继续跑完整性检查——失败时同时给出「哪个目标炸了」
+          # （子脚本已经打印了编译器输出）和「最终缺了哪些产物」，一次看全。
+          build_rc=0
+          printf '%s\n' "${targets[@]}" \
+            | LOG_DIR="$log_dir" GO_P="$go_p" \
+              xargs -P "$jobs" -I '{}' bash "$script" '{}' || build_rc=$?
+
+          # ── 完整性断言：产物一个都不能少、不能是空的 ────────────────────
+          # 并发的失败模式是「静默少一个」，靠下面逐一比对清单兜住。
+          missing=0
+          for t in "${targets[@]}"; do
+            read -r kind os arch <<< "$t"
+            ext=""
+            if [ "$os" = "windows" ]; then ext=".exe"; fi
+            f="dist/${kind}-${os}-${arch}${ext}"
+            if [ ! -s "$f" ]; then
+              echo "✗ 缺失或空文件: $f" >&2
+              missing=$((missing+1))
+            fi
+          done
+          if [ "$build_rc" -ne 0 ]; then
+            echo "构建阶段有目标失败（xargs rc=${build_rc}），缺失 ${missing} 个产物" >&2
+            exit 1
+          fi
+          if [ "$missing" -ne 0 ]; then
+            echo "共 $missing 个产物缺失，中止" >&2
+            exit 1
+          fi
+
+          echo "built=$total" >> "$GITHUB_OUTPUT"
+          echo "共 $total 个产物（并发 $jobs 路）"
           ls -lh dist
 
       - name: Self-check binaries
         run: |
           set -euo pipefail
-          set -euo pipefail
           # 自检分两层：
-          #  1) 格式层——全部 13 个产物都用 file 看一遍，确认架构/子系统正确
+          #  1) 格式层——全部 16 个产物都用 file 看一遍，确认架构/子系统正确
           #  2) 执行层——只跑「宿主平台 + 宿主架构」那一份
           #
           # 第 2 层不能写死 cli-darwin-arm64：pick-runner 回退到 ubuntu-latest
@@ -328,3 +441,74 @@ jobs:
         run: |
           rm -f ~/.npmrc .npmrc 2>/dev/null || true
           npm publish --provenance --access public --loglevel verbose
+
+  # ── Docker 镜像（服务端一键部署）─────────────────────────────────────────
+  #
+  # 为什么必须有这个 job（2026-11-13 实证）：`docker-compose.server.yml` 与
+  # DEPLOY.md 都让用户 `docker compose up -d`，引用
+  # `ghcr.io/jixoai/reply9842-server:latest`，而此前**没有任何 workflow 构建
+  # 这个镜像**——`gh api repos/.../pkgs/container/reply9842-server` 返回 Not Found。
+  # 也就是说照文档走一遍必然拉不到镜像。Dockerfile.server 一直是好的，只是没人跑它。
+  #
+  # 只在 tag 上构建（workflow_dispatch 干跑不推镜像，避免污染 latest）。
+  docker:
+    name: Build and push image
+    needs: release
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+      packages: write               # 推 ghcr 必需
+    steps:
+      - uses: actions/checkout@v4
+
+      # QEMU + buildx：镜像要同时支持 amd64（服务器主流）与 arm64（部分云厂商）
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Derive image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ github.repository }}-server
+          tags: |
+            type=semver,pattern={{version}}
+            type=semver,pattern={{major}}.{{minor}}
+            type=raw,value=latest
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: Dockerfile.server
+          platforms: linux/amd64,linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            VERSION=${{ github.ref_name }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Smoke test the image
+        # 镜像推完必须验证它真的能起来，否则「构建成功但跑不起来」会一路传到用户
+        run: |
+          set -euo pipefail
+          img="ghcr.io/${{ github.repository }}-server:latest"
+          docker pull "$img"
+          # 无证书应当 fatal 退出（证明二进制真的在跑，而不是空壳）
+          if docker run --rm "$img" 2>&1 | grep -q "必须提供 -cert 与 -key"; then
+            echo "✓ 镜像可执行且参数校验生效"
+          else
+            echo "❌ 镜像未能正常启动" >&2
+            docker run --rm "$img" 2>&1 | tail -20 >&2 || true
+            exit 1
+          fi
