@@ -1,0 +1,63 @@
+name: Deploy site to GitHub Pages
+
+# 部署仓库根下 site/ 目录到 GitHub Pages。
+#
+# 首次启用需要仓库管理员做两件事（详见 README 的「部署」一节）：
+#   1. Settings → Pages → Source 选择 "GitHub Actions"
+#   2. 在 DNS 处为 rfc9842-reply.jixoai.com 添加 CNAME 记录指向 <owner>.github.io
+# 做完这两步后本工作流即可自动发布，后续 push 到 main 就会更新站点。
+
+on:
+  push:
+    branches: [main]
+    # 只有站点内容变化才重新部署，避免改 Go 代码也触发 Pages 构建
+    paths:
+      - "site/**"
+      - ".github/workflows/pages.yml"
+  workflow_dispatch:
+
+# Pages 部署需要的权限：GITHUB_TOKEN 写 Pages + 读取仓库以便 artifact 上传
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# 同一时间只允许一个部署；新 push 取消排队中的旧部署，但绝不打断正在跑的部署
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build site artifact
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Verify site entry exists
+        run: |
+          set -euo pipefail
+          test -f site/index.html || { echo "site/index.html 缺失"; exit 1; }
+          test -f site/CNAME || { echo "site/CNAME 缺失"; exit 1; }
+          echo "CNAME: $(cat site/CNAME)"
+
+      - name: Configure Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: ./site
+
+  deploy:
+    name: Deploy to Pages
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy
+        id: deployment
+        uses: actions/deploy-pages@v4

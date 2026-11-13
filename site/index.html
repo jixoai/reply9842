@@ -1,0 +1,505 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>rfc9842-reply — 把 AI Agent 上行带宽砍掉 99.8%</title>
+    <meta
+      name="description"
+      content="基于内容寻址基版本的增量压缩隧道。Agent 每请求上行 1.3–2.2 MB，实测压到几百字节：22.3 MB 的 14 条连续请求 ──▶ 20.9 KB。"
+    />
+    <meta name="theme-color" content="#000000" />
+    <meta property="og:type" content="website" />
+    <meta property="og:title" content="rfc9842-reply — 增量压缩隧道" />
+    <meta
+      property="og:description"
+      content="把 AI Agent 的上行带宽砍掉 99.8%。内容寻址基版本 + zstd delta，1.4 MB 请求压到约 1 KB。"
+    />
+    <meta property="og:url" content="https://rfc9842-reply.jixoai.com" />
+    <link rel="stylesheet" href="style.css" />
+    <link
+      rel="icon"
+      href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 16 16'%3E%3Crect width='16' height='16' fill='%23000'/%3E%3Cpath d='M3 8h4M9 8h4M5 5l3 3-3 3M11 5L8 8l3 3' stroke='%2300a6f4' stroke-width='1.4' fill='none' stroke-linecap='round'/%3E%3C/svg%3E"
+    />
+  </head>
+  <body>
+    <header class="site-header">
+      <div class="wrap">
+        <a class="brand" href="#top">
+          <span class="brand-mark" aria-hidden="true"></span>
+          <span class="brand-name">rfc9842-reply</span>
+          <span class="brand-tag">incremental tunnel</span>
+        </a>
+        <nav class="nav" aria-label="页面导航">
+          <a class="nav-hide" href="#problem">问题</a>
+          <a class="nav-hide" href="#how">原理</a>
+          <a href="#results">实测</a>
+          <a class="nav-hide" href="#start">快速开始</a>
+          <a href="https://github.com/jixoai/rfc9842-reply">GitHub ↗</a>
+        </nav>
+      </div>
+    </header>
+
+    <main id="top">
+      <!-- ───────────────────────── hero ───────────────────────── -->
+      <section class="hero">
+        <div class="wrap">
+          <p class="eyebrow">Content-addressed delta tunnel</p>
+          <h1>把 AI Agent 的上行带宽<em>砍掉 99.8%</em></h1>
+          <p class="lede">
+            Agent 每一次请求都要重传完整的上下文——system prompt、tools schema、全部多轮历史。本项目在隧道两端各放一个有状态压缩器：<strong>上一轮的请求体，就是这一轮的字典</strong>。相邻请求里 90% 以上的字节上一轮已经传过了，不必再传。
+          </p>
+
+          <div class="stats">
+            <div class="stat">
+              <span class="stat-label">上行体积节省</span>
+              <span class="stat-value">99.9<span class="unit">%</span></span>
+              <span class="stat-note">生产环境 215 条请求累计</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">单请求线宽</span>
+              <span class="stat-value">365<span class="unit">B</span></span>
+              <span class="stat-note">279.8 MB → 659 KB，压缩比 0.225%</span>
+            </div>
+            <div class="stat">
+              <span class="stat-label">14 条连续请求累计</span>
+              <span class="stat-value">22.3<span class="unit">MB</span> → 20.9<span class="unit">KB</span></span>
+              <span class="stat-note">生产日志，压缩比 0.094%</span>
+            </div>
+          </div>
+
+          <div class="actions">
+            <a class="btn btn-primary" href="#start">快速开始 <span class="arrow">→</span></a>
+            <a class="btn" href="https://github.com/jixoai/rfc9842-reply">查看源码 <span class="arrow">↗</span></a>
+          </div>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── problem ───────────────────────── -->
+      <section id="problem">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">01 / 问题</span>
+            <h2>Agent 的上行，远大于下行</h2>
+            <p class="sec-sub">
+              上下文越长，每轮重传的重复字节越多。实测某生产 Agent 的真实负载：上行是下行的
+              14.8 倍，而相邻请求的体积几乎完全一样——这说明绝大部分流量是纯粹的重复。
+            </p>
+          </div>
+
+          <div class="pain">
+            <div class="prose">
+              <p>
+                自建 Agent 直连 LLM 网关时，每一个请求都是一个自包含的完整文档。多轮对话里，前 N 轮的每一句 user 与 assistant 消息，都会在第 N+1 轮被原样重新上传一遍。
+              </p>
+              <p>
+                真正变化的部分只有尾部追加的几十 KB——但线上传的是整个 1.3–2.2 MB。
+                <strong>相邻请求体积比 p50 为 1.003</strong>：体积几乎不变，内容也几乎不变。
+              </p>
+              <p>
+                <code>gzip</code> 救不了这个问题。它是<strong>无状态</strong>的，每个请求都从零开始找重复，永远看不到「上一轮刚传过的那 1.3 MB」。实测只能压到 32%。
+              </p>
+            </div>
+
+            <div class="kv" role="table" aria-label="生产负载实测指标">
+              <div class="kv-row" role="row">
+                <span role="cell">日请求量</span><span role="cell">22,000+</span>
+              </div>
+              <div class="kv-row" role="row">
+                <span role="cell">单请求上行</span><span role="cell">1.3 – 2.2 MB</span>
+              </div>
+              <div class="kv-row" role="row">
+                <span role="cell">日上行</span><span role="cell">20 – 44 GB</span>
+              </div>
+              <div class="kv-row" role="row">
+                <span role="cell">日下行</span><span role="cell">3 GB</span>
+              </div>
+              <div class="kv-row" role="row">
+                <span role="cell">上行 / 下行</span><span role="cell">14.8 : 1</span>
+              </div>
+              <div class="kv-row hl" role="row">
+                <span role="cell">相邻请求体积比 p50</span><span role="cell">1.003</span>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── how it works ───────────────────────── -->
+      <section id="how">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">02 / 原理</span>
+            <h2>把上一轮请求当字典</h2>
+            <p class="sec-sub">
+              客户端在历史请求里挑一个「块哈希命中率」最高的当基线，用 zstd 把新请求压成对基线的 delta。服务端按内容哈希取回字典、解压、校验哈希，再转发上游。全程只用一个 32 字节的哈希协商。
+            </p>
+          </div>
+
+          <div class="diagram">
+            <div class="diagram-grid">
+              <!-- client -->
+              <div class="node">
+                <div class="node-head">
+                  <span class="node-name">relay-client</span>
+                  <span class="node-sub">本地 · 与 Agent 同机</span>
+                </div>
+                <ol class="steps">
+                  <li><span class="step-n">1</span><span>选基线：在历史请求里找<b>块哈希命中率</b>最高的一条</span></li>
+                  <li><span class="step-n">2</span><span><b>zstd delta</b>：把基线当字典压缩新请求</span></li>
+                  <li><span class="step-n">3</span><span><b>40 字节 dcz 头</b>：magic + BLAKE3 哈希，后接 zstd 流</span></li>
+                  <li><span class="step-n">4</span><span>经 QUIC / TCP 隧道发出</span></li>
+                </ol>
+              </div>
+
+              <!-- link -->
+              <div class="link-col" aria-hidden="true">
+                <span class="link-label">隧道</span>
+                <span class="wire-arrow">→</span>
+                <span class="wire"></span>
+                <span class="wire-meta">250 – 3,400 B</span>
+                <span class="wire"></span>
+                <span class="wire-arrow">←</span>
+                <span class="link-label">响应流</span>
+              </div>
+
+              <!-- server -->
+              <div class="node">
+                <div class="node-head">
+                  <span class="node-name">relay-server</span>
+                  <span class="node-sub">远端 · 紧邻上游</span>
+                </div>
+                <ol class="steps">
+                  <li><span class="step-n">1</span><span>按哈希从 <b>store</b> 取回字典</span></li>
+                  <li><span class="step-n">2</span><span>解 delta + 校验 <b>ResultHash</b></span></li>
+                  <li><span class="step-n">3</span><span>转发到上游（同机回环，不出网卡）</span></li>
+                  <li><span class="step-n">4</span><span>存本次 body，供后续请求当基线</span></li>
+                </ol>
+              </div>
+            </div>
+            <p class="diagram-caption">
+              Agent 侧完全无感：只需把 <code>base_url</code> 指向 <code>http://127.0.0.1:18899</code>。
+            </p>
+          </div>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── results ───────────────────────── -->
+      <section id="results">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">03 / 实测</span>
+            <h2>14 条连续真实请求</h2>
+            <p class="sec-sub">
+              从生产日志里取一段连续的请求（基线已就位、全部 200、全部走 dcz），逐条列出体积。所有数字都来自 <code>client-*.jsonl</code>，可用同仓库的代码复算。
+            </p>
+          </div>
+
+          <div class="table-scroll">
+            <table>
+              <caption class="sr-only" style="position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0)">
+                14 条连续请求的压缩前后体积（11:04–11:06 采样窗口）
+              </caption>
+              <thead>
+                <tr>
+                  <th scope="col">时间</th>
+                  <th scope="col" class="num">请求体</th>
+                  <th scope="col" class="num">线宽</th>
+                  <th scope="col" class="num">压缩比</th>
+                  <th scope="col">编码</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr><td>11:04:00</td><td class="num">1,528,775</td><td class="num">1,057</td><td class="num">0.069%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:04:16</td><td class="num">1,531,271</td><td class="num">527</td><td class="num">0.034%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:04:30</td><td class="num">1,535,571</td><td class="num">625</td><td class="num">0.041%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:04:31</td><td class="num">2,178,119</td><td class="num">1,183</td><td class="num">0.054%</td><td><span class="tag tag-hi">dcz L12</span></td></tr>
+                <tr><td>11:04:42</td><td class="num">1,537,405</td><td class="num">493</td><td class="num">0.032%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:04:47</td><td class="num">2,179,890</td><td class="num">661</td><td class="num">0.030%</td><td><span class="tag tag-hi">dcz L12</span></td></tr>
+                <tr><td>11:05:05</td><td class="num">1,539,331</td><td class="num">462</td><td class="num">0.030%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:05:23</td><td class="num">1,545,467</td><td class="num">773</td><td class="num">0.050%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:05:33</td><td class="num">1,548,276</td><td class="num">558</td><td class="num">0.036%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:05:35</td><td class="num">2,182,268</td><td class="num">614</td><td class="num">0.028%</td><td><span class="tag tag-hi">dcz L12</span></td></tr>
+                <tr><td>11:05:51</td><td class="num">2,190,514</td><td class="num">1,557</td><td class="num">0.071%</td><td><span class="tag tag-hi">dcz L12</span></td></tr>
+                <tr><td>11:05:52</td><td class="num">1,552,791</td><td class="num">390</td><td class="num">0.025%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:06:06</td><td class="num">1,556,839</td><td class="num">716</td><td class="num">0.046%</td><td><span class="tag tag-hi">dcz L19</span></td></tr>
+                <tr><td>11:06:19</td><td class="num">2,191,646</td><td class="num">625</td><td class="num">0.029%</td><td><span class="tag tag-hi">dcz L12</span></td></tr>
+                <tr class="total">
+                  <td>合计</td>
+                  <td class="num">24,798,163</td>
+                  <td class="num">10,241</td>
+                  <td class="num hl">0.041%</td>
+                  <td>省 99.96%</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+          <p class="footnote">
+            另一段包含冷启动的 14 条请求（基线尚未就位）为
+            <b>22,273,268 B → 20,911 B = 0.094%</b>，其中 2 条首次 delta 未命中、触发了全量重发（约 762 KB，未计入该统计的 <code>up_wire</code> 列）。这是冷启动的真实代价。
+          </p>
+
+          <div class="bars" role="list" aria-label="与无状态压缩的对比">
+            <div class="bar-row" role="listitem">
+              <span class="bar-name">原始请求体</span>
+              <div class="bar-track"><div class="bar-fill" style="width: 100%"></div></div>
+              <span class="bar-val">22.3 MB</span>
+            </div>
+            <div class="bar-row" role="listitem">
+              <span class="bar-name">gzip -9</span>
+              <div class="bar-track"><div class="bar-fill" style="width: 31.7%"></div></div>
+              <span class="bar-val">31.65%</span>
+            </div>
+            <div class="bar-row" role="listitem">
+              <span class="bar-name">zstd -19 · 无字典</span>
+              <div class="bar-track"><div class="bar-fill" style="width: 22.7%"></div></div>
+              <span class="bar-val">22.65%</span>
+            </div>
+            <div class="bar-row best" role="listitem">
+              <span class="bar-name"><b>dcz delta</b> · 本项目</span>
+              <div class="bar-track"><div class="bar-fill" style="width: 0.35%"></div></div>
+              <span class="bar-val">0.094%</span>
+            </div>
+          </div>
+          <p class="footnote">
+            同一批 14 条真实请求体、本机实测：gzip -9 为 7,049,305 B，dcz 为 20,911 B ——
+            <b>相差 337 倍</b>。单条 1.35 MB 请求上差距更极端：gzip 471,780 B vs dcz 461 B，相差 1023 倍。柱长按体积线性绘制，最后一根为可视化起见已放大到可见宽度；数值以右侧标注为准。
+          </p>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── quick start ───────────────────────── -->
+      <section id="start">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">04 / 快速开始</span>
+            <h2>两条命令，Agent 无感接入</h2>
+            <p class="sec-sub">
+              客户端与服务端都是单个 Go 二进制。Agent 侧只改一个 <code>base_url</code>，请求格式、鉴权、流式语义全部不变。
+            </p>
+          </div>
+
+          <div class="code-grid">
+            <div class="code">
+              <div class="code-head"><span>服务端 · 紧邻上游</span><span>relay-server</span></div>
+              <pre><u># 编译</u>
+go build -o relay-server ./cmd/relay-server
+
+<u># 启动：QUIC 与 TCP/TLS 共用 28443</u>
+./relay-server \
+  -listen   <b>0.0.0.0:28443</b> \
+  -upstream <b>http://127.0.0.1:3431</b> \
+  -uphost   magpie.aiweb.xin \
+  -cert     /path/to/fullchain.pem \
+  -key      /path/to/privkey.pem</pre>
+            </div>
+
+            <div class="code">
+              <div class="code-head"><span>客户端 · 与 Agent 同机</span><span>relay-client</span></div>
+              <pre><u># 编译</u>
+go build -o relay-client ./cmd/relay-client
+
+<u># 启动</u>
+./relay-client \
+  -listen      <b>127.0.0.1:18899</b> \
+  -server      47.82.76.102:28443 \
+  -server-name magpie.aiweb.xin \
+  -transport   auto</pre>
+            </div>
+          </div>
+
+          <div class="code">
+            <div class="code-head"><span>Agent 侧</span><span>只改一行</span></div>
+            <pre><u># 原来的上游</u>
+ANTHROPIC_BASE_URL=https://magpie.example.com
+
+<u># 指向本地隧道入口即可，其余全部不变</u>
+ANTHROPIC_BASE_URL=<i>http://127.0.0.1:18899</i></pre>
+          </div>
+
+          <p class="footnote">
+            <b>-upstream 必须填 127.0.0.1 或同机内网地址</b>。若填公网域名，流量会绕一整圈公网（实测某云主机公网 IP 根本不在网卡上，真实内网地址是 172.17.61.35）。服务端默认基版本缓存 256 MB、spool 活跃区 512 MB / 幂等区 2048 MB，均按字节预算淘汰。
+          </p>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── decisions ───────────────────────── -->
+      <section id="design">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">05 / 设计决策</span>
+            <h2>三个被实测数据钉住的取舍</h2>
+            <p class="sec-sub">
+              这套方案看起来可以更复杂——块级去重、多候选基线、字典目录。三个方向都做了实测，都被数据否决了。
+            </p>
+          </div>
+
+          <div class="cards">
+            <article class="card">
+              <span class="card-n">决策 01</span>
+              <h3>不做块级去重，做整文档 delta</h3>
+              <p>
+                FastCDC 块级去重（min 2KB / avg 8KB / max 64KB，292 KB 请求）产出 17 KB；整文档 zstd delta 产出 1,297 B。原因：LLM 会话以尾部追加为主，LZ77 的变长
+                match 对「未变的前缀」只编码 2–3 字节，而块级去重把未变的 12.7 KB 当成不可分原子。
+              </p>
+              <span class="metric">整文档 delta 更快 <b>13 倍</b></span>
+            </article>
+
+            <article class="card">
+              <span class="card-n">决策 02</span>
+              <h3>基线判定用块哈希命中率，不用公共前缀</h3>
+              <p>
+                真实请求从第 45 字节起就不同（<code>max_tokens</code> 的数值字段变了），平均公共前缀只有 45 字节，但第 64 字节后有 93% 逐字节相同。「从头算前缀」永远只看得到前 45 字节，于是误判「不值得 delta」，白扔 1.3 MB。
+              </p>
+              <span class="metric">区分度 <b>0%</b> → <b>91.5%</b></span>
+            </article>
+
+            <article class="card">
+              <span class="card-n">决策 03</span>
+              <h3>一致性靠内容哈希，不要字典目录</h3>
+              <p>
+                <code>BaseHash = blake3(上一轮 body)</code>。服务端 store 命中就解码、不命中就回 DeltaMiss 让客户端重发全量。没有目录、没有版本号、没有会话 ID，服务端完全无状态。协商成本固定 32 字节，不随缓存规模增长。
+              </p>
+              <span class="metric">协商成本恒定 <b>32 字节</b></span>
+            </article>
+          </div>
+
+          <p class="footnote">
+            第三条与 RFC 9842 §2.1.3 一致：服务端分配的 ID 不得用于保证字典内容，使用前<b>必须校验哈希</b>。历史上的 SDCH 正是因为「客户端块缓存 + 服务端块缓存 +
+            一致性协议」的字典老化问题被 Chrome 移除；「上一轮 body 当字典」天然随会话推进而更新，不存在老化。
+          </p>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── reliability ───────────────────────── -->
+      <section id="reliability">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">06 / 正确性</span>
+            <h2>防静默损坏 + 断线续传</h2>
+            <p class="sec-sub">
+              有状态压缩最危险的失败模式不是报错，而是「解出来了一个语义合理但内容错乱的请求」。模型不会报警，只会给奇怪回答，几天后才发现。
+            </p>
+          </div>
+
+          <div class="pain">
+            <div class="prose">
+              <h3 style="font-size: 13px; margin: 0 0 0.75rem; letter-spacing: -0.01em">
+                三道防线，全部强制开启，没有关闭开关
+              </h3>
+              <p>
+                <strong>1. zstd frame CRC</strong> —— 帧级 checksum（<code>WithEncoderCRC</code>）。关闭它就等于放弃第一道防线。
+              </p>
+              <p>
+                <strong>2. dcz 头里的 BLAKE3 哈希</strong> —— 解压前与提供的字典比对，字典错配立刻拒绝，绝不尝试「解解看」。
+              </p>
+              <p>
+                <strong>3. ResultHash</strong> —— 客户端声明「解码后应当得到的 body 哈希」，服务端解压完再验一次。任一失败都返回错误帧，客户端重发全量。
+              </p>
+            </div>
+
+            <div class="prose">
+              <h3 style="font-size: 13px; margin: 0 0 0.75rem; letter-spacing: -0.01em">
+                断线不该让上游白跑
+              </h3>
+              <p>
+                上游请求用 <code>context.WithoutCancel</code> 派生——<strong>客户端断开不影响上游继续接收</strong>。响应流边收边落盘，磁盘双区域：<code>tmp/</code> 活跃、<code>idem/</code> 幂等，各自按字节预算淘汰。
+              </p>
+              <p>
+                客户端重连带 <code>IdemKey</code> + <code>ResumeFrom</code>（字节偏移）或 SSE <code>event id</code>，从断点接着收。终止帧 <code>FrameDone</code> 让「上游正常完成」与「连接断了」在客户端视角第一次可区分。
+              </p>
+              <p>
+                实测：60 个 SSE 事件的响应在断开后重连，拼接<strong>连贯无重复</strong>。
+              </p>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── limitations ───────────────────────── -->
+      <section id="limits">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">07 / 边界</span>
+            <h2>已知限制</h2>
+            <p class="sec-sub">写清楚边界比多列几个优点有用。</p>
+          </div>
+
+          <ul class="notes">
+            <li><span class="idx">01</span><span><b>冷启动无收益。</b>服务端首次见到某基线时必然 miss，第一次重发是全量成本（约 20–35%）。稳态才是 0.04% 那一档。</span></li>
+            <li><span class="idx">02</span><span><b>响应不压缩。</b>当前只优化上行；下行 p50 约 18 KB，尚未处理。</span></li>
+            <li><span class="idx">03</span><span><b>线宽统计只计首次尝试。</b>DeltaMiss 后的全量重发不计入该请求的 <code>up_wire</code>，因此含冷启动的窗口，其真实占比会高于表格数字。</span></li>
+            <li><span class="idx">04</span><span><b>QUIC 生产未启用。</b>回环端到端测试通过，但生产链路仍走 TCP/TLS；启用需放通 UDP 并验证中间设备。</span></li>
+            <li><span class="idx">05</span><span><b>大文档内存。</b>30 MB 级请求的 delta 需要显著内存，靠 <code>PickLevel</code> 按体积降级（≤2 MB 用 L19，≤8 MB 用 L12，更大用 L9）。</span></li>
+            <li><span class="idx">06</span><span><b>单请求体全量缓冲。</b>客户端与服务端都会把 body 读进内存（为了统计与压缩）。</span></li>
+            <li><span class="idx">07</span><span><b>跨用户字典隔离。</b>若将来共享字典，必须按租户隔离——混合公私数据的字典存在 CRIME/BREACH 类攻击面（RFC 9842 §9.2）。</span></li>
+          </ul>
+        </div>
+      </section>
+
+      <!-- ───────────────────────── specs ───────────────────────── -->
+      <section id="specs">
+        <div class="wrap">
+          <div class="sec-head">
+            <span class="sec-num">08 / 规范</span>
+            <h2>站在 RFC 9842 的肩上</h2>
+            <p class="sec-sub">
+              线格式直接沿用 Compression Dictionary Transport 的 dcz 语义，只是把「按需下载字典」换成了「隧道两端各自持有历史请求」。
+            </p>
+          </div>
+
+          <div class="specs">
+            <div class="spec">
+              <span class="spec-id">RFC 9842</span>
+              <span class="spec-name">Compression Dictionary Transport</span>
+              <span class="spec-use">dcz 线格式、内容哈希协商。线格式一致；请求方向为自研扩展。</span>
+            </div>
+            <div class="spec">
+              <span class="spec-id">RFC 8878</span>
+              <span class="spec-name">Zstandard</span>
+              <span class="spec-use">raw content dictionary，直接用。</span>
+            </div>
+            <div class="spec">
+              <span class="spec-id">RFC 9530</span>
+              <span class="spec-name">Repr-Digest</span>
+              <span class="spec-use">表示身份摘要，语义参考。</span>
+            </div>
+            <div class="spec">
+              <span class="spec-id">RFC 7694</span>
+              <span class="spec-name">Client-Initiated Content-Encoding</span>
+              <span class="spec-use">请求方向编码协商，语义参考。</span>
+            </div>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="wrap">
+        <div class="foot-grid">
+          <div class="foot-brand">
+            <a class="brand" href="#top">
+              <span class="brand-mark" aria-hidden="true"></span>
+              <span class="brand-name">rfc9842-reply</span>
+            </a>
+            <span class="foot-desc">基于内容寻址基版本的<br />增量压缩隧道</span>
+            <span class="foot-desc">Go 编写，单个二进制，Agent 无感接入。</span>
+          </div>
+          <div class="foot-links">
+            <a href="https://github.com/jixoai/rfc9842-reply">GitHub</a>
+            <a href="https://github.com/jixoai/rfc9842-reply#readme">README</a>
+            <a href="https://www.rfc-editor.org/rfc/rfc9842.html">RFC 9842</a>
+            <a href="https://www.rfc-editor.org/rfc/rfc8878.html">RFC 8878</a>
+          </div>
+        </div>
+
+        <div class="wordmark" aria-hidden="true">rfc9842-reply</div>
+
+        <div class="colophon">
+          <span>© 2026 jixoai</span>
+          <span>所有数字来自生产日志 client-*.jsonl，可复算</span>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
