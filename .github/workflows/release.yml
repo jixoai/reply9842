@@ -204,10 +204,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      # 刻意不传 registry-url：它会让 setup-node 往 .npmrc 写 NODE_AUTH_TOKEN，
+      # npm 见到该变量就走 Basic Auth，OIDC 换来的短期凭证被忽略，结果是
+      # E404（registry 对无权写入返回 404 而非 403）。npm 默认 registry 即可。
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
 
       - name: Download all binaries into package vendor/
         uses: actions/download-artifact@v4
@@ -252,8 +254,18 @@ jobs:
         working-directory: npm
         run: npm pack --dry-run 2>&1 | tail -40
 
+      - name: Upgrade npm (Trusted Publishing 需要 CLI 11+)
+        run: npm install -g npm@latest
+
       - name: Publish via OIDC
         working-directory: npm
-        # Trusted Publishing 不需要 NODE_AUTH_TOKEN：npm CLI 11+ 用 Actions 的
-        # id-token 换短期凭证，并自动生成 provenance。
-        run: npm publish --provenance --access public
+        # Trusted Publishing：npm CLI 11+ 用 Actions 的 id-token 换短期凭证，
+        # 自动生成 provenance。必须确保环境里没有 NODE_AUTH_TOKEN——一旦存在，
+        # npm 优先用它做 Basic Auth，OIDC 不生效（实测 E404）。
+        env:
+          NODE_AUTH_TOKEN: ""
+          NPM_CONFIG_PROVENANCE: "true"
+        run: |
+          unset NODE_AUTH_TOKEN || true
+          rm -f ~/.npmrc .npmrc 2>/dev/null || true
+          npm publish --provenance --access public
