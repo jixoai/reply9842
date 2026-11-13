@@ -33,6 +33,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -186,6 +187,22 @@ type app struct {
 }
 
 func main() {
+	// 越早装越好：初始化阶段也可能 panic。
+	installCrashLog(relayclient.DefaultDir())
+	// 普通 panic（非 runtime fatal）在这里落盘后再退出。没有它，从 Finder
+	// 启动时整个进程会「无声消失」——用户只能报告「闪退」。
+	defer func() {
+		if r := recover(); r != nil {
+			stack := debug.Stack()
+			fmt.Fprintf(os.Stderr, "panic: %v\n%s", r, stack)
+			_ = writeCrashReport(relayclient.DefaultDir(), r, stack)
+			// 用非零退出码：macOS 登录项的 KeepAlive 是 SuccessfulExit=false，
+			// 只有非零退出才会被 launchd 拉起来（settings.json 的 running 会让
+			// 拉起后的进程自己恢复隧道）。recover 之后正常 return 等于 exit 0，
+			// 那就不重启了——自恢复链条在这里断掉。
+			os.Exit(2)
+		}
+	}()
 	// Windows：go install 出来的 exe 是 console 子系统，先隐藏黑框（release
 	// 构建另有 -H=windowsgui，两套都兜住）
 	hideConsole()
@@ -351,7 +368,7 @@ func main() {
 			}
 		}
 		// 登录启动的意义就是立刻开始工作；-start 是同样的语义，只是要看窗口。
-		if login || *startNow || *startAlias {
+		if shouldStartOnLaunch(login, *startNow || *startAlias, st) {
 			a.start()
 		}
 		// 自动更新：只在用户打开开关、且不是被自己重启起来的这次启动时检查。
@@ -543,40 +560,31 @@ func (a *app) showWindow() {
 	})
 }
 
+// 出货窗口尺寸。改这里就够了：测试与官网截图都读这两个常量，
+// 散落的 560/660 字面量出现过一次「改了窗口、测试还在量旧尺寸」的事故。
+const (
+	defaultWinWidth  = 580
+	defaultWinHeight = 640
+)
+
 // createWindow 建面板窗口。主线程调用。
 func (a *app) createWindow() {
 	win := mygo.NewWindow(mygo.WindowOptions{
 		Title: "reply9842",
-		// 480×496。
+		// 尺寸演进：480×496 → 560×660 → **580×640**（2026-11-14 owner 定稿）。
 		//
-		// 560×660。
+		// 宽度 580：两张图的刻度列 + 绘图区在 480 宽时只剩约 370，48 根柱子每根
+		// 不到 8px，堆叠柱会糊成一片；580 让单柱约 10px，也摆脱了「手机比例」。
 		//
-		// 2026-11-13 owner 要求「默认窗口做大一点，底部就不用两栏、合并成一栏」，
-		// 同时面板要放两张图。这两个要求一起决定了尺寸：
+		// 高度 640：不是拍的，是量出来的（ui.Tester 逐元素取底边）。设置页最坏的
+		// 组合是「更新失败两行 + 保存失败两行」，此时内容底边约 611——640 减去
+		// 顶栏 48 与底栏 33 后仍放得下。这条约束由 TestSettingsFitsShippedWindow
+		// 守着：它按出货尺寸渲染最坏组合，断言每一行都在 footer 之上。
+		// 窗口再矮就交给设置页自己滚（比切掉一行好）；MinHeight=400 是硬下界。
 		//
-		//  1. 高度：顶栏 48 + 主图(最小 110 + 卡片装饰 56) + 副图(88 + 56)
-		//     + 底栏 32 + 上下内边距 26 + 卡片间距 ≈ 610。
-		//  2. 宽度：两张图的纵轴标签列（34px）+ 绘图区在 480 宽时只剩约 370，
-		//     48 根柱子每根不到 8px，堆叠柱会糊成一片。560 让单柱约 9.5px。
-		//     560 也是「不再是手机比例」的下限，桌面应用该有的样子。
-		//
-		// # 为什么从 640 加到 660（同日设置页多了三行更新配置）
-		//
-		// 不是拍的，是量出来的（ui.Tester 无界高度渲染后逐元素取底边）：
-		//
-		//	设置页空闲                        内容底 518 → 需要 ≈561
-		//	设置页运行中                      内容底 568 → 需要 ≈611
-		//	运行中 + 两行更新错误              内容底 568 → 需要 ≈611
-		//	运行中 + 两行更新错误 + 两行保存失败提示
-		//	                                  内容底 611 → 需要 ≈654  ← 640 时被 footer 压住
-		//
-		// 最后一行是唯一超出 640 的组合，而它恰好是「更新失败、设置也存不下来」
-		// 时用户最需要读到的那句话。加 20 让最坏情况仍有余量；面板 tab 多出的
-		// 高度由主图 Grow(1) 吃掉，不损失任何东西。
-		//
-		// 主图 Grow(1) 吃满剩余高度，副图定高 88——窗口继续拉高时变高的是主图。
-		Width:  560,
-		Height: 660,
+		// 面板 tab 的两张图等高（各 Grow(1)），窗口拉高时两张一起变高。
+		Width:  defaultWinWidth,
+		Height: defaultWinHeight,
 		// 窗口可以拉大，但别小到把顶栏右侧那一簇挤成两行（顶栏靠收起应用名
 		// 兜到 468，见 titleBar 的 showName）。
 		MinWidth: 440,
@@ -663,6 +671,8 @@ func (a *app) start() {
 		// 常驻显示出来了，同一件事说两遍只会让用户怀疑自己漏看了什么。
 		return
 	}
+	// 把「正在运行」持久化：下次启动（含登录项、崩溃后重开）应当自动接着跑。
+	a.persistRunState()
 	// 启动成功不弹提示：顶栏开关整个变成绿色停止块、footer 出现「运行中 00:02」、
 	// 徽标换成真实端口——三处同时变，比一行会推挤布局的提示条说得更清楚。
 }
@@ -671,7 +681,27 @@ func (a *app) stop() {
 	if err := a.runner.Stop(context.Background()); err != nil {
 		a.setNotice(humanError(err), true)
 	}
+	// 手动停止同样要落盘：用户明确说过「停」，重启后就不该自己跑起来。
+	a.persistRunState()
 	// 同上：停止成功由开关与 footer 表达，不需要额外一行字。
+}
+
+// persistRunState 把当前 Runner 的运行状态写进设置文件。
+//
+// 写盘失败不弹提示：这是「记住状态」的附带动作，失败也只影响下次启动的默认值，
+// 不该打断正在启动/停止的主流程。错误留在 settingsErr 里，设置页会显示。
+func (a *app) persistRunState() {
+	_ = a.saveSettings()
+}
+
+// shouldStartOnLaunch 决定这次启动要不要立刻开始转发。
+//
+// 四个来源，优先级从「显式」到「继承」：
+//   - login：登录项启动，进系统就是为了接着跑
+//   - flagStart：命令行显式 -start / -autostart
+//   - running：上次退出时的状态（用户手动停过就是 false，不许自动复活）
+func shouldStartOnLaunch(login, flagStart bool, st relayclient.Settings) bool {
+	return login || flagStart || st.Running
 }
 
 // toggle 启动 / 停止（托盘菜单与主按钮共用同一条路径）
@@ -750,6 +780,9 @@ func (a *app) currentSettings() relayclient.Settings {
 		WindowSec:    int64(window / time.Second),
 		AutoUpdate:   a.autoUpdate,
 		UpdateMirror: strings.TrimSpace(a.updateMirror),
+		// 运行态由 Runner 的**实际**状态给出，不是某个「想让它跑」的标记：
+		// 启动失败时不能让文件写成 true，否则下次启动会再失败一次。
+		Running: a.running(),
 	}
 }
 

@@ -317,9 +317,14 @@ func (a *app) panelPane(c *ui.Context, p *glass.Palette) {
 	//   上：压缩率——「省了多少」，本产品的卖点
 	//   下：流量与延迟——「现在顺不顺」，压缩率图完全看不见的维度
 	//
-	// 高度分配：上图 Grow(1) 吃满剩余，下图定高。两张都 grow 的话比例会随
-	// 窗口高度漂移，而「谁该长得更多」没有依据；定高副图 + 主图 grow 让
-	// 窗口拉大时变高的是主图，主次分明。
+	// 高度分配（owner 2026-11-14 定）：两张卡各 Grow(1)，绘图区等高。
+	//
+	// 上一版是「主图 grow + 副图定高 156」：截图实测绘图区 228 vs 154，
+	// 双序列（柱 + 折线）的图信息更多却矮 74px，而上面单序列图多出来的
+	// 高度只是柱子上方的空白。两张图各自回答一个问题，没有哪张该独占
+	// 剩余空间；等高之后两张图的柱底、刻度在同一屏上直接对齐。代价是
+	// 窗口拉高时两张一起变高、主图不再独占增量——这是有意的取舍：本面板
+	// 不设「主图」，两图是并列的两个问题（省了多少 / 现在顺不顺）。
 	a.chartCard(c, p)
 	a.trafficCard(c, p)
 }
@@ -350,7 +355,10 @@ func (a *app) failureLine(c *ui.Context, p *glass.Palette) {
 // 状态点晕成 20px 的一团（上一轮真实截图里，错误态的红晕半径约 20px）。
 // 要强调就给一圈极淡的外描边。
 func (a *app) liveBadge(c *ui.Context, p *glass.Palette, running bool) {
-	dot, text := p.Success, "实时"
+	// 圆点用 p.DownBar 而不是 p.Success：同一条标题行里已经有数据绿
+	// （图例「省下」），两种相近的绿（#54bf5c vs #4ec38a）并排会被读成
+	// 「同一色的两种深浅」；「实时」表达的就是「数据在流」，用系列绿更准。
+	dot, text := p.DownBar, "实时"
 	if !running {
 		dot, text = p.Tertiary, "已暂停"
 	}
@@ -359,7 +367,8 @@ func (a *app) liveBadge(c *ui.Context, p *glass.Palette, running bool) {
 		InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.05)).
 		Radius(999).Shrink(0).
 		Children(func() {
-			ui.Box(c).Size(4, 4).Radius(2).Background(dot).Shrink(0)
+			// 6×6：与图例色块同一尺寸（4px 时它在 11px 的文字旁显得像颗尘点）。
+			ui.Box(c).Size(6, 6).Radius(3).Background(dot).Shrink(0)
 			ui.Text(c, text).FontSize(11).LetterSpacing(0.2).
 				TextColor(p.Tertiary).SingleLine()
 		})
@@ -450,6 +459,96 @@ const (
 	chartAxisGap   float32 = 6
 )
 
+// ---- 绘图区的纵向比例尺（两张图共用同一个换算入口）----
+
+// plotTopInset / plotBottomInset 绘图区上下留给刻度文字的内缩（DIPs）。
+//
+// 刻度标签以刻度值为中心，最上/最下两个标签各有约 3px 伸到刻度值之外；
+// 8/6 的内缩让它们既不越出绘图区（不被裁），也不贴到卡片边缘。
+//
+// 顶部比底部多 2：绘图区顶边紧挨着图例（卡片里只有一个 Gap(8)），
+// 标签顶部再往上就没有呼吸了（实测「12.4 MB」的字顶距卡片内容区仅 1px）。
+const (
+	plotTopInset    float32 = 8
+	plotBottomInset float32 = 6
+)
+
+// plotTopHeadroom 比例尺顶端再往下让出的留白（DIPs）。
+//
+// 只有比例尺（柱顶、折线点、100% 虚线）吃这个内缩，刻度文字不吃：峰值柱顶
+// 与最上刻度中心因此留出 3px。两者齐平时（上一版实测差 0.5px）1x 下读作
+// 「柱顶顶到了坐标系上沿」，而柱子必须先于刻度收住，图才有上边框。
+const plotTopHeadroom float32 = 3
+
+// plotScale 绘图区的纵向比例尺：把 [0,1] 的比例换成 y。
+//
+// 唯一的换算入口。柱顶、柱底、折线点、参考虚线、左侧刻度标签**全部**走
+// y()，同一个比例永远落在同一个像素上。上一轮的缺陷正是两套换算并存：
+// 柱高按「96% 可用高度」算、100% 虚线按整高算，于是 100% 被画在 94% 的
+// 位置（实测低 15px），虚线从每根柱顶下方横穿而过。
+type plotScale struct {
+	top  float32 // frac=1 的 y（轴顶）
+	base float32 // frac=0 的 y（基线）
+}
+
+// newPlotScale 由绘图区矩形算比例尺。r 必须是绘图区（已扣掉刻度列），
+// 不是整行：否则刻度的 x 与柱子的 x 会错开一个 gutter。
+func newPlotScale(r ui.Rect) plotScale {
+	top := r.Y + plotTopInset + plotTopHeadroom
+	base := r.Y + r.H - 1 - plotBottomInset
+	if base < top {
+		base = top
+	}
+	return plotScale{top: top, base: base}
+}
+
+// y 比例尺：frac=0 → 基线，frac=1 → 轴顶。
+func (s plotScale) y(frac float32) float32 {
+	f := float32(clampF(float64(frac), 0, 1))
+	return s.base - f*(s.base-s.top)
+}
+
+// height 一段比例（0..1）对应的高度（像素），供柱高使用。
+func (s plotScale) height(frac float32) float32 { return s.y(0) - s.y(frac) }
+
+// plotArea 绘图区：扣掉左侧刻度列的 gutter。
+//
+// 两张图共用同一组 gutter（chartAxisWidth + chartAxisGap），柱子的 x 落点
+// 与刻度因此跨图对齐。
+func plotArea(r ui.Rect) ui.Rect {
+	gutter := chartAxisWidth + chartAxisGap
+	if r.W <= gutter {
+		return ui.Rect{}
+	}
+	return ui.Rect{X: r.X + gutter, Y: r.Y, W: r.W - gutter, H: r.H}
+}
+
+// axisTicks 纵轴刻度列。
+//
+// 位置由 plotScale 反算，不用 Grow 均匀分布：Grow 只能把 N 个标签摊开，
+// 而刻度必须落在**数据**的 y 上。上一版靠 Grow（标签在行内居中），最上
+// 刻度比最高柱顶低 4px，读起来像柱子顶出了坐标系。这里把标签绝对定位在
+// 纵向盒里（Top/Bottom 内缩 = plotTopInset/plotBottomInset，见 plotScale），
+// 每个标签以刻度值为中心；盒顶比比例尺顶端高 plotTopHeadroom，于是峰值柱顶
+// 总在最上刻度中心之下 3px（柱顶不顶格）。
+func (a *app) axisTicks(c *ui.Context, p *glass.Palette, size float32, labels ...string) {
+	if len(labels) < 2 {
+		return
+	}
+	ui.Box(c).Absolute().Left(0).Width(chartAxisWidth).
+		Top(plotTopInset).Bottom(plotBottomInset).Children(func() {
+		for i, label := range labels {
+			frac := 1 - float32(i)/float32(len(labels)-1)
+			ui.Box(c).Absolute().Left(0).Right(0).
+				TopPercent((1-frac)*100).TranslatePercent(0, -50).
+				AlignItems(ui.End).Children(func() {
+				ui.Text(c, label).FontSize(size).FontFeatures("tnum").
+					TextColor(p.Tertiary).SingleLine()
+			})
+		}
+	})
+}
+
 // trafficCard 流量与延迟图（第二张）。
 //
 // ── 为什么需要第二张图 ────────────────────────────────────────────────────
@@ -474,7 +573,7 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 	running := a.running()
 	hasData := a.hasTraffic()
 
-	glass.Surface(ui.Column(c).Padding(12, 14, 12).Gap(8), p, glass.Card).Children(func() {
+	glass.Surface(ui.Column(c).Padding(12, 14, 12).Gap(8).Grow(1), p, glass.Card).Children(func() {
 		ui.Row(c).AlignItems(ui.Center).Gap(10).Children(func() {
 			glass.Heading(c, p, "流量与延迟")
 			ui.Box(c).Grow(1)
@@ -493,7 +592,7 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 		})
 
 		if !hasData {
-			ui.Box(c).Height(trafficPlotHeight).FillWidth().
+			ui.Box(c).Grow(1).MinHeight(52).FillWidth().
 				AlignItems(ui.Center).Justify(ui.Center).Children(func() {
 				ui.Text(c, "等待流量数据").FontSize(11.5).
 					TextColor(p.MutedForeground).SingleLine()
@@ -507,18 +606,6 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 	})
 }
 
-// trafficPlotHeight 流量图绘图区的固定高度。
-//
-// 与上面那张「吃掉剩余高度」的图不同，这张是定高的：两张图同时 grow 会让
-// 比例随窗口高度漂移（窗口拉大时两张图都变高，但谁该长得更多没有依据）。
-// 定高 + 上面那张 grow，结果是「主图随窗口长、副图稳定」——主次分明。
-//
-// 156 而不是 88：真实数据的单桶流量是重尾分布——一个 2MB 的桶旁边常跟着
-// 十几个 100-300KB 的桶，88px 时后者只剩 4-12px，读者会以为它们「没有流量」。
-// 加高到 156 后常态柱有 15-30px，足以读出高低差；峰值仍是满高，但不靠
-// 压扁其它柱来成立（另见 trafficPlot 里的最小可见高度）。
-const trafficPlotHeight float32 = 156
-
 // hasTraffic 是否有可画的流量数据（上下行任一非零即可）
 func (a *app) hasTraffic() bool {
 	for _, b := range a.agg.Series {
@@ -531,130 +618,155 @@ func (a *app) hasTraffic() bool {
 
 // trafficPlot 画流量柱 + 延迟折线。
 //
-// 三条渲染契约（都来自「延迟被画成一堆碎划线」的反馈）：
+// 四条渲染契约（全部来自像素复核）：
 //
 //  1. 折线用 StrokePolyline（真斜线 + 圆头圆角），不是 Painter.Line——
 //     Line 只画水平/垂直，斜段会退化成一条短横线，整条曲线看起来像坏点。
-//  2. 相邻的非空桶必须连成一段；只有 Count==0 的桶才断开，并且由
-//     latencyHasGaps 在图例里说明「断点=无样本」，不让断线读成渲染失败。
-//  3. 单点数据画一段最小 7px 的圆头线，不小于一个可辨认的短划。
+//  2. 折线顶点的 x 与柱心**是同一个表达式**（bucketCenter）。上一版折线落在
+//     桶边界（柱缝中点）上，整体左移了半个槽位（实测 -8px），顶点压在柱缝上，
+//     读数会归到错误的桶。重叠是可接受的——折线画在柱子之上，并且靠第 4 条
+//     的描边把「叠加」这件事画清楚。
+//  3. 只有「有延迟样本」的桶（Count>0 且 MsSum>0）才有点，其余断开。上一版
+//     只判 Count>0，于是「有请求但没采到隧道往返」的桶按 AvgMs()=0 画在基线上，
+//     在离柱群 160px 的空白处留下一条 17×2px 的橙线——1x 下就是一道划痕。
+//  4. 折线先画一层深色描边（线宽 +2px）再画琥珀线：2px 的线直接斜穿蓝色柱体
+//     时，柱身被切成上下两段，读作「渲染坏了」；1px 的深色环让线读作「浮在柱子
+//     上的一条线」，这是「有意叠加」而不是划痕。选它而不是降低柱体透明度：
+//     柱高/柱色本身承载量级读数，压透明度会让相邻桶的对比也一起变淡。
+//
+// 单点（孤立的非空桶）画圆点而不是横短划：顶点落在柱心之后，一根 3.8px 的
+// 横短划会与柱顶的边混在一起；圆点（线宽 +2 的直径）在 1x 下读作「一个样本」。
 //
 // 量纲不混轴：左轴只标字节（顶=峰值、中=峰值/2、底=0），延迟的数值
 // （当前/峰值/均值）由图下那行摘要给出。上一版在同一根左轴上同时标
 // "2.2 MB" 与 "101603 ms" 且没有刻度，读者无法判断折线的高度代表什么。
+// 柱与线的纵向位置都走 plotScale（峰值柱顶 / 峰值延迟点 = 比例尺顶端，
+// 也就是最上刻度中心往下 plotTopHeadroom 的那条线）。
 func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 	series := a.agg.Series
 
 	// 比例尺：柱的基准取「本窗口最大单桶字节」，线的基准取「本窗口最大平均延迟」。
-	// 两者各算各的，但都至少取 1，避免除零。
+	// 两者各算各的，但都至少取 1，避免除零。两条比例尺共用同一个纵向盒
+	// （见 plotScale）：峰值柱的柱顶与峰值延迟点都精确落在轴顶刻度上。
 	var maxBytes int64 = 1
 	var maxMs int64 = 1
 	for _, b := range series {
 		if v := b.UpWire + b.DownWire; v > maxBytes {
 			maxBytes = v
 		}
+		if !hasLatencySample(b) {
+			continue
+		}
 		if v := b.AvgMs(); v > maxMs {
 			maxMs = v
 		}
 	}
 
-	ui.Row(c).Height(trafficPlotHeight).FillWidth().
-		AlignItems(ui.Stretch).Gap(chartAxisGap).Children(func() {
-		// 字节刻度三档：顶=本窗口峰值、中=峰值的一半、底=0。
-		// 延迟不在同一根轴上（见函数头注释），它的数值在摘要行里。
-		ui.Column(c).Width(chartAxisWidth).Shrink(0).AlignItems(ui.End).Children(func() {
-			ui.Text(c, humanBytes(maxBytes)).FontSize(8).FontFeatures("tnum").
-				TextColor(p.Tertiary).SingleLine()
-			ui.Box(c).Grow(1)
-			ui.Text(c, humanBytes(maxBytes/2)).FontSize(8).FontFeatures("tnum").
-				TextColor(p.Tertiary).SingleLine()
-			ui.Box(c).Grow(1)
-			ui.Text(c, "0").FontSize(8).
-				TextColor(p.Tertiary).SingleLine()
-		})
-
-		ui.Box(c).Grow(1).Draw(func(pt *ui.Painter, r ui.Rect) {
-			if r.W <= 0 || r.H <= 0 {
+	ui.Box(c).Grow(1).MinHeight(chartMinHeight).FillWidth().
+		Draw(func(pt *ui.Painter, r ui.Rect) {
+			area := plotArea(r)
+			if area.W <= 0 || area.H <= 0 {
 				return
 			}
+			s := newPlotScale(area)
+
 			// 基线
-			pt.Fill(ui.Rect{X: r.X, Y: r.Y + r.H - 1, W: r.W, H: 1}, p.Edge, 0)
+			pt.Fill(ui.Rect{X: area.X, Y: s.base, W: area.W, H: 1}, p.Edge, 0)
 
 			n := len(series)
 			if n == 0 {
 				return
 			}
-			// 柱宽：留 2px 间隙，但不小于 1.5px（48 根柱子时仍要看得见）
-			slot := r.W / float32(n)
+			// 柱宽：留 22% 间隙，但不小于 1.5px（48 根柱子时仍要看得见）
+			slot := area.W / float32(n)
 			gap := slot * 0.22
-			bw := slot - gap
-			if bw < 1.5 {
-				bw = 1.5
-			}
+			bw := max(slot-gap, 1.5)
+			// bucketCenter 第 i 个桶的中心 x。柱与折线点共用它——这是
+			// 「折线顶点 x == 柱心 x」在代码层面的唯一保证（见函数头第 2 条）。
+			bucketCenter := func(i int) float32 { return area.X + (float32(i)+0.5)*slot }
 
 			// 先画完所有柱子，再画折线：折线必须在柱子之上，否则后画的
 			// 柱子会盖住它经过的那一段，看起来又像断线。
 			for i, b := range series {
-				x := r.X + float32(i)*slot + gap/2
+				total := b.UpWire + b.DownWire
+				if total <= 0 {
+					continue
+				}
+				x := bucketCenter(i) - bw/2
 
 				// 上行与下行**堆叠**而不是并排：「这一桶总共走了多少」是
 				// 更常见的读数，并排会让柱宽减半、48 根时几乎看不清。
-				up := float32(b.UpWire) / float32(maxBytes) * r.H
-				down := float32(b.DownWire) / float32(maxBytes) * r.H
-				if total := up + down; total > 0 && total < minTrafficBarPx {
-					// 非零桶至少要 3px：否则 2MB 峰值旁的小流量桶只剩 1px，
-					// 读者会把它读成「这一段时间没有数据」。
-					k := minTrafficBarPx / total
-					up *= k
-					down *= k
-				}
-				if up+down > r.H-1 {
-					// 峰值柱自己可能刚好满格；留 1px 让柱顶不贴边
-					k := (r.H - 1) / (up + down)
-					up *= k
-					down *= k
-				}
-				if up > 0 {
-					pt.Fill(ui.Rect{X: x, Y: r.Y + r.H - up, W: bw, H: up},
+				h := trafficBarHeight(total, maxBytes, s.base-s.top)
+				upH := h * float32(b.UpWire) / float32(total)
+				downH := h - upH
+				if upH > 0 {
+					pt.Fill(ui.Rect{X: x, Y: s.base - upH, W: bw, H: upH},
 						p.UpBar, 0.8)
 				}
-				if down > 0 {
-					pt.Fill(ui.Rect{X: x, Y: r.Y + r.H - up - down, W: bw, H: down},
+				if downH > 0 {
+					pt.Fill(ui.Rect{X: x, Y: s.base - upH - downH, W: bw, H: downH},
 						p.DownBar, 0.8)
 				}
 			}
 
-			// 延迟折线：连续非空桶一段；空桶处断开（空转期没有延迟样本，
-			// 连过去会画出一条「延迟平稳」的假象）。
-			usable := r.H - 4 // 上下各留 2px，线帽不贴边
-			run := make([][2]float32, 0, len(series))
+			// 延迟折线：连续有样本的桶连成一段；无样本（Count==0 或
+			// MsSum==0）处断开——空转期没有延迟样本，连过去会画出
+			// 一条「延迟平稳」的假象。
+			var runs [][][2]float32
+			var run [][2]float32
 			flush := func() {
-				if len(run) == 0 {
-					return
+				if len(run) > 0 {
+					runs = append(runs, run)
+					run = nil
 				}
-				if len(run) == 1 {
-					// 单点：一段 7px 的圆头短划，不是一个 2×2 的点。
-					x, y := run[0][0], run[0][1]
-					pt.StrokePolyline([][2]float32{{x - 3.5, y}, {x + 3.5, y}},
-						latencyLineWidth, p.Latency)
-				} else {
-					pt.StrokePolyline(run, latencyLineWidth, p.Latency)
-				}
-				run = run[:0]
 			}
 			for i, b := range series {
-				if b.Count <= 0 {
+				if !hasLatencySample(b) {
 					flush()
 					continue
 				}
-				frac := clampF(float64(b.AvgMs())/float64(maxMs), 0, 1)
-				cx := r.X + float32(i)*slot + slot/2
-				ly := r.Y + r.H - 2 - float32(frac)*usable
-				run = append(run, [2]float32{cx, ly})
+				frac := float32(clampF(float64(b.AvgMs())/float64(maxMs), 0, 1))
+				run = append(run, [2]float32{bucketCenter(i), s.y(frac)})
 			}
 			flush()
-		})
+
+			// 两遍画：先所有描边、再所有线。逐段「描边+线」会在端点处
+			// 让后一段的描边压住前一段的线头。
+			for _, run := range runs {
+				strokeLatency(pt, run, latencyHaloWidth, p.Shade)
+			}
+			for _, run := range runs {
+				strokeLatency(pt, run, latencyLineWidth, p.Latency)
+			}
+		}).Children(func() {
+		// 字节刻度三档：顶=本窗口峰值、中=峰值的一半、底=0。
+		// 延迟不在同一根轴上（见函数头注释），它的数值在摘要行里。
+		a.axisTicks(c, p, 8, humanBytes(maxBytes), humanBytes(maxBytes/2), "0")
 	})
+}
+
+// latencyHaloWidth 折线描边的线宽（DIPs）：比琥珀线宽 2px，左右各 1px。
+const latencyHaloWidth = latencyLineWidth + 2
+
+// strokeLatency 画一段延迟折线（含描边时的同一个几何）。
+//
+// 单点画圆点：StrokePolyline 对单点什么都不画，而「一根横短划」在柱心位置
+// 会与柱顶的边糊在一起（见函数头注释）。
+func strokeLatency(pt *ui.Painter, run [][2]float32, width float32, col ui.Color) {
+	if len(run) == 1 {
+		d := width + 2
+		pt.Fill(ui.Rect{X: run[0][0] - d/2, Y: run[0][1] - d/2, W: d, H: d}, col, d/2)
+		return
+	}
+	pt.StrokePolyline(run, width, col)
+}
+
+// hasLatencySample 桶里是否有可画的延迟样本。
+//
+// Count>0 但 MsSum==0 的桶是「有请求、没采到隧道往返」（错误请求、本地命中
+// 等）：AvgMs() 会返回 0，把它当样本画出来就是在基线上凭空多一个点。
+func hasLatencySample(b stats.Bucket) bool {
+	return b.Count > 0 && b.MsSum > 0
 }
 
 // latencyLineWidth 延迟折线的线宽（DIPs）。
@@ -664,7 +776,35 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 const latencyLineWidth float32 = 2
 
 // minTrafficBarPx 非零流量桶的最小总高度。
+//
+// 只对「有实质流量」的桶生效（见 minTrafficBarFrac）：真实数据的单桶流量是
+// 重尾分布，峰值旁边常跟着 1% 量级的桶，按比例只剩 1-2px，抬到 3px 才读得
+// 出「这里有过流量」。低于 1% 的桶按真实比例画（可能不足 1px），否则空置的
+// 右半幅会被一排 3px 绿点填满。
 const minTrafficBarPx float32 = 3
+
+// minTrafficBarFrac 「有实质流量」的下限：占本窗口单桶峰值的 1%。
+//
+// 1% 的依据：峰值 3.9 MB 时它就是 39 KB，已是「一次正常请求」的量级；
+// 更小的桶（0.08%）在任何柱宽下都读不出量级，只会在基线上留下碎屑。
+const minTrafficBarFrac float32 = 0.01
+
+// trafficBarHeight 一个桶的柱高（像素）。
+//
+// 峰值桶精确等于 plotH（轴顶刻度），其余按比例；最小可见高度只给
+// ≥ 峰值 1% 的桶——上一版无条件把非零桶抬到 3px，右半幅空置时一排 0.08%
+// 的桶变成 3px 绿点，读起来像基线掉渣。低于 1% 的桶按真实比例画（0-1px）。
+func trafficBarHeight(total, maxBytes int64, plotH float32) float32 {
+	if total <= 0 || maxBytes <= 0 || plotH <= 0 {
+		return 0
+	}
+	frac := float32(total) / float32(maxBytes)
+	h := frac * plotH
+	if frac >= minTrafficBarFrac && h < minTrafficBarPx {
+		h = minTrafficBarPx
+	}
+	return h
+}
 
 // trafficSummary 流量图下面那行摘要。
 //
@@ -685,6 +825,11 @@ func (a *app) trafficSummary(g stats.Agg) string {
 		n += b.Count
 		msSum += b.MsSum
 		hsN += b.HsCount
+		// 「当前」也走 hasLatencySample：没有延迟样本的桶（MsSum==0）不该
+		// 把读数改写成 0 ms——它和图上「这里断线」是同一件事的两个说法。
+		if !hasLatencySample(b) {
+			continue
+		}
 		if ms := b.AvgMs(); ms > peak {
 			peak = ms
 		}
@@ -701,9 +846,12 @@ func (a *app) trafficSummary(g stats.Agg) string {
 
 	// 上行/下行用箭头：图例就在上方（上行=蓝柱、下行=绿柱），这里再用四个
 	// 汉字会把「延迟 当前/峰值/均值」这组更重要的读数挤出单行。
+	// 三个延迟读数共用同一个单位（见 humanMsGroup）：同一句里混 ms/s 时
+	// 三个数没法直接比大小。
+	ms := humanMsGroup(latest, peak, msSum/n)
 	text := fmt.Sprintf("最近 %s · ↑%s · ↓%s · 延迟 当前 %s / 峰值 %s / 均值 %s",
 		humanWindow(span), humanBytes(up), humanBytes(down),
-		humanMs(latest), humanMs(peak), humanMs(msSum/n))
+		ms[0], ms[1], ms[2])
 	// 握手：0 次是好事（复用生效），所以措辞要中性偏正面，而不是「无数据」。
 	// 均值不写：一个数已经够回答「有没有在反复握手」，具体耗时不是这行的问题。
 	if hsN == 0 {
@@ -716,12 +864,14 @@ func (a *app) trafficSummary(g stats.Agg) string {
 
 // latencyHasGaps 非空延迟样本之间是否存在空洞（折线因此断开）。
 //
-// 只关心「两个非空桶之间夹着空桶」：开头/结尾的空桶不会让折线断在中间，
-// 不构成视觉上的断点。
+// 判据与画线完全一致（hasLatencySample）：只在「两个有样本的桶之间夹着无样本
+// 的桶」时算断点。开头/结尾的空洞不会让折线断在中间，不构成视觉上的断点。
+// 两处不能各写一套条件——否则图例会为一条看不见的断点做说明，或者对一条
+// 真的断掉的线沉默。
 func (a *app) latencyHasGaps() bool {
 	seen, gap := false, false
 	for _, b := range a.agg.Series {
-		if b.Count > 0 {
+		if hasLatencySample(b) {
 			if gap {
 				return true
 			}
@@ -750,12 +900,6 @@ func (a *app) latencyHasGaps() bool {
 // 压缩 99.9% 时它按比例只有 0.2px，抗锯齿后会完全消失，整根柱子读成纯亮色——
 // 那会丢失「仍然发了东西」这个事实。3px 是 Retina 上能稳定看见一条线的高度。
 const minWirePx float32 = 3
-
-// threshold 90% 参考线：让每根柱子自动跟「好成绩」对比。
-//
-// 为什么是 90%：本产品的生产数据长期在 99% 以上，90% 是「已经明显生效」的门槛；
-// 低于它说明这一秒的请求都是小包或首包（要走全量），看一眼就知道发生了什么。
-const gaugeThreshold = 0.90
 
 // hasSeries 是否有可画的数据（有一秒带流量即可）
 func (a *app) hasSeries() bool {
@@ -802,7 +946,9 @@ func (a *app) legend(c *ui.Context, p *glass.Palette) {
 
 func (a *app) legendSwatch(c *ui.Context, col ui.Color, label string) {
 	ui.Row(c).Gap(4).AlignItems(ui.Center).Shrink(0).Children(func() {
-		ui.Box(c).Size(7, 7).Radius(1.5).Shrink(0).Background(col)
+		// 6×6：与柱子的最小可辨宽度同量级（数据柱净宽 6.6-11px、圆角 2），
+		// 图例 key 与数据同形，读图时不需要再换算一次。
+		ui.Box(c).Size(6, 6).Radius(1.5).Shrink(0).Background(col)
 		ui.Text(c, label).FontSize(10).TextColor(a.pal.Tertiary).SingleLine()
 	})
 }
@@ -810,23 +956,30 @@ func (a *app) legendSwatch(c *ui.Context, col ui.Color, label string) {
 // legendLine 折线类图例：画一小段横线而不是色块。
 //
 // 形状必须与柱状图例区分：同一张图里既有柱又有线时，两种图例都画成方块会让
-// 人以为有三组柱子。线段在这里是「这是个折线」的直接提示。
+// 人以为有三组柱子。线宽与数据折线共用 latencyLineWidth（不是另取一个 1.4），
+// 否则图例上的一条细线会比图里的折线更细，读作两种不同的东西。
 func (a *app) legendLine(c *ui.Context, col ui.Color, label string) {
 	ui.Row(c).Gap(4).AlignItems(ui.Center).Shrink(0).Children(func() {
 		ui.Box(c).Size(11, 7).Shrink(0).Draw(func(pt *ui.Painter, r ui.Rect) {
-			pt.Line(r.X, r.Y+r.H/2, r.X+r.W, r.Y+r.H/2, 1.4, col)
+			pt.StrokePolyline([][2]float32{
+				{r.X + latencyLineWidth/2, r.Y + r.H/2},
+				{r.X + r.W - latencyLineWidth/2, r.Y + r.H/2},
+			}, latencyLineWidth, col)
 		})
 		ui.Text(c, label).FontSize(10).TextColor(a.pal.Tertiary).SingleLine()
 	})
 }
 
-// chartPlot 柱状图本体：纵轴刻度 + 90% 参考线 + 每分钟一根分层柱。
+// chartPlot 柱状图本体：纵轴刻度 + 100% 参考虚线 + 每分钟一根分层柱。
 //
 // 每根柱子的画法（自底向上）：
 //
-//	barH   = max(省下的比例 × 可用高度, minWirePx)   ← 柱子总高 = 压缩率
-//	wireH  = min(minWirePx, barH)                   （蓝，贴底）
-//	savedH = barH - wireH                           （绿，在上）
+//	barH   = max(省下的比例 × 满量程, minWirePx)   ← 柱子总高 = 压缩率
+//	wireH  = min(minWirePx, barH)                 （蓝，贴底）
+//	savedH = barH - wireH                         （绿，在上）
+//
+// 满量程与 100% 虚线、左侧刻度全部来自 plotScale 的同一个换算（见 plotScale
+// 的注释）：100% 的柱顶与虚线在像素上重合，不会再出现「虚线从柱顶下方穿过」。
 //
 // 为什么蓝段是「固定最小高度」而不是「按比例」：这是「压缩率当柱高」这个
 // 映射本身带来的约束。压缩 99.9% 时按比例算蓝段只有 0.1px，抗锯齿后消失，
@@ -842,38 +995,27 @@ func (a *app) legendLine(c *ui.Context, col ui.Color, label string) {
 func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 	series := a.agg.Series
 	// 绘图区吃掉卡片里的剩余高度，但有下限：窗口被拉到最小高度时
-	// 图仍有 chartMinHeight，不至于压成一条线（此时由外层 Scroll 兜底）。
-	plot := ui.Row(c).Grow(1).MinHeight(chartMinHeight).FillWidth().
-		AlignItems(ui.Stretch).Gap(chartAxisGap)
-
-	plot.Children(func() {
-		// 纵轴刻度：0/25/50/75/100%。五档是因为柱高直接读作百分数，
-		// 少一档就得靠目测插值。列宽与流量图共用 chartAxisWidth，
-		// 两张图的绘图区因此左右对齐（同一屏叠放时 x 轴不错位）。
-		ui.Column(c).Width(chartAxisWidth).Shrink(0).AlignItems(ui.End).Children(func() {
-			for i, label := range []string{"100%", "75%", "50%", "25%", "0"} {
-				if i > 0 {
-					ui.Box(c).Grow(1)
-				}
-				ui.Text(c, label).FontSize(8.5).FontFeatures("tnum").
-					TextColor(p.Tertiary).SingleLine()
-			}
-		})
-
-		// 绘图区
-		ui.Box(c).Grow(1).Draw(func(pt *ui.Painter, r ui.Rect) {
-			if r.W <= 0 || r.H <= 0 {
+	// 图仍有 chartMinHeight，不至于压成一条线。
+	ui.Box(c).Grow(1).MinHeight(chartMinHeight).FillWidth().
+		Draw(func(pt *ui.Painter, r ui.Rect) {
+			area := plotArea(r)
+			if area.W <= 0 || area.H <= 0 {
 				return
 			}
-			// 基线（0%）：1px 发丝线，不给网格
-			pt.Fill(ui.Rect{X: r.X, Y: r.Y + r.H - 1, W: r.W, H: 1}, p.Edge, 0)
+			s := newPlotScale(area)
 
-			// 90% 参考线：虚线。画实线会与柱顶混在一起；
-			// 3px/3px 的节奏足够让人看出「这是参考，不是数据」。
-			ty := r.Y + r.H*(1-gaugeThreshold)
-			for x := float32(0); x < r.W; x += 6 {
-				w := min(float32(3), r.W-x)
-				pt.Fill(ui.Rect{X: r.X + x, Y: ty, W: w, H: 1}, p.Border, 0)
+			// 基线（0%）：1px 发丝线，不给网格
+			pt.Fill(ui.Rect{X: area.X, Y: s.base, W: area.W, H: 1}, p.Edge, 0)
+
+			// 100% 参考虚线：y 取 s.y(1)，与一根「省满 100%」的柱顶是
+			// **同一个表达式**。上一版柱高按 96% 的可用高度算、虚线按整高算，
+			// 100% 因此被画在 94% 的位置（截图实测低 15px），1x 下就是虚线
+			// 从每根柱顶下方横穿而过。画实线会与柱顶混在一起，3px/3px 的
+			// 节奏足够让人看出「这是参考，不是数据」。
+			dy := s.y(1)
+			for x := float32(0); x < area.W; x += 6 {
+				w := min(float32(3), area.W-x)
+				pt.Fill(ui.Rect{X: area.X + x, Y: dy, W: w, H: 1}, p.Border, 0)
 			}
 
 			n := len(series)
@@ -883,19 +1025,18 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 			// 柱间留 3px：30 根柱子在 380px 里每根约 9.6px，留 3px 后
 			// 净宽 6.6px —— 足够看出「一根一根」，也容得下 2px 圆角。
 			const gap float32 = 3
-			slot := r.W / float32(n)
+			slot := area.W / float32(n)
 			bw := max(slot-gap, 1)
-
-			// 柱顶留 4% 空隙：100% 压缩的柱子否则会顶到卡片上沿，像被裁了。
-			usable := r.H * 0.96
 
 			for i, b := range series {
 				if b.UpRaw <= 0 {
 					continue // 空分钟不画：基线上的空白就是「这段时间没流量」
 				}
-				saved := clampF(1-float64(b.UpWire)/float64(b.UpRaw), 0, 1)
+				saved := float32(clampF(1-float64(b.UpWire)/float64(b.UpRaw), 0, 1))
 
-				barH := float32(saved) * usable
+				// 柱高 = 压缩率 × 比例尺的满量程。saved=1 时柱顶 = s.top，
+				// 正好落在上面那条 100% 虚线上（像素差 < 1px）。
+				barH := s.height(saved)
 				// 一点没省（saved=0）时柱子高度为 0，只剩一条蓝线：
 				// 那是准确的——「这一分钟完全没有优化」。
 				wireH := min(minWirePx, barH)
@@ -904,19 +1045,23 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 				}
 				savedH := barH - wireH
 
-				x := r.X + float32(i)*slot + (slot-bw)/2
-				bottom := r.Y + r.H - 1
+				x := area.X + float32(i)*slot + (slot-bw)/2
+				top := s.base - barH
 
 				// 绿段（省下）：柱子的主体，从上沿往下
 				if savedH > 0 {
-					pt.Fill(ui.Rect{X: x, Y: bottom - barH, W: bw, H: savedH},
+					pt.Fill(ui.Rect{X: x, Y: top, W: bw, H: savedH},
 						p.DownBar, min(2, bw/2))
 				}
 				// 蓝段（实际发送）：贴底
-				pt.Fill(ui.Rect{X: x, Y: bottom - wireH, W: bw, H: wireH},
+				pt.Fill(ui.Rect{X: x, Y: s.base - wireH, W: bw, H: wireH},
 					p.UpBar, min(2, bw/2))
 			}
-		})
+		}).Children(func() {
+		// 纵轴刻度：0/25/50/75/100%。五档是因为柱高直接读作百分数，
+		// 少一档就得靠目测插值。列宽与流量图共用 chartAxisWidth，
+		// 两张图的绘图区因此左右对齐（同一屏叠放时 x 轴不错位）。
+		a.axisTicks(c, p, 8.5, "100%", "75%", "50%", "25%", "0")
 	})
 }
 
@@ -1357,17 +1502,21 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 	// 版本是最不需要看的（放最右，视线最少落到那里）。底栏不再有复制按钮：
 	// 那是一个动作，放在顶栏徽标上；状态栏保持纯读取。
 	ui.Row(c).Height(32).FillWidth().Padding(0, 16).
-		AlignItems(ui.Center).Background(p.PageDim).Gap(10).Children(func() {
-		ui.Textf(c, "%s · %s", state, a.transportLabel()).
-			FontSize(10.5).TextColor(p.Tertiary).SingleLine()
+		AlignItems(ui.Center).Background(p.PageDim).Gap(footerSegmentGap).Children(func() {
+		// 状态与传输方式之间、以及与后面的统计摘要之间，用的是同一种分隔点
+		// 「 · 」。上一版把摘要前的点写成独立元素并给 Row 设了 Gap(10)，
+		// 于是同一行里出现两种点距（实测 14/13px vs 7/8px），读起来像
+		// 排版事故而不是分组。「自动选择传输」两侧那种多出来的空隙就是这么来的。
+		head := fmt.Sprintf("%s · %s", state, a.transportLabel())
 
 		// 统计摘要：只在有数据时出现。空态下这一格是「还没有请求记录」，
 		// 而状态区已经说了「未运行」——同一件事说两遍只会稀释信息。
 		if line := a.footerStatsLine(); line != "" {
-			ui.Text(c, "·").FontSize(10.5).TextColor(p.Tertiary).SingleLine()
+			ui.Text(c, head+" ·").FontSize(10.5).TextColor(p.Tertiary).SingleLine()
 			ui.Text(c, line).FontSize(10.5).FontFeatures("tnum").
 				TextColor(p.MutedForeground).MaxLines(1).Grow(1)
 		} else {
+			ui.Text(c, head).FontSize(10.5).TextColor(p.Tertiary).SingleLine()
 			ui.Box(c).Grow(1)
 		}
 
@@ -1384,10 +1533,21 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 	})
 }
 
+// footerSegmentGap 底栏里两段文字之间的间隙（DIPs）。
+//
+// 4 ≈ 一个 10.5px 的半角空格：底栏内部的分隔点是写在字符串里的「 · 」，
+// 段与段之间用同一个间隙，两处点距才不会一个 7px、一个 14px（见 footer）。
+// 取 0 会把两段的字挤在一起，取 10 又回到「两种点距」的老问题。
+const footerSegmentGap float32 = 4
+
 // footerStatsLine 底部那一行里的统计摘要（空态返回空串，让调用方跳过）。
 //
 // 口径从「本次会话」改成「近 N 小时」：统计自 2026-11-13 起从磁盘日志重建，
 // 重启不清零，所以「本次会话」已名不副实。前缀写明保留期，让时间跨度可见。
+//
+// 延迟读数走 humanMs（与卡片摘要里的「当前/峰值/均值」同一个换算函数）：
+// 底栏曾经写裸毫秒（"p50 27766 ms"），同一屏上卡片写「31.1 s」——同一量纲
+// 两种写法，读者得自己换算。
 func (a *app) footerStatsLine() string {
 	g := a.agg
 	if g.Requests == 0 {
@@ -1401,8 +1561,8 @@ func (a *app) footerStatsLine() string {
 	if retain <= 0 {
 		retain = int(stats.DefaultRetain / time.Second)
 	}
-	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %d ms",
-		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), g.P50Ms)
+	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %s",
+		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), humanMs(g.P50Ms))
 }
 
 // transportLabel 传输方式的显示名

@@ -74,6 +74,16 @@ type Settings struct {
 	// 那不该让保存失败。真正的解析发生在 update.New，错误会显示在设置页的
 	// 更新状态行里。
 	UpdateMirror string `json:"update_mirror"`
+
+	// Running 上次退出时的运行状态。
+	//
+	// true  = 上次是开着隧道退出的（含登录启动、自动更新重启），下次启动自动进入运行；
+	// false = 用户手动停过，下次启动保持停止。
+	//
+	// 语义是「延续上次的状态」，不是「用户偏好 AlwaysRun」：手动停止就是一次
+	// 明确的表态，不该在重启后被悄悄推翻。老配置文件没有这个字段时为零值
+	// false——即「没配过 = 不自动开始」，与之前的默认行为一致。
+	Running bool `json:"running"`
 }
 
 // DefaultSettings 默认偏好：保留一天、看最近 30 分钟、不自动更新、镜像留空

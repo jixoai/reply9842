@@ -136,7 +136,7 @@ func TestAutoUpdateSwitchPersists(t *testing.T) {
 		t.Fatalf("初始落盘 auto_update 已是 true")
 	}
 
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	cx, cy, ok := findSwitchCenter(tt, "启动时检查并安装新版本（会重启一次）")
 	if !ok {
 		t.Fatalf("找不到自动更新开关：%q", tt.Texts())
@@ -152,7 +152,7 @@ func TestAutoUpdateSwitchPersists(t *testing.T) {
 	}
 
 	// 再点一次关掉，磁盘也要跟着回去
-	tt = ui.NewTester(a.view, 560, 660)
+	tt = ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if cx, cy, ok := findSwitchCenter(tt, "启动时检查并安装新版本（会重启一次）"); ok {
 		tt.ClickAt(cx, cy)
 	}
@@ -192,7 +192,7 @@ func TestUpdateMirrorPersistsAndReachesOptions(t *testing.T) {
 		t.Errorf("留空时 Mirrors = %v，期望 nil（未配置语义）", o.Mirrors)
 	}
 
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	x, y, ok := mirrorInputCenter(tt)
 	if !ok {
 		t.Fatalf("找不到镜像输入框：%q", tt.Texts())
@@ -256,7 +256,7 @@ func TestDevBuildBlocksReplace(t *testing.T) {
 		t.Errorf("提示没有说明原因：%q", a.upd.msg)
 	}
 	// 界面上必须真的把这句话显示出来
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if !tt.HasText("源码构建") {
 		t.Errorf("界面没有显示「源码构建」提示：%q", tt.Texts())
 	}
@@ -270,7 +270,7 @@ func TestDevBuildDisablesSwitchAndInstall(t *testing.T) {
 		stage: updAvailable,
 		info:  update.Info{Current: "dev", Latest: "v0.9.9", HasUpdate: true, DevBuild: true},
 	}
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
 	if tt.HasText("更新到 v0.9.9") {
 		t.Errorf("dev 构建不该给「更新到 …」按钮：%q", tt.Texts())
@@ -301,7 +301,7 @@ func TestCheckUpdateShowsResult(t *testing.T) {
 		}}
 		f.install(a)
 
-		tt := ui.NewTester(a.view, 560, 660)
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 		if err := tt.Click("检查更新"); err != nil {
 			t.Fatalf("点「检查更新」失败：%v", err)
 		}
@@ -321,7 +321,7 @@ func TestCheckUpdateShowsResult(t *testing.T) {
 		}}
 		f.install(a)
 
-		tt := ui.NewTester(a.view, 560, 660)
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 		if err := tt.Click("检查更新"); err != nil {
 			t.Fatalf("点「检查更新」失败：%v", err)
 		}
@@ -345,7 +345,7 @@ func TestCheckUpdateShowsResult(t *testing.T) {
 		}
 		f.install(a)
 
-		tt := ui.NewTester(a.view, 560, 660)
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 		if err := tt.Click("检查更新"); err != nil {
 			t.Fatalf("点「检查更新」失败：%v", err)
 		}
@@ -385,7 +385,7 @@ func TestInstallFullPipeline(t *testing.T) {
 	f.install(a)
 	a.upd = updateSession{stage: updAvailable, info: f.info}
 
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if err := tt.Click("更新到 v0.3.0"); err != nil {
 		t.Fatalf("点安装按钮失败：%v", err)
 	}
@@ -462,7 +462,7 @@ func TestDownloadCancelButtonCancels(t *testing.T) {
 		cancel:     func() { canceled++ },
 	}
 
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if !tt.HasText("取消") {
 		t.Fatalf("下载中没有「取消」按钮：%q", tt.Texts())
 	}
@@ -494,7 +494,7 @@ func TestReplaceStageIsNotCancelable(t *testing.T) {
 	for _, st := range []updateStage{updApplying, updRestarting} {
 		a := newUpdateTestApp(t, "v0.2.0")
 		a.upd = updateSession{stage: st, cancel: func() {}}
-		tt := ui.NewTester(a.view, 560, 660)
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 		if tt.HasText("取消") {
 			t.Errorf("stage=%v 出现了「取消」按钮：%q", st, tt.Texts())
 		}

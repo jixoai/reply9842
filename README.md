@@ -214,6 +214,23 @@ CLI 与 GUI 是同一套逻辑的两条外壳：托盘常驻、关窗不退出�
 SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v
 ```
 
+### 运行状态与自恢复
+
+运行/停止是**可继承**的状态，写在 `settings.json` 的 `running` 里：
+
+- 开着隧道退出（含登录启动、更新后重启）→ 下次启动自动接着跑；
+- 手动点过停止 → 下次启动保持停止（用户明确表态过，不该被悄悄推翻）。
+
+服务可用性分三层兜：
+
+| 层 | 机制 | 覆盖什么 |
+|---|---|---|
+| 进程内 | 监听 goroutine 被 supervisor 守住，`Serve` 意外返回时按 200ms→5s 退避重开 | accept 出错、瞬时 EMFILE |
+| 进程外 | macOS 登录项 `KeepAlive={SuccessfulExit=false}` | 未捕获 panic / 运行时致命错误 |
+| 崩溃现场 | `debug.SetCrashOutput` + main 的 recover → `~/.reply9842/crash.log` | 让「闪退」留下时间戳与完整栈 |
+
+`SuccessfulExit=false` 是刻意的：崩溃才拉起，用户主动「退出」不会被复活。
+
 ### 自动更新（默认关闭）
 
 设置页里是一个开关，默认**关**。打开后按与 npm 引导器完全一致的镜像链下载
@@ -429,6 +446,9 @@ tools/probe-proxy/    测上游各阶段耗时的透明流式代理（排障用�
 6. **跨用户字典隔离**。若将来共享字典，必须按租户隔离——混合公私数据的字典存在
    CRIME/BREACH 类攻击面（RFC 9842 §9.2）。
 7. **GUI 无 Linux 后端**。mygo 的 native UI 只支持 macOS / Windows，Linux 只有 cli 与 server。
+8. **Windows 缺进程级自恢复**。登录项写在 HKCU Run 里，没有 launchd 那种 KeepAlive
+   语义：进程内 supervisor 与 `crash.log` 照常生效，但进程整体崩溃后要用户手动重开
+   （后续可换计划任务 + 失败重启）。macOS 侧已由 `KeepAlive={SuccessfulExit=false}` 兜住。
 
 ## 规范参考
 

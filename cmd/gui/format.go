@@ -43,16 +43,52 @@ func humanDuration(d time.Duration) string {
 	return fmt.Sprintf("%02d:%02d", m, s)
 }
 
-// humanMs 延迟的显示口径：1000ms 以下保留毫秒，以上换秒。
+// humanMs 单个延迟读数的显示口径：1000ms 以下保留毫秒，以上换秒。
 //
 // 真实链路的延迟会到几十秒（首包/大包），"28771 ms" 读起来要先数位数；
 // "28.8 s" 一眼就是「很慢」。阈值取 1000 而不是 60000：4 位数的毫秒
 // 在任何摘要行里都太长。
+//
+// 它直接复用 humanMsGroup 的换算（单值即一组）：两处各写一套换算时，
+// 同一屏上会出现「p50 27766 ms」与「均值 31.1 s」并排——同一个量纲两种写法。
 func humanMs(ms int64) string {
-	if ms >= 1000 {
-		return fmt.Sprintf("%.1f s", float64(ms)/1000)
+	return humanMsGroup(ms)[0]
+}
+
+// humanMsGroup 同一组延迟读数（同一行里的「当前 / 峰值 / 均值」）用**同一个
+// 单位**显示：先按其中最大值选单位，再统一换算。
+//
+// humanMs 是逐个数各算各的，于是同一句里会混两种量纲：
+//
+//	当前 788 ms / 峰值 81.7 s / 均值 42.8 s
+//
+// 三个数要比较大小，读者得先在脑子里换算一遍。组内统一后是
+//
+//	当前 0.8 s / 峰值 81.7 s / 均值 42.8 s
+//
+// 换算到秒后不足 0.05s 的读数写 "<0.1 s"（写 0.0 s 会被读成「没有延迟」）。
+func humanMsGroup(values ...int64) []string {
+	var hi int64
+	for _, v := range values {
+		if v > hi {
+			hi = v
+		}
 	}
-	return fmt.Sprintf("%d ms", ms)
+	out := make([]string, len(values))
+	if hi < 1000 {
+		for i, v := range values {
+			out[i] = fmt.Sprintf("%d ms", v)
+		}
+		return out
+	}
+	for i, v := range values {
+		if v*10 < 500 { // < 50ms：一位小数会舍成 0.0
+			out[i] = "<0.1 s"
+			continue
+		}
+		out[i] = fmt.Sprintf("%.1f s", float64(v)/1000)
+	}
+	return out
 }
 
 // displayVersion 版本号的显示形态，统一成一个前导 v。

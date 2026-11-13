@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"image"
+	"image/color"
 	"image/png"
 	"os"
 	"path/filepath"
@@ -94,7 +96,7 @@ func newTestApp(t *testing.T) *app {
 // 纳入了 go test。
 func TestViewBuilds(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
 	// 空态：顶栏开关（"启动代理" 是它的无障碍名）+ 图表卡 + 顶栏复制徽标，
 	// 不该出现统计三格，也没有独立的状态行。
@@ -119,7 +121,7 @@ func TestViewBuilds(t *testing.T) {
 // 这是本轮改版最重要的一条视觉约束，用文本 + 像素双重断言守住。
 func TestIdleHasNoHeroNumber(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
 	for _, banned := range []string{"—", "0×", "0.0×"} {
 		if tt.HasText(banned) {
@@ -135,7 +137,7 @@ func TestIdleHasNoHeroNumber(t *testing.T) {
 // 空态的信息由 hero 的一句话承担，同一件事不用两处说。
 func TestNoEmptyTalkRow(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	for _, banned := range []string{"尚无流量", "运行后这里显示"} {
 		if tt.HasText(banned) {
 			t.Errorf("出现了已删除的空话横条 %q：%q", banned, tt.Texts())
@@ -149,7 +151,7 @@ func TestNoEmptyTalkRow(t *testing.T) {
 // 给用户看 "vdev" 没有意义。
 func TestVersionShownOnce(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	want := displayVersion(version)
 	n := 0
 	for _, s := range tt.Texts() {
@@ -173,7 +175,7 @@ func TestVersionShownOnce(t *testing.T) {
 // 这样主面板不需要滚动就能看完。
 func TestPanelTabHasNoConfig(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	for _, banned := range []string{"上游地址", "监听地址", "传输方式", "开机自启"} {
 		if tt.HasText(banned) {
 			t.Errorf("面板 tab 出现了设置项 %q：%q", banned, tt.Texts())
@@ -185,7 +187,7 @@ func TestPanelTabHasNoConfig(t *testing.T) {
 func TestSettingsTab(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
 	for _, want := range []string{"上游地址", "监听地址", "传输方式", "日志保留", "显示区间"} {
 		if !tt.HasText(want) {
@@ -307,7 +309,7 @@ func TestSettingsWhileRunning(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
 	setRunning(a, true)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
 	if !tt.HasText("运行中不可修改") {
 		t.Errorf("运行中未提示不可修改：%q", tt.Texts())
@@ -321,7 +323,7 @@ func TestViewRunning(t *testing.T) {
 	a.agg = stats.Agg{Requests: 12847, UpRaw: 1400 * 1024, UpWire: 1024,
 		UpRatio: 1024.0 / (1400 * 1024), P50Ms: 28}
 	a.snap = func() stats.Agg { return a.agg }
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
 	// 统计口径是「近 <保留期>」（统计从磁盘重建，重启不清零），不是「本次会话」
 	for _, want := range []string{"停止代理", "上行体积对比", "实时", "12,847 请求", "p50 28 ms"} {
@@ -436,7 +438,7 @@ func TestNoTakeoverPane(t *testing.T) {
 func TestLightPaletteBuilds(t *testing.T) {
 	a := newTestApp(t)
 	a.pal = glass.Light()
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if !tt.HasText("启动代理") {
 		t.Errorf("亮色板未渲染：%q", tt.Texts())
 	}
@@ -680,7 +682,7 @@ func TestAutoStartSwitchWiring(t *testing.T) {
 		t.Fatalf("初始 Open() = (%v, %v)", on, err)
 	}
 
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	// 开关在这行的最右。定位逻辑抽在 findSwitchCenter 里，两次点击共用。
 	cx, cy, ok2 := findSwitchCenter(tt, "登录后自动驻留托盘，下次登录生效")
 	if !ok2 {
@@ -703,7 +705,7 @@ func TestAutoStartSwitchWiring(t *testing.T) {
 
 	// 再点一次：关掉，plist 消失。用同一个定位函数——两处各写一遍像素扫描
 	// 是上一版的教训：改了一处忘了另一处，第二次点击就静默点空。
-	tt = ui.NewTester(a.view, 560, 640)
+	tt = ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if cx, cy, ok := findSwitchCenter(tt, "登录后自动驻留托盘，下次登录生效"); ok {
 		tt.ClickAt(cx, cy)
 	}
@@ -780,7 +782,7 @@ func TestSelectChangesWindow(t *testing.T) {
 // 「控件接上了状态」，而真机截图只证明「画出来了」。
 func TestTabsSwitchByClick(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if a.tab != tabPanel {
 		t.Fatalf("初始 tab = %d，期望面板", a.tab)
 	}
@@ -820,7 +822,7 @@ func TestTabsSwitchByClick(t *testing.T) {
 // 这条测试同时守住「不许再出现 AI 相关字样」这个解耦要求。
 func TestCopyChipCopiesPlainURL(t *testing.T) {
 	a := newTestApp(t)
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if err := tt.Click("复制地址"); err != nil {
 		t.Fatalf("点复制徽标失败：%v", err)
 	}
@@ -869,7 +871,7 @@ func TestNoAIPromptsInUI(t *testing.T) {
 	for _, tab := range []int{tabPanel, tabSettings} {
 		a := newTestApp(t)
 		a.tab = tab
-		tt := ui.NewTester(a.view, 560, 640)
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 		for _, banned := range []string{"ANTHROPIC", "Anthropic", "anthropic", "OPENAI", "OPENAI_API_KEY", "BASE_URL", "export "} {
 			if tt.HasText(banned) {
 				t.Errorf("tab=%d 出现 AI 相关提示 %q：%q", tab, banned, tt.Texts())
@@ -889,7 +891,7 @@ func TestRunToggleSwitchesStateAndIcon(t *testing.T) {
 	a.listen = "127.0.0.1:0"
 	t.Cleanup(func() { _ = a.runner.Stop(context.Background()) })
 
-	tt := ui.NewTester(a.view, 560, 640)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	if !tt.HasText("启动代理") {
 		t.Fatalf("停止态应显示「启动代理」：%q", tt.Texts())
 	}
@@ -1047,7 +1049,7 @@ func findSwitchCenter(tt *ui.Tester, label string) (x, y float32, ok bool) {
 // 取值用 main.go 里 createWindow 的真实宽度与高度（窄到 440 也要成立）。
 func TestSettingsFitsShippedWindow(t *testing.T) {
 	// 出货尺寸 + 一个「更新出错且保存也失败」的最坏情况（那时文案最长）。
-	const winW, winH = 560, 660
+	winW, winH := defaultWinWidth, defaultWinHeight
 	footerTop := float32(winH - 33) // footer 32 + 发丝线 1
 
 	type scenario struct {
@@ -1099,7 +1101,7 @@ func TestSettingsFitsShippedWindow(t *testing.T) {
 func TestSettingsHasTwoGroups(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	for _, want := range []string{"连接", "其他"} {
 		if !tt.HasText(want) {
 			t.Errorf("设置页缺少分区标题 %q：%q", want, tt.Texts())
@@ -1125,7 +1127,7 @@ func TestFooterHasNoCopyEntry(t *testing.T) {
 	for _, tab := range []int{tabPanel, tabSettings} {
 		a := newTestApp(t)
 		a.tab = tab
-		tt := ui.NewTester(a.view, 560, 660)
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 		n := 0
 		for _, s := range tt.Texts() {
 			if s == "复制地址" {
@@ -1169,7 +1171,7 @@ func TestTrafficSummaryOneLine(t *testing.T) {
 		t.Errorf("trafficSummary = %q，仍带「 均 X ms」尾巴", text)
 	}
 
-	tt := ui.NewTester(a.view, 560, 660)
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 	r, ok := tt.Find(text)
 	if !ok {
 		t.Fatalf("找不到摘要文本：%q", tt.Texts())
@@ -1179,24 +1181,29 @@ func TestTrafficSummaryOneLine(t *testing.T) {
 	}
 }
 
-// TestLatencyHasGaps 折线断点只在「两个非空桶之间夹着空桶」时成立。
+// TestLatencyHasGaps 折线断点只在「两个有延迟样本的桶之间夹着无样本的桶」时成立。
+//
+// 判据与画线共用 hasLatencySample：Count>0 但 MsSum==0 的桶（有请求、没采到
+// 隧道往返）在图上不画点，它同样是一个真实断点。
 func TestLatencyHasGaps(t *testing.T) {
+	// sample 一个有延迟样本的桶
+	sample := func(n int64) stats.Bucket {
+		return stats.Bucket{UpRaw: 1000 * n, Count: n, MsSum: 100 * n}
+	}
 	cases := []struct {
-		name   string
-		counts []int64
-		want   bool
+		name string
+		b    []stats.Bucket
+		want bool
 	}{
-		{"中间有洞", []int64{1, 0, 1}, true},
-		{"连续", []int64{1, 1, 1}, false},
-		{"两端为空不算断点", []int64{0, 1, 1, 0}, false},
-		{"尾部为空不算断点", []int64{1, 0, 0, 0}, false},
-		{"全空", []int64{0, 0, 0}, false},
+		{"中间有洞", []stats.Bucket{sample(1), {}, sample(1)}, true},
+		{"连续", []stats.Bucket{sample(1), sample(1), sample(1)}, false},
+		{"两端为空不算断点", []stats.Bucket{{}, sample(1), sample(1), {}}, false},
+		{"尾部为空不算断点", []stats.Bucket{sample(1), {}, {}, {}}, false},
+		{"全空", []stats.Bucket{{}, {}, {}}, false},
+		{"中间夹着无延迟样本的桶", []stats.Bucket{sample(1), {Count: 2, UpRaw: 10}, sample(1)}, true},
 	}
 	for _, tc := range cases {
-		a := &app{agg: stats.Agg{Series: make([]stats.Bucket, len(tc.counts))}}
-		for i, c := range tc.counts {
-			a.agg.Series[i].Count = c
-		}
+		a := &app{agg: stats.Agg{Series: tc.b}}
 		if got := a.latencyHasGaps(); got != tc.want {
 			t.Errorf("%s: latencyHasGaps() = %v，期望 %v", tc.name, got, tc.want)
 		}
@@ -1222,5 +1229,547 @@ func TestHumanMs(t *testing.T) {
 		if got := humanMs(in); got != want {
 			t.Errorf("humanMs(%d) = %q，期望 %q", in, got, want)
 		}
+	}
+}
+
+// ---- 图表几何：柱、参考线、刻度必须共用同一个 scale ----
+
+// 系列色（暗色板 p.DownBar/p.UpBar）：渲染时 Fill 用 0.8 透明度，但通道值
+// 与色板一致（实测 #4ec38a / #4c9ef0），所以按 RGB 匹配即可。
+var (
+	rgbDownBar = [3]uint8{0x4e, 0xc3, 0x8a}
+	rgbUpBar   = [3]uint8{0x4c, 0x9e, 0xf0}
+	// 延迟折线的琥珀色 #e0a94a：不透明，所以渲染值与色板逐通道一致。
+	rgbLatency = [3]uint8{0xe0, 0xa9, 0x4a}
+)
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// nearRGB 像素是否接近给定颜色（逐通道容差 tol，吸收抗锯齿）。
+func nearRGB(c color.Color, rgb [3]uint8, tol int) bool {
+	r, g, b, _ := c.RGBA()
+	return absInt(int(r>>8)-int(rgb[0])) <= tol &&
+		absInt(int(g>>8)-int(rgb[1])) <= tol &&
+		absInt(int(b>>8)-int(rgb[2])) <= tol
+}
+
+// barTopRow 在 [y0,y1) × [x0,x1) 里找最上面一行柱色像素（-1 表示没有）。
+func barTopRow(img *image.RGBA, x0, x1, y0, y1 int) int {
+	for y := y0; y < y1; y++ {
+		for x := x0; x < x1; x++ {
+			if nearRGB(img.At(x, y), rgbDownBar, 20) || nearRGB(img.At(x, y), rgbUpBar, 20) {
+				return y
+			}
+		}
+	}
+	return -1
+}
+
+// dashRow 找参考虚线所在行：虚线段 3px 实 3px 空，一行里有几十段同色像素，
+// 覆盖行宽约一半；取 [y0,y1) 里「同一颜色重复次数最多」的行。要求覆盖率在
+// 30%..65%，把整行同色的卡片边/基线（≈100%）排除掉。
+func dashRow(img *image.RGBA, x0, x1, y0, y1 int) int {
+	width := x1 - x0
+	lo, hi := width*3/10, width*65/100
+	best, bestN := -1, 0
+	for y := y0; y < y1; y++ {
+		count := map[color.RGBA]int{}
+		for x := x0; x < x1; x++ {
+			r, g, b, a := img.At(x, y).RGBA()
+			count[color.RGBA{uint8(r >> 8), uint8(g >> 8), uint8(b >> 8), uint8(a >> 8)}]++
+		}
+		for _, n := range count {
+			if n >= lo && n <= hi && n > bestN {
+				best, bestN = y, n
+			}
+		}
+	}
+	return best
+}
+
+// inkCenterRow [y0,y1) 里某色文字的最上一组连续墨迹行的中心（-1 表示没找到）。
+func inkCenterRow(img *image.RGBA, x0, x1, y0, y1 int, rgb [3]uint8, tol int) float64 {
+	lo, hi := -1, -1
+	for y := y0; y < y1; y++ {
+		hit := false
+		for x := x0; x < x1; x++ {
+			if nearRGB(img.At(x, y), rgb, tol) {
+				hit = true
+				break
+			}
+		}
+		if hit && lo < 0 {
+			lo = y
+		}
+		if hit {
+			hi = y
+		} else if lo >= 0 && y > hi+2 {
+			break
+		}
+	}
+	if lo < 0 {
+		return -1
+	}
+	return float64(lo+hi) / 2
+}
+
+// TestChartScaleBarsAndTicks 两张图的柱、参考虚线、刻度标签共用同一个 scale。
+//
+// 三条断言对应上一轮独立像素复核的三条 blocker：
+//  1. 第一图：100% 压缩的柱顶与 100% 虚线在同一像素行（≤1px）。上一版柱高
+//     用 96% 可用高度、虚线用整高，虚线从每根柱顶下方 15px 处横穿。
+//  2. 第二图：峰值柱顶不高于最上刻度（≥0），且落在刻度上（≤2px）。
+//  3. 两个绘图区等高（由刻度反算，≤1px）。
+func TestChartScaleBarsAndTicks(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{Requests: 40, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	// 桶 0：wire=0 → 压缩率 100%，柱顶必须压在 100% 虚线上。
+	a.agg.Series[0] = stats.Bucket{UpRaw: 800_000, UpWire: 0, DownWire: 60_000, Count: 1, MsSum: 120}
+	for i := 1; i < 12; i++ {
+		a.agg.Series[i] = stats.Bucket{
+			UpRaw: 800_000, UpWire: int64(20_000 * i), DownWire: int64(30_000 * i),
+			Count: 1, MsSum: int64(400 * i),
+		}
+	}
+	a.snap = func() stats.Agg { return a.agg }
+
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	img := tt.Image()
+	if img == nil {
+		t.Fatal("Image() 返回 nil")
+	}
+
+	// 绘图区横向范围：左边是刻度列 + 间距，右边到卡片右边距。
+	// 右缘跟着窗口宽度走（560 宽时是 529），写死会在改尺寸后量到卡片外。
+	const x0 = 84
+	x1 := defaultWinWidth - 31
+
+	// ---- 1. 第一图的柱顶 vs 100% 虚线 ----
+	r100, ok := tt.Find("100%")
+	if !ok {
+		t.Fatalf("找不到 100%% 刻度：%q", tt.Texts())
+	}
+	yTop := int(r100.Y)
+	if yTop < 40 || yTop > 500 {
+		t.Fatalf("100%% 刻度 y=%.1f 不合理", r100.Y)
+	}
+	dash := dashRow(img, x0, x1, yTop-4, yTop+12)
+	bar := barTopRow(img, x0, x1, yTop-4, yTop+40)
+	if dash < 0 || bar < 0 {
+		t.Fatalf("第一图找不到虚线(%d)或柱顶(%d)", dash, bar)
+	}
+	if d := absInt(bar - dash); d > 1 {
+		t.Errorf("柱顶 y=%d 与 100%% 虚线 y=%d 相差 %dpx（要求 ≤1）", bar, dash, d)
+	} else {
+		t.Logf("第一图：柱顶 y=%d / 100%% 虚线 y=%d（差 %dpx）", bar, dash, d)
+	}
+
+	// ---- 2/3. 第二图：峰值柱顶 vs 最上刻度；两图等高 ----
+	a2 := newTestApp(t)
+	setRunning(a2, true)
+	a2.agg = stats.Agg{Requests: 40, WindowSec: 1800, BucketSec: 60}
+	a2.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	for i := 0; i < 6; i++ {
+		a2.agg.Series[i] = stats.Bucket{UpRaw: 900_000, UpWire: 1_000, DownWire: 1_000,
+			Count: 1, MsSum: int64(300 * (i + 1))}
+	}
+	// 峰值桶：上行 4MB + 下行 9MB = 13MB → 轴顶刻度 "12.4 MB"（与摘要行的
+	// ↑3.8MB / ↓8.6MB 不同串，Find 不会选错）。
+	a2.agg.Series[10] = stats.Bucket{UpRaw: 20_000_000, UpWire: 4_000_000,
+		DownWire: 9_000_000, Count: 1, MsSum: 90_000}
+	a2.snap = func() stats.Agg { return a2.agg }
+
+	tt2 := ui.NewTester(a2.view, defaultWinWidth, defaultWinHeight)
+	img2 := tt2.Image()
+	if img2 == nil {
+		t.Fatal("Image() 返回 nil")
+	}
+	topLabel := humanBytes(13_000_000)
+	rt, ok := tt2.Find(topLabel)
+	if !ok {
+		t.Fatalf("找不到峰值刻度 %q：%q", topLabel, tt2.Texts())
+	}
+	// 图例色块在轴顶上方约 20px，从刻度行开始往下扫，避开图例。
+	peak := barTopRow(img2, x0, x1, int(rt.Y)-2, int(rt.Y)+220)
+	if peak < 0 {
+		t.Fatal("第二图找不到峰值柱")
+	}
+	tick := inkCenterRow(img2, 20, 84, int(rt.Y)-6, int(rt.Y)+8,
+		[3]uint8{0x94, 0x94, 0x94}, 40)
+	if tick < 0 {
+		t.Fatalf("找不到峰值刻度文字")
+	}
+	if d := float64(peak) - tick; d < 2 || d > 4 {
+		t.Errorf("峰值柱顶 y=%d、最上刻度 y=%.1f，差 %.1fpx（要求 2..4：柱顶必须在刻度"+
+			"中心之下留出 2-3px 的顶部余量，齐平会读成「柱顶顶到坐标系上沿」）",
+			peak, tick, d)
+	} else {
+		t.Logf("第二图：峰值柱顶 y=%d / 最上刻度 y=%.1f（差 %.1fpx）", peak, tick, d)
+	}
+
+	// 等高：第一图由 100%/25% 两档反算（间隔 0.75H），第二图由峰值/半峰值
+	// 反算（间隔 0.5H）。用刻度行距而不是绝对 y，避免标签居中带来的偏移。
+	r25, ok := tt.Find("25%")
+	if !ok {
+		t.Fatalf("找不到 25%% 刻度")
+	}
+	h1 := (r25.Y - r100.Y) / 0.75
+	half, ok := tt2.Find(humanBytes(13_000_000 / 2))
+	if !ok {
+		t.Fatalf("找不到半峰值刻度 %q：%q", humanBytes(13_000_000/2), tt2.Texts())
+	}
+	h2 := (half.Y - rt.Y) / 0.5
+	if d := float64(h1 - h2); d < -1 || d > 1 {
+		t.Errorf("两个绘图区高度不等：%.1f vs %.1f（差 %.1fpx）", h1, h2, d)
+	} else {
+		t.Logf("绘图区高度：第一图 %.1fpx / 第二图 %.1fpx", h1, h2)
+	}
+}
+
+// barColumns 扫出连续的「有柱色」列，返回 [left, right] 段（含端点）。
+//
+// 用列而不是行来分段：柱与柱之间的 3px 间隙在 1x 下是干净的背景列，
+// 于是每根柱正好一段，段的中心就是柱心。
+func barColumns(img *image.RGBA, x0, x1, y0, y1 int) [][2]int {
+	var out [][2]int
+	start := -1
+	for x := x0; x <= x1; x++ {
+		hit := false
+		if x < x1 {
+			for y := y0; y < y1; y++ {
+				c := img.At(x, y)
+				if nearRGB(c, rgbDownBar, 20) || nearRGB(c, rgbUpBar, 20) {
+					hit = true
+					break
+				}
+			}
+		}
+		if hit && start < 0 {
+			start = x
+		}
+		if !hit && start >= 0 {
+			out = append(out, [2]int{start, x - 1})
+			start = -1
+		}
+	}
+	return out
+}
+
+// latencyInk [x0,x1) × [y0,y1) 里的折线像素（-1 行表示没有）。
+func latencyInk(img *image.RGBA, x0, x1, y0, y1 int) (yMin, yMax int) {
+	yMin, yMax = -1, -1
+	for y := y0; y < y1; y++ {
+		for x := x0; x < x1; x++ {
+			if nearRGB(img.At(x, y), rgbLatency, 26) {
+				if yMin < 0 {
+					yMin = y
+				}
+				yMax = y
+				break
+			}
+		}
+	}
+	return yMin, yMax
+}
+
+// TestLatencyVerticesOnBarCenters 折线顶点与柱心必须是同一个 x。
+//
+// 上一版折线的顶点落在**桶边界**（柱缝）上，整体左移半个槽位（实测 -8px）：
+// 线画在柱缝上，读数会归到错误的桶。这条测试用锯齿形延迟（每个桶都是拐点）
+// 在像素上验证两件事：
+//  1. 折线的横向覆盖范围恰好从第一根柱心到最后第二根柱心（不许从绘图区左缘起笔）；
+//  2. 每个桶的柱心列是该段折线的极值点（顶点在这里），而不是段中点。
+func TestLatencyVerticesOnBarCenters(t *testing.T) {
+	const x0 = 84
+	x1 := defaultWinWidth - 31
+	a := newTestApp(t)
+	setRunning(a, true)
+
+	var maxTotal int64
+	a.agg = stats.Agg{Requests: 60, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	for i := range a.agg.Series {
+		b := stats.Bucket{
+			UpRaw: 1_000_000, UpWire: 200_000, DownWire: 300_000,
+			Count: 2,
+		}
+		// 锯齿：偶数桶慢、奇数桶快 → 每个桶都是折线的拐点。
+		if i%2 == 0 {
+			b.MsSum = 8000
+		} else {
+			b.MsSum = 2000
+		}
+		a.agg.Series[i] = b
+		if v := b.UpWire + b.DownWire; v > maxTotal {
+			maxTotal = v
+		}
+	}
+	a.snap = func() stats.Agg { return a.agg }
+
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	img := tt.Image()
+	if img == nil {
+		t.Fatal("Image() 返回 nil")
+	}
+	top, ok := tt.Find(humanBytes(maxTotal))
+	if !ok {
+		t.Fatalf("找不到峰值刻度 %q：%q", humanBytes(maxTotal), tt.Texts())
+	}
+	yTop, yBot := int(top.Y)-4, int(top.Y)+230
+	segs := barColumns(img, x0, x1, yTop, yBot)
+	if len(segs) < stats.SeriesBuckets-2 {
+		t.Fatalf("扫到 %d 根柱，期望至少 %d：柱之间必须还剩得下干净的背景列",
+			len(segs), stats.SeriesBuckets-2)
+	}
+	if len(segs) != stats.SeriesBuckets {
+		// 允许一两处间隙被抗锯齿填掉（580 宽时槽距 15.5px、柱宽 12px），
+		// 但必须记下来：真掉了半屏的柱子说明布局出问题。
+		t.Logf("扫到 %d 根柱（理想 %d），按实测柱心继续验证", len(segs), stats.SeriesBuckets)
+	}
+	if len(segs) < 3 {
+		t.Fatal("柱子太少，锯齿无从比较")
+	}
+
+	// 1. 横向范围：从第一根柱心到最后第二根柱心（±2px 吸收圆头与抗锯齿）。
+	firstCenter := float64(segs[0][0]+segs[0][1]) / 2
+	lastCenter := float64(segs[len(segs)-1][0]+segs[len(segs)-1][1]) / 2
+	inkMin, inkMax := -1, -1
+	for x := x0; x < x1; x++ {
+		if lo, _ := latencyInk(img, x, x+1, yTop, yBot); lo >= 0 {
+			if inkMin < 0 {
+				inkMin = x
+			}
+			inkMax = x
+		}
+	}
+	if inkMin < 0 {
+		t.Fatal("绘图区里没有折线像素")
+	}
+	if d := float64(inkMin) - firstCenter; d < -2 || d > 2 {
+		t.Errorf("折线起点 x=%d，第一根柱心 x=%.1f（差 %.1fpx）：顶点没有落在柱心上",
+			inkMin, firstCenter, d)
+	}
+	if d := float64(inkMax) - lastCenter; d < -2 || d > 2 {
+		t.Errorf("折线终点 x=%d，最后一根柱心 x=%.1f（差 %.1fpx）：顶点没有落在柱心上",
+			inkMax, lastCenter, d)
+	}
+
+	// 2. 每个柱心列必须是极值点。延迟按「峰值贴轴顶」归一，所以偶数桶
+	// （慢）在屏幕上更高（y 更小），奇数桶（快）更低。取「中线 y」比较：
+	// 顶点列的墨迹围绕顶点对称。
+	centerY := func(cx int) float64 {
+		lo, hi := latencyInk(img, cx, cx+1, yTop, yBot)
+		if lo < 0 {
+			return -1
+		}
+		return float64(lo+hi) / 2
+	}
+	for i, s := range segs {
+		cx := (s[0] + s[1]) / 2
+		cv := centerY(cx)
+		if cv < 0 {
+			t.Errorf("第 %d 个桶：柱心列 x=%d 没有折线像素", i, cx)
+			continue
+		}
+		// 柱缝中点（两根柱之间的间隙中心）就是上一版画顶点的位置。
+		if i+1 < len(segs) {
+			mid := (s[1] + segs[i+1][0]) / 2
+			if mv := centerY(mid); mv >= 0 {
+				slow := i%2 == 0
+				if slow && !(cv < mv) {
+					t.Errorf("第 %d 个桶（慢）：柱心 y=%.1f 不比柱缝 y=%.1f 更高——顶点落在柱缝上",
+						i, cv, mv)
+				}
+				if !slow && !(cv > mv) {
+					t.Errorf("第 %d 个桶（快）：柱心 y=%.1f 不比柱缝 y=%.1f 更低——顶点落在柱缝上",
+						i, cv, mv)
+				}
+			}
+		}
+	}
+}
+
+// TestLatencySkipsZeroMsBuckets 「有请求但没采到延迟」的桶不画点、不连线。
+//
+// 上一版只判 Count>0：MsSum==0 的桶按 AvgMs()=0 画在基线上，于是在离柱群
+// 很远的空白处留下一条 17×2px 的橙线——1x 下就是一道划痕。
+func TestLatencySkipsZeroMsBuckets(t *testing.T) {
+	const x0, x1 = 84, 529
+	a := newTestApp(t)
+	setRunning(a, true)
+
+	a.agg = stats.Agg{Requests: 4, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	var maxTotal int64
+	put := func(i int, msSum int64) {
+		b := stats.Bucket{UpRaw: 1_000_000, UpWire: 200_000, DownWire: 300_000,
+			Count: 2, MsSum: msSum}
+		a.agg.Series[i] = b
+		if v := b.UpWire + b.DownWire; v > maxTotal {
+			maxTotal = v
+		}
+	}
+	// 两端各一个正常样本，中间一个是「有请求、没采到隧道往返」的桶。
+	put(1, 4000)
+	put(15, 0)
+	put(28, 8000)
+	a.snap = func() stats.Agg { return a.agg }
+
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	img := tt.Image()
+	if img == nil {
+		t.Fatal("Image() 返回 nil")
+	}
+	top, ok := tt.Find(humanBytes(maxTotal))
+	if !ok {
+		t.Fatalf("找不到峰值刻度 %q", humanBytes(maxTotal))
+	}
+	yTop, yBot := int(top.Y)-6, int(top.Y)+230
+	segs := barColumns(img, x0, x1, yTop, yBot)
+	if len(segs) != 3 {
+		t.Fatalf("扫到 %d 根柱，期望 3（桶 1 / 15 / 28）", len(segs))
+	}
+	mid := segs[1] // 桶 15
+	lo, hi := latencyInk(img, mid[0]-4, mid[1]+5, yTop, yBot)
+	if lo >= 0 {
+		t.Errorf("MsSum==0 的桶（x %d..%d）上画了折线：y %d..%d",
+			mid[0], mid[1], lo, hi)
+	}
+	// 两侧的正常样本仍必须画出来（别把整条线都静默了）
+	for _, s := range []int{0, 2} {
+		if l, _ := latencyInk(img, segs[s][0], segs[s][1]+1, yTop, yBot); l < 0 {
+			t.Errorf("第 %d 根柱（有延迟样本）上没有折线像素", s)
+		}
+	}
+}
+
+// TestTrafficBarMinHeight 最小可见高度只给「有实质流量」的桶（≥ 峰值 1%）。
+//
+// 上一版无条件把非零桶抬到 3px：真实数据的最右 bucket 只有峰值的 0.08%，
+// 被画成 3px 绿点，配上压在柱顶的延迟短划，1x 下是一小坨绿橙杂点。
+func TestTrafficBarMinHeight(t *testing.T) {
+	const peak int64 = 4_000_000
+	const plotH float32 = 180
+	cases := []struct {
+		name  string
+		total int64
+		check func(float32) bool
+		why   string
+	}{
+		{"峰值=满量程", peak, func(h float32) bool { return h == plotH }, "峰值柱必须精确落在轴顶"},
+		{"0.08% 的碎屑桶", peak / 1250, func(h float32) bool { return h < 1 }, "按真实比例画（<1px），不许抬到 3px"},
+		{"0.5%", peak / 200, func(h float32) bool { return h < 1 }, "低于 1% 一律按真实比例"},
+		{"1.25%", peak / 80, func(h float32) bool { return h == minTrafficBarPx }, "刚过 1% 的桶抬到 3px"},
+		{"2%", peak / 50, func(h float32) bool { return h > minTrafficBarPx }, "按比例已超过 3px"},
+		{"空桶", 0, func(h float32) bool { return h == 0 }, "空桶不画"},
+	}
+	for _, tc := range cases {
+		if got := trafficBarHeight(tc.total, peak, plotH); !tc.check(got) {
+			t.Errorf("%s: trafficBarHeight(%d) = %.2fpx，%s", tc.name, tc.total, got, tc.why)
+		}
+	}
+}
+
+// TestHumanMsGroup 同一行里的延迟读数必须用同一个单位。
+//
+// 上一版是「当前 788 ms / 峰值 81.7 s / 均值 42.8 s」——一句话里两种量纲，
+// 三个数没法直接比大小。
+func TestHumanMsGroup(t *testing.T) {
+	cases := []struct {
+		in   []int64
+		want []string
+	}{
+		{[]int64{788, 81700, 42800}, []string{"0.8 s", "81.7 s", "42.8 s"}},
+		{[]int64{12, 300, 200}, []string{"12 ms", "300 ms", "200 ms"}},
+		{[]int64{10, 5000, 50}, []string{"<0.1 s", "5.0 s", "0.1 s"}},
+		{[]int64{0, 0, 0}, []string{"0 ms", "0 ms", "0 ms"}},
+	}
+	for _, tc := range cases {
+		got := humanMsGroup(tc.in...)
+		if strings.Join(got, "|") != strings.Join(tc.want, "|") {
+			t.Errorf("humanMsGroup(%v) = %v，期望 %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestCrashReportWritten 崩溃日志必须真的落盘。
+//
+// 起因：GUI 从 Finder 启动时 stderr 无处可去，进程「整个消失」而不留任何痕迹
+// （2026-11-14 实测：Dock 图标消失、无 .ips、无日志）。写盘是唯一的证据来源，
+// 所以这条断言守的是「有文件、有时间戳、有 panic 值和栈」。
+func TestCrashReportWritten(t *testing.T) {
+	dir := t.TempDir()
+	if err := writeCrashReport(dir, "boom", []byte("goroutine 1 [running]:\nmain.main()")); err != nil {
+		t.Fatalf("writeCrashReport: %v", err)
+	}
+	b, err := os.ReadFile(crashLogPath(dir))
+	if err != nil {
+		t.Fatalf("读不到崩溃日志：%v", err)
+	}
+	s := string(b)
+	for _, want := range []string{"panic: boom", "goroutine 1", "T"} {
+		if !strings.Contains(s, want) {
+			t.Errorf("崩溃日志缺少 %q：%q", want, s)
+		}
+	}
+}
+
+// TestShouldStartOnLaunch 启动时是否自动开始转发。
+//
+// 需求（owner 2026-11-14）：「只要在启动状态，这个状态就应该持久化，下次重启
+// 自动进入启动；除非我手动停止服务，那么这个停止的状态也会被持久化」。
+// 所以判定顺序是：登录项 / 显式 -start 优先，其次才是上次的状态。
+func TestShouldStartOnLaunch(t *testing.T) {
+	cases := []struct {
+		name      string
+		login     bool
+		flagStart bool
+		lastRun   bool
+		want      bool
+	}{
+		{"登录项启动", true, false, false, true},
+		{"显式 -start", false, true, false, true},
+		{"上次在运行", false, false, true, true},
+		{"上次手动停过", false, false, false, false},
+		{"手动停过但这次 -start", false, true, false, true},
+	}
+	for _, tc := range cases {
+		st := relayclient.DefaultSettings()
+		st.Running = tc.lastRun
+		if got := shouldStartOnLaunch(tc.login, tc.flagStart, st); got != tc.want {
+			t.Errorf("%s: shouldStartOnLaunch = %v，期望 %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestRunStatePersisted 启动/停止必须写进 settings.json。
+//
+// 只断言文件：下次启动读文件决定是否自动开始，所以「文件里的 running」就是
+// 全部契约。启动失败不能写成 true（否则每次启动都白试一次），这条也在语义里。
+func TestRunStatePersisted(t *testing.T) {
+	a := newTestApp(t)
+	// :0 让内核分配端口：18899 可能被本机真实运行的客户端占着，绑不上就不该
+	// 把「端口冲突」误判成「状态没持久化」。
+	a.listen = "127.0.0.1:0"
+	a.start()
+	if !a.running() {
+		t.Fatalf("start() 之后 Runner 没跑起来")
+	}
+	if s := relayclient.LoadSettings(a.settingsPath); !s.Running {
+		t.Errorf("启动后 settings.running = false，期望 true")
+	}
+	a.stop()
+	if a.running() {
+		t.Fatalf("stop() 之后 Runner 还在跑")
+	}
+	if s := relayclient.LoadSettings(a.settingsPath); s.Running {
+		t.Errorf("停止后 settings.running = true，期望 false")
 	}
 }
