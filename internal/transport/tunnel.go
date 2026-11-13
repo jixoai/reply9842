@@ -46,6 +46,18 @@ type Dialer struct {
 	Mode       Kind          // auto / quic / tcp
 	QuicProbe  time.Duration // auto 模式下 QUIC 探测超时，默认 1s
 
+	// LocalAddr 绑定出站源地址（如 "192.168.1.106:0" 或 "192.168.1.106"）。
+	//
+	// 存在的理由：代理软件的 TUN 全局模式会整段接管 IPv4 路由
+	// （实测 Clash 系：0.0.0.0/1 + 128.0.0.0/1 两条 UGSc 规则指向 utun），
+	// 于是到隧道服务器的流量也被导进代理。代理对 28443 这类非标端口没有
+	// 正确的直连规则，TLS 握手会被中途切断，客户端只看到
+	// "tcp tls: EOF"——看起来像服务端崩了，实际是本地网络劫持。
+	//
+	// 绑到物理网卡的真实 IP 后，内核直接走该网卡的 ARP/路由，不再进 utun。
+	// 这是用户侧「不想改代理配置」时最省事的解法。
+	LocalAddr string
+
 	// auto 模式的粘性记忆：一旦某模式成功，后续优先该模式
 	prefer   atomic.Value // Kind
 	lastKind atomic.Value // Kind
@@ -156,11 +168,45 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 	// → 实际用 WithoutCancel 脱钩，但 OpenStreamSync/AcceptStream 等仍吃传进去的 ctx）。
 	// 这里 dial 用调用方 ctx（auto 模式的 1s 探测超时），但 stream 操作必须
 	// 用连接自身生命周期 ctx，否则探测超时一到就把已建立的连接判死。
-	qc, err := quic.DialAddr(ctx, d.Addr, tlsCfg, &quic.Config{
-		HandshakeIdleTimeout: 5 * time.Second,
-		MaxIdleTimeout:       120 * time.Second,
-		KeepAlivePeriod:      30 * time.Second,
-	})
+	//
+	// 需要绑源地址时不能走 DialAddr（它会自己建 UDP socket），改用
+	// net.ListenUDP 先拿到绑定好的 PacketConn 再交给 quic.Dial。
+	var qc *quic.Conn
+	var err error
+	if d.LocalAddr != "" {
+		la, e := net.ResolveUDPAddr("udp", func() string {
+			if _, _, se := net.SplitHostPort(d.LocalAddr); se != nil {
+				return net.JoinHostPort(d.LocalAddr, "0")
+			}
+			return d.LocalAddr
+		}())
+		if e != nil {
+			return nil, fmt.Errorf("quic local addr: %w", e)
+		}
+		pc, e := net.ListenUDP("udp", la)
+		if e != nil {
+			return nil, fmt.Errorf("quic listen udp: %w", e)
+		}
+		ra, e := net.ResolveUDPAddr("udp", d.Addr)
+		if e != nil {
+			pc.Close()
+			return nil, fmt.Errorf("quic remote addr: %w", e)
+		}
+		qc, err = quic.Dial(ctx, pc, ra, tlsCfg, &quic.Config{
+			HandshakeIdleTimeout: 5 * time.Second,
+			MaxIdleTimeout:       120 * time.Second,
+			KeepAlivePeriod:      30 * time.Second,
+		})
+		if err != nil {
+			pc.Close()
+		}
+	} else {
+		qc, err = quic.DialAddr(ctx, d.Addr, tlsCfg, &quic.Config{
+			HandshakeIdleTimeout: 5 * time.Second,
+			MaxIdleTimeout:       120 * time.Second,
+			KeepAlivePeriod:      30 * time.Second,
+		})
+	}
 	if err != nil {
 		return nil, fmt.Errorf("quic dial: %w", err)
 	}
@@ -191,7 +237,11 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 		InsecureSkipVerify: d.Insecure,
 		MinVersion:         tls.VersionTLS12,
 	}
-	nd := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	la, err := d.localAddr()
+	if err != nil {
+		return nil, fmt.Errorf("tcp local addr: %w", err)
+	}
+	nd := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: la}
 	raw, err := nd.DialContext(ctx, "tcp", d.Addr)
 	if err != nil {
 		return nil, fmt.Errorf("tcp dial: %w", err)
@@ -218,6 +268,19 @@ func (d *Dialer) serverName() string {
 		return d.Addr
 	}
 	return h
+}
+
+// localAddr 把 LocalAddr 规整成 *net.TCPAddr（空则返回 nil = 让内核选）。
+// 允许只给 IP（自动补 :0），也允许给完整 host:port。
+func (d *Dialer) localAddr() (*net.TCPAddr, error) {
+	if d.LocalAddr == "" {
+		return nil, nil
+	}
+	s := d.LocalAddr
+	if _, _, err := net.SplitHostPort(s); err != nil {
+		s = net.JoinHostPort(s, "0")
+	}
+	return net.ResolveTCPAddr("tcp", s)
 }
 
 // ---- 服务端 ----

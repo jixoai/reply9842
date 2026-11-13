@@ -658,6 +658,12 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		a.configField(c, p, "服务器域名", &a.serverName,
 			relayclient.DefaultServerName, running)
 		a.configRule(c, p)
+		// 源地址绑定：开代理 TUN 全局模式时，发往隧道服务器的流量也会被导进
+		// utun。代理对 28443 这类非标端口没有正确规则，TLS 握手会被中途切断，
+		// 客户端只看到 "tcp tls: EOF"——看起来像服务端崩了。填物理网卡 IP
+		// （macOS: ipconfig getifaddr en0）让内核直接走该网卡即可绕过。
+		a.configField(c, p, "源地址", &a.localAddr, "留空自动；绕过代理时填网卡 IP", running)
+		a.configRule(c, p)
 		a.configField(c, p, "监听地址", &a.listen, relayclient.DefaultListen, running)
 		a.configRule(c, p)
 		a.transportRow(c, p, running)

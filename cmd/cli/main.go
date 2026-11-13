@@ -81,7 +81,9 @@ func newServeFlags(c *relayclient.Config) *flag.FlagSet {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	fs.StringVar(&c.Listen, "listen", c.Listen, "本地 HTTP 监听")
 	fs.StringVar(&c.Server, "server", c.Server, "relay-server 地址 host:port")
-	fs.StringVar(&c.ServerName, "server-name", "", "TLS SNI（留空自动推导）")
+	fs.StringVar(&c.ServerName, "server-name", "", "TLS SNI（留空自动推导；用 IP 连时必须填证书域名）")
+	fs.StringVar(&c.LocalAddr, "local-addr", "",
+		"绑定出站源地址（如 192.168.1.106），用于绕过代理 TUN 全局模式对隧道的劫持")
 	fs.StringVar(&c.Transport, "transport", c.Transport, "传输: auto|quic|tcp")
 	fs.BoolVar(&c.Insecure, "insecure", false, "跳过服务端证书校验（自签观察期）")
 	fs.IntVar(&c.MinDelta, "min-delta", c.MinDelta, "小于此字节数的请求体不做 delta")

@@ -97,7 +97,11 @@ type app struct {
 	server     string
 	transport  string
 	serverName string
-	insecure   bool
+	// localAddr 绑定出站源地址。用户开代理 TUN 全局模式时，隧道流量会被
+	// 导进 utun 导致 TLS 握手被切断（表现为 tcp tls: EOF）；填物理网卡 IP
+	// 可让内核直接走该网卡，不必改代理配置。
+	localAddr string
+	insecure  bool
 
 	// tab 当前页（0=面板 1=设置），与 titleBar 里 tab 的顺序一致
 	tab int
@@ -167,6 +171,8 @@ func main() {
 	serverName := flag.String("server-name", cfg.ServerName,
 		"TLS SNI；上游用域名证书时必须显式指定，留空则按上游地址推导（自签/回环场景要 -insecure）")
 	insecure := flag.Bool("insecure", cfg.Insecure, "跳过服务端证书校验（自签证书或回环调试）")
+	localAddr := flag.String("local-addr", cfg.LocalAddr,
+		"绑定出站源地址（如 192.168.1.106）；用于绕过代理 TUN 全局模式对隧道的劫持")
 	startNow := flag.Bool("start", false, "打开窗口并立即开始转发")
 	// 旧名字保留为别名：INSTALL.md 与老脚本里写的是 -autostart（当时的含义是
 	// 「启动后立即转发」）。登录项用的是双横线 --autostart，两者互不干扰。
@@ -196,6 +202,7 @@ func main() {
 	}
 	cfg.Listen, cfg.Server, cfg.Transport = *listen, *server, *transport
 	cfg.ServerName, cfg.Insecure = *serverName, *insecure
+	cfg.LocalAddr = *localAddr
 
 	pal := glass.Dark()
 	if *light {
@@ -221,6 +228,7 @@ func main() {
 		server:       cfg.Server,
 		transport:    cfg.Transport,
 		serverName:   cfg.ServerName,
+		localAddr:    cfg.LocalAddr,
 		insecure:     cfg.Insecure,
 		pal:          pal,
 		retainIdx:    relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
@@ -441,17 +449,18 @@ func (a *app) showWindow() {
 func (a *app) createWindow() {
 	win := mygo.NewWindow(mygo.WindowOptions{
 		Title: "reply9842",
-		// 480×470。
+		// 480×510。
 		//
-		// 这个数字不是拍的：设置 tab 的 7 行内容在无头渲染里到 y=315 结束，
-		// 加上 titlebar(45) + footer(28) + 上下内边距(26) + 底部操作行(30)
-		// 约需 444；真机窗口的外框（圆角阴影那条看不见的边）再吃掉若干像素，
-		// 400 会让最后一行「显示区间」被切掉（实测，无头渲染看不出来）。
-		// 470 留了余量。
+		// 这个数字不是拍的：设置 tab 的内容在无头渲染里逐行量过——
+		// 8 行字段（上游 / 服务器域名 / 源地址 / 监听 / 传输 / 自启 /
+		// 日志保留 / 显示区间）加 7 条分隔线到 y≈359，加上 titlebar(45) +
+		// footer(28) + 上下内边距(26) + 底部操作行(30) 约需 488；真机窗口的
+		// 外框（圆角阴影那条看不见的边）再吃掉若干像素。400 时最后一行
+		// 「显示区间」会被切掉（实测，无头渲染看不出来），所以这里留到 510。
 		//
 		// 面板 tab 在高窗口里不会露白：有数据时图表卡片 grow 吃满剩余高度。
 		Width:  480,
-		Height: 470,
+		Height: 510,
 		// 窗口可以拉大，但别小到把状态行与主按钮挤成两行
 		MinWidth: 440,
 		// 太矮时设置 tab 会滚（比切开好），但别矮到连状态行都放不下
@@ -517,6 +526,7 @@ func (a *app) start() {
 	cfg.Server = strings.TrimSpace(a.server)
 	cfg.Transport = a.transport
 	cfg.ServerName = strings.TrimSpace(a.serverName)
+	cfg.LocalAddr = strings.TrimSpace(a.localAddr)
 	cfg.Insecure = a.insecure
 	if err := a.runner.SetConfig(cfg); err != nil {
 		a.setNotice(humanError(err), true)

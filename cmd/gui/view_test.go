@@ -522,8 +522,8 @@ func TestSnapshotFrames(t *testing.T) {
 		w, h  int
 		setup func(a *app)
 	}{
-		{"panel-idle", 480, 400, func(a *app) {}},
-		{"panel-running", 480, 400, func(a *app) {
+		{"panel-idle", 480, 510, func(a *app) {}},
+		{"panel-running", 480, 510, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1204, UpRaw: 1400 * 1024, UpWire: 70 * 1024,
 				UpRatio: 70.0 / 1400, P50Ms: 28}
@@ -531,14 +531,14 @@ func TestSnapshotFrames(t *testing.T) {
 			a.snap = func() stats.Agg { return a.agg }
 			a.transport = "quic"
 		}},
-		{"panel-sparse", 480, 400, func(a *app) {
+		{"panel-sparse", 480, 510, func(a *app) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1, UpRaw: 524847, UpWire: 392, UpRatio: 392.0 / 524847, P50Ms: 18}
 			a.agg.Series = sparseSeries()
 			a.snap = func() stats.Agg { return a.agg }
 		}},
-		{"settings", 480, 400, func(a *app) { a.tab = tabSettings }},
-		{"settings-running", 480, 400, func(a *app) {
+		{"settings", 480, 510, func(a *app) { a.tab = tabSettings }},
+		{"settings-running", 480, 510, func(a *app) {
 			a.tab = tabSettings
 			setRunning(a, true)
 		}},

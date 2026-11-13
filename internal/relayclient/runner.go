@@ -56,6 +56,7 @@ type Config struct {
 	Listen     string        // 本地 HTTP 监听，如 127.0.0.1:18899
 	Server     string        // relay-server 地址 host:port
 	ServerName string        // TLS SNI，留空自动推导
+	LocalAddr  string        // 绑定出站源地址（绕 TUN 代理劫持），留空让内核选
 	Transport  string        // auto | quic | tcp
 	Insecure   bool          // 跳过服务端证书校验（自签观察期）
 	MinDelta   int           // 小于此字节数的请求体不做 delta
@@ -278,7 +279,7 @@ func (r *Runner) Start() error {
 	}
 
 	dialer := &transport.Dialer{
-		Addr: c.Server, ServerName: c.ServerName,
+		Addr: c.Server, ServerName: c.ServerName, LocalAddr: c.LocalAddr,
 		Insecure: c.Insecure, Mode: mode,
 	}
 	finder := basefind.New(c.HistoryMB)
