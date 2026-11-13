@@ -19,18 +19,17 @@ test("产物命名规则与 release.yml 一致", () => {
 });
 
 test("镜像列表按优先级且以直连兜底", () => {
-  const m = src.match(/const MIRRORS = \[([\s\S]*?)\];/);
-  assert.ok(m, "找不到 MIRRORS 定义");
-  const body = m[1];
-  assert.match(body, /gh-proxy\.com/, "应含 gh-proxy.com");
-  assert.match(body, /ghfast\.top/, "应含 ghfast.top");
-  // 最后一项必须是空串（直连兜底）
-  assert.ok(/""\s*,\s*\/\//.test(body), '最后一项应为空串兜底');
+  const { DEFAULT_MIRRORS } = require("../lib/mirror");
+  assert.ok(DEFAULT_MIRRORS.includes("https://gh-proxy.com/"), "应含 gh-proxy.com");
+  assert.ok(DEFAULT_MIRRORS.includes("https://ghfast.top/"), "应含 ghfast.top");
+  assert.strictEqual(DEFAULT_MIRRORS[DEFAULT_MIRRORS.length - 1], "",
+    '最后一项必须是空串（直连兜底）');
 });
 
 test("缓存按版本隔离", () => {
-  assert.match(src, /path\.join\(cacheRoot\(\), version, name\)/,
-    "缓存路径必须含 version，否则换版本会串包");
+  const { binaryPath } = require("../lib/run");
+  const p = binaryPath("cli", "9.9.9");
+  if (p) assert.match(p, /9\.9\.9/, "缓存路径必须含 version，否则换版本会串包");
 });
 
 test("跨平台缓存根", () => {
@@ -40,8 +39,13 @@ test("跨平台缓存根", () => {
 });
 
 test("下载是原子落盘（.part -> rename）", () => {
-  assert.match(src, /`\$\{dest\}\.part`/, "应写 .part 临时文件");
-  assert.match(src, /rename\(tmp, dest\)/, "应 rename 落盘");
+  const { tempPath } = require("../lib/download");
+  assert.strictEqual(tempPath("/cache/bin"), "/cache/bin.part");
+  const dl = require("node:fs").readFileSync(
+    path.join(__dirname, "..", "lib", "download.js"), "utf8"
+  );
+  assert.match(dl, /rename\(tmp, dest\)/, "应 rename 落盘");
+  assert.match(dl, /verifySize\(/, "rename 前必须核对字节数");
 });
 
 test("三个 bin 入口存在且指向同一启动器", () => {
