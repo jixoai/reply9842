@@ -31,6 +31,20 @@ fi
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
 
+# 可选：绑定出站源地址。代理软件的 TUN 全局模式会把所有 IPv4 导进 utun，
+# 连 ssh/scp 也会被劫持（实测表现为 Connection closed / kex 阶段断开）。
+# 绑到物理网卡 IP 可绕开：
+#   SSH_BIND=192.168.1.106 ./scripts/deploy.sh gaubee-cloud
+SSH_OPTS=(-o BatchMode=yes)
+# scp 与 ssh 的参数不同：ssh 用 -b，scp 只认 -o BindAddress=。
+# 早先把 -b 直接塞进共享数组，scp 报 "illegal option -- b"（2026-11-13 实测）。
+SCP_OPTS=(-o BatchMode=yes)
+if [ -n "${SSH_BIND:-}" ]; then
+	SSH_OPTS+=(-b "$SSH_BIND")
+	SCP_OPTS+=(-o "BindAddress=${SSH_BIND}")
+	echo "（绑定源地址 ${SSH_BIND}）"
+fi
+
 VERSION="${VERSION:-$(git describe --tags --always --dirty 2>/dev/null || echo dev)}"
 BIN_LOCAL="/tmp/reply9842-server-deploy"
 GZ_LOCAL="/tmp/reply9842-server-deploy.gz"
@@ -66,10 +80,10 @@ echo "   $GZ_SIZE 字节, sha256: $GZ_SHA"
 
 echo "== 4/6 传输（不设短超时，慢就等）=="
 # 注意：不用 timeout 包。跨境链路 40MB/s→40KB/s 都可能，掐断就是半截文件。
-scp -o BatchMode=yes "$GZ_LOCAL" "$HOST:/tmp/r9842-deploy.gz"
+scp "${SCP_OPTS[@]}" "$GZ_LOCAL" "$HOST:/tmp/r9842-deploy.gz"
 
 echo "== 5/6 远端解压 + 校验 sha256（不一致立即中止）=="
-REMOTE_SHA=$(ssh -o BatchMode=yes "$HOST" "sha256sum /tmp/r9842-deploy.gz | cut -d' ' -f1")
+REMOTE_SHA=$(ssh "${SSH_OPTS[@]}" "$HOST" "sha256sum /tmp/r9842-deploy.gz | cut -d' ' -f1")
 echo "   远端: $REMOTE_SHA"
 if [ "$REMOTE_SHA" != "$GZ_SHA" ]; then
 	echo "❌ 传输损坏：远端 sha256 与本地不一致，拒绝部署" >&2
@@ -79,7 +93,7 @@ if [ "$REMOTE_SHA" != "$GZ_SHA" ]; then
 fi
 echo "   ✓ 校验通过"
 
-ssh -o BatchMode=yes "$HOST" '
+ssh "${SSH_OPTS[@]}" "$HOST" '
 	set -eu
 	gunzip -f /tmp/r9842-deploy.gz
 	chmod 0755 /tmp/r9842-deploy
@@ -91,7 +105,7 @@ ssh -o BatchMode=yes "$HOST" '
 
 echo "== 6/6 验证服务真的起来了 =="
 sleep 3
-ssh -o BatchMode=yes "$HOST" '
+ssh "${SSH_OPTS[@]}" "$HOST" '
 	set -eu
 	state=$(systemctl is-active reply9842-server 2>&1 || true)
 	echo "   systemctl: $state"
