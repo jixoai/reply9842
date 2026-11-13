@@ -87,9 +87,6 @@ jobs:
     needs: pick-runner
     runs-on: ${{ needs.pick-runner.outputs.label }}
     timeout-minutes: 30
-    needs: pick-runner
-    runs-on: ${{ needs.pick-runner.outputs.label }}
-    timeout-minutes: 30
 
     steps:
       - name: Checkout
@@ -180,7 +177,24 @@ jobs:
       - name: Checksums
         if: startsWith(github.ref, 'refs/tags/v')
         run: |
-          cd dist && shasum -a 256 * > SHA256SUMS.txt && cat SHA256SUMS.txt
+          set -euo pipefail
+          cd dist
+          # 注意排除 SHA256SUMS.txt 自身：workflow 重跑时它已存在，会把
+          # 自己也算进去。用 glob 而不是 ls|grep，避免文件名带特殊字符时出错。
+          shopt -s extglob nullglob
+          files=(!(*SHA256SUMS.txt))
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "dist 为空，没有可校验的产物" >&2
+            exit 1
+          fi
+          # shasum 是 macOS 自带（Perl），ubuntu 只有 sha256sum；self-hosted 与
+          # 官方 runner 都会跑到这一步，所以两条路都要通。
+          if command -v sha256sum >/dev/null 2>&1; then
+            sha256sum "${files[@]}" > SHA256SUMS.txt
+          else
+            shasum -a 256 "${files[@]}" > SHA256SUMS.txt
+          fi
+          cat SHA256SUMS.txt
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
