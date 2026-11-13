@@ -51,8 +51,8 @@ cd "$here"
   --out rsrc \
   --manifest gui \
   --icon "$ico" \
-  --product-name "rfc9842-reply" \
-  --file-description "rfc9842-reply 客户端" \
+  --product-name "reply9842" \
+  --file-description "reply9842 客户端" \
   --original-filename "relay-gui-windows-amd64.exe" \
   --product-version "$num" \
   --file-version "$num" \

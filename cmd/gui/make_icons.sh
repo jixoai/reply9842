@@ -29,7 +29,11 @@ if ! command -v iconutil >/dev/null 2>&1; then
 fi
 test -f "$svg" || { echo "找不到 $svg" >&2; exit 1; }
 
-rm -rf "$iconset" "$preview"
+# 只清 .iconset（构建中间产物）。$preview 不能整目录删：里面有**入库**的
+# 交付物（preview-sheet、各尺寸预览、历史对比图）。
+# 2026-11-13 实证：`rm -rf "$preview"` 删掉了已提交的 compare-old-new.png，
+# 表现为 git status 里一次莫名其妙的「删除文件」——差点当成有意改动提交掉。
+rm -rf "$iconset"
 mkdir -p "$iconset" "$preview"
 
 # .iconset 的十档：逻辑尺寸 × 1x/2x。@2x 是高密度屏实际取用的图，

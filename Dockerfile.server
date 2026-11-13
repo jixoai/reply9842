@@ -15,9 +15,18 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY . .
 ARG VERSION=dev
-RUN CGO_ENABLED=0 GOOS=linux go build \
+# TARGETOS / TARGETARCH 由 buildx 在多平台构建时自动注入（值即目标平台）。
+# 必须显式传给 go build：不写 GOARCH 的话 go 用**构建机**的架构，于是
+# `--platform linux/amd64,linux/arm64` 会产出一个架构错标的镜像。
+# 2026-11-13 实测：在 arm64 Mac 上执行原来的 build 行（只有 GOOS=linux），
+# 产物是 `ELF ... ARM aarch64`。单独 docker build（非 buildx）时这两个变量为空，
+# GOARCH 留空即回退宿主架构，行为与改动前一致。
+ARG TARGETOS
+ARG TARGETARCH
+RUN CGO_ENABLED=0 GOOS=${TARGETOS:-linux} GOARCH=${TARGETARCH} go build \
       -trimpath -ldflags "-s -w -X main.version=${VERSION}" \
-      -o /out/reply9842-server ./cmd/server
+      -o /out/reply9842-server ./cmd/server && \
+    file /out/reply9842-server
 
 # ---- 运行 ----
 FROM scratch

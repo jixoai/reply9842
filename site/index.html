@@ -3,19 +3,19 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>rfc9842-reply — 把 AI Agent 上行带宽砍掉 99.8%</title>
+    <title>reply9842 — 把 AI Agent 上行带宽砍掉 99.8%</title>
     <meta
       name="description"
       content="基于内容寻址基版本的增量压缩隧道。Agent 每请求上行 1.3–2.2 MB，实测压到几百字节：22.3 MB 的 14 条连续请求 ──▶ 20.9 KB。"
     />
     <meta name="theme-color" content="#000000" />
     <meta property="og:type" content="website" />
-    <meta property="og:title" content="rfc9842-reply — 增量压缩隧道" />
+    <meta property="og:title" content="reply9842 — 增量压缩隧道" />
     <meta
       property="og:description"
       content="把 AI Agent 的上行带宽砍掉 99.8%。内容寻址基版本 + zstd delta，1.4 MB 请求压到约 1 KB。"
     />
-    <meta property="og:url" content="https://rfc9842-reply.jixoai.com" />
+    <meta property="og:url" content="https://reply9842.jixoai.com" />
     <link rel="stylesheet" href="style.css" />
     <link
       rel="icon"
@@ -27,7 +27,7 @@
       <div class="wrap">
         <a class="brand" href="#top">
           <span class="brand-mark" aria-hidden="true"></span>
-          <span class="brand-name">rfc9842-reply</span>
+          <span class="brand-name">reply9842</span>
           <span class="brand-tag">incremental tunnel</span>
         </a>
         <nav class="nav" aria-label="页面导航">
@@ -35,7 +35,7 @@
           <a class="nav-hide" href="#how">原理</a>
           <a href="#results">实测</a>
           <a class="nav-hide" href="#start">快速开始</a>
-          <a href="https://github.com/jixoai/rfc9842-reply">GitHub ↗</a>
+          <a href="https://github.com/jixoai/reply9842">GitHub ↗</a>
         </nav>
       </div>
     </header>
@@ -70,7 +70,7 @@
 
           <div class="actions">
             <a class="btn btn-primary" href="#start">快速开始 <span class="arrow">→</span></a>
-            <a class="btn" href="https://github.com/jixoai/rfc9842-reply">查看源码 <span class="arrow">↗</span></a>
+            <a class="btn" href="https://github.com/jixoai/reply9842">查看源码 <span class="arrow">↗</span></a>
           </div>
         </div>
       </section>
@@ -480,20 +480,20 @@ ANTHROPIC_BASE_URL=<i>http://127.0.0.1:18899</i></pre>
           <div class="foot-brand">
             <a class="brand" href="#top">
               <span class="brand-mark" aria-hidden="true"></span>
-              <span class="brand-name">rfc9842-reply</span>
+              <span class="brand-name">reply9842</span>
             </a>
             <span class="foot-desc">基于内容寻址基版本的<br />增量压缩隧道</span>
             <span class="foot-desc">Go 编写，单个二进制，Agent 无感接入。</span>
           </div>
           <div class="foot-links">
-            <a href="https://github.com/jixoai/rfc9842-reply">GitHub</a>
-            <a href="https://github.com/jixoai/rfc9842-reply#readme">README</a>
+            <a href="https://github.com/jixoai/reply9842">GitHub</a>
+            <a href="https://github.com/jixoai/reply9842#readme">README</a>
             <a href="https://www.rfc-editor.org/rfc/rfc9842.html">RFC 9842</a>
             <a href="https://www.rfc-editor.org/rfc/rfc8878.html">RFC 8878</a>
           </div>
         </div>
 
-        <div class="wordmark" aria-hidden="true">rfc9842-reply</div>
+        <div class="wordmark" aria-hidden="true">reply9842</div>
 
         <div class="colophon">
           <span>© 2026 jixoai</span>
