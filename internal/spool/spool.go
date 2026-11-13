@@ -23,6 +23,7 @@
 package spool
 
 import (
+	"bytes"
 	"container/list"
 	"encoding/hex"
 	"encoding/json"
@@ -34,6 +35,10 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/jixoai/rfc9842-reply/internal/downlink"
+
+	"github.com/klauspost/compress/zstd"
 )
 
 // State 条目状态
@@ -63,6 +68,9 @@ type sidecar struct {
 	Status  int    `json:"status"`
 	Headers []byte `json:"headers,omitempty"`
 	Written int64  `json:"written"`
+	// Compressed .dat 里存的是 zstd 流（下行压缩），恢复后必须按压缩解读，
+	// 否则会把压缩字节当明文推给客户端。
+	Compressed bool `json:"compressed,omitempty"`
 }
 
 // Entry 一次请求的响应缓冲
@@ -80,6 +88,26 @@ type Entry struct {
 	complete bool
 	err      error
 	notify   chan struct{} // 每次 Append/Finish 时 close 并替换
+
+	// ---- 下行压缩（2026-11-13）----
+	//
+	// compressed=true 时 .dat 里存的是**一条连续 zstd 流**；written 等对外
+	// API 全部保持「明文字节」语义，续传偏移、事件索引都不必换单位。
+	// 代价：从明文偏移 from>0 读取时要先解压丢弃前缀（实测 695KB 全量 0.46ms）。
+	compressed bool
+	cmpr       *downlink.Compressor
+	wire       int64 // .dat 实际字节数（压缩后）
+
+	// wantCompress 客户端声明支持下行压缩 → 希望压缩
+	// decided      是否已做出「压 / 不压」的决定（跨过 MinUseful 门槛时拍板）
+	// pending      决定前暂存的明文（上限 ≈ MinUseful）
+	wantCompress bool
+	decided      bool
+	pending      []byte
+
+	// readMu 串行化压缩解码游标（cur）。锁序固定 readMu → mu，绝不反向。
+	readMu sync.Mutex
+	cur    *cursor
 
 	headStatus  int
 	headHeaders []byte
@@ -108,28 +136,349 @@ type EventMark struct {
 
 // ReadFrom 从 offset 开始读取已落盘的 body 字节，最多 n 字节。
 // 返回实际读取的字节数；若 offset 已到末尾返回 (0, nil)。
-// 使用 ReadAt 而非 Read，避免与写入端共享文件偏移。
+//
+// offset 与 n 都是**明文**单位（压缩条目的调用方不需要知道压缩的存在）。
+// 未压缩条目走 ReadAt（无状态、无游标）；压缩条目走顺序解码游标——客户端
+// 消费偏移单调递增，游标命中时零重复解码；续传跳转时重建游标。
 func (e *Entry) ReadFrom(offset int64, n int) ([]byte, error) {
-	e.mu.Lock()
-	written := e.written
-	f := e.file
-	e.mu.Unlock()
-	if f == nil {
-		return nil, errors.New("spool: entry closed")
+	if !e.Compressed() {
+		e.mu.Lock()
+		written, f := e.written, e.file
+		e.mu.Unlock()
+		if f == nil {
+			return nil, errors.New("spool: entry closed")
+		}
+		if offset >= written {
+			return nil, nil
+		}
+		if int64(n) > written-offset {
+			n = int(written - offset)
+		}
+		buf := make([]byte, n)
+		got, err := f.ReadAt(buf, offset)
+		if err != nil && err != io.EOF {
+			return buf[:got], err
+		}
+		return buf[:got], nil
 	}
-	if offset >= written {
+
+	// ---- 压缩条目 ----
+	// readable 是「已推出压缩器本体的明文量」：还攒在压缩器内缓冲里的字节
+	// 客户端此刻读不到，必须由 FlushDown 推出来（读取方按空闲超时调用）。
+	readable := e.readable()
+	if offset >= readable || n <= 0 {
 		return nil, nil
 	}
-	avail := written - offset
-	if int64(n) > avail {
-		n = int(avail)
+	if int64(n) > readable-offset {
+		n = int(readable - offset)
+	}
+
+	e.readMu.Lock()
+	defer e.readMu.Unlock()
+
+	if e.cur == nil || e.cur.pos != offset {
+		if err := e.seek(offset); err != nil {
+			return nil, err
+		}
 	}
 	buf := make([]byte, n)
-	got, err := f.ReadAt(buf, offset)
-	if err != nil && err != io.EOF {
-		return buf[:got], err
+	got := 0
+	for got < n {
+		m, err := e.cur.dec.Read(buf[got:])
+		got += m
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			e.cur.pos += int64(got)
+			return buf[:got], err
+		}
+		if m == 0 {
+			break
+		}
 	}
+	e.cur.pos += int64(got)
 	return buf[:got], nil
+}
+
+// readable 已推出压缩器、可从 .dat 解出的明文字节数。
+func (e *Entry) readable() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.readableLocked()
+}
+
+func (e *Entry) readableLocked() int64 {
+	flushed := e.written
+	if e.cmpr != nil {
+		flushed -= int64(e.cmpr.Pending())
+	}
+	return flushed
+}
+
+// seek 在明文偏移 from 处建立解码游标。压缩流无法从中间偏移直接解码，
+// 只能从头解压并丢弃前缀——这是「spool 存压缩流」方案的确定成本。
+func (e *Entry) seek(from int64) error {
+	if e.cur != nil {
+		e.cur.dec.Close()
+		e.cur = nil
+	}
+	e.mu.Lock()
+	if e.file == nil {
+		e.mu.Unlock()
+		return errors.New("spool: entry closed")
+	}
+	e.mu.Unlock()
+
+	// decoder 会立刻起后台 goroutine 读 src，而 src 的 Read 要取 e.mu，
+	// 所以必须在创建 decoder 之前放锁（否则自锁）。
+	src := &wireSource{e: e}
+	dec, err := zstd.NewReader(src, zstd.WithDecoderConcurrency(1))
+	if err != nil {
+		return err
+	}
+	c := &cursor{dec: dec, pos: 0}
+	if from > 0 {
+		var buf [16 << 10]byte
+		skipped := int64(0)
+		for skipped < from {
+			want := int64(len(buf))
+			if from-skipped < want {
+				want = from - skipped
+			}
+			n, rerr := dec.Read(buf[:want])
+			skipped += int64(n)
+			if rerr != nil {
+				dec.Close()
+				return fmt.Errorf("spool: seek %d: %w", from, rerr)
+			}
+			if n == 0 {
+				dec.Close()
+				return fmt.Errorf("spool: seek %d: short prefix", from)
+			}
+		}
+		c.pos = skipped
+	}
+	e.mu.Lock()
+	e.cur = c
+	e.mu.Unlock()
+	return nil
+}
+
+// FlushDown 把压缩器内缓冲的明文推成可读字节（空闲超时时由读取方调用）。
+// 返回是否产生了新的可读字节。未压缩条目是空操作。
+func (e *Entry) FlushDown() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.cmpr == nil || e.file == nil {
+		return false
+	}
+	before := e.readableLocked()
+	if err := e.cmpr.Flush(); err != nil {
+		return false
+	}
+	if e.readableLocked() == before {
+		return false
+	}
+	e.gen++
+	close(e.notify)
+	e.notify = make(chan struct{})
+	return true
+}
+
+// EnableCompression 允许后续 Append 走下行压缩（.dat 存 zstd 流）。
+//
+// 这是「请求压缩」而非「立即压缩」：真正的压缩器在累计明文达到
+// downlink.MinUseful 时才创建。原因：响应头到达时还不知道 body 总量，而
+// 小于 MinUseful 的响应压缩后反而更大（实测线上 401 错误体 172B → 333B）。
+//
+// 返回 false 表示该条目已开始写明文、不会再压缩。
+func (e *Entry) EnableCompression() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.written != 0 || e.cmpr != nil || e.compressed {
+		return false
+	}
+	e.wantCompress = true
+	return true
+}
+
+// settleCompressionLocked 按「累计明文是否够大」决定压缩或落明文。
+// 调用方持有 e.mu，且仅在该条目尚未决定（decided=false）时调用。
+// 返回 true 表示已启用压缩。
+// settleCompressionLocked 拍板并（在需要时）创建压缩器。
+// 调用方必须先把待压明文从 pending 取出，并以 amount 传入总量。
+//
+// 门槛判断集中在这里：所有拍板路径（攒够、结束、超时）都走同一个判断，
+// 否则「超时拍板」这类旁路会让小响应被压缩（实测 180B 错误体 → 328B）。
+func (e *Entry) settleCompressionLocked(amount int) bool {
+	e.decided = true
+	if !e.wantCompress || e.compressed {
+		return false
+	}
+	if amount < downlink.MinUseful {
+		return false
+	}
+	c, err := downlink.New(sinkWriter{e: e})
+	if err != nil {
+		// 压缩器创建失败：退回明文，请求本身仍然成功
+		e.wantCompress = false
+		return false
+	}
+	e.compressed = true
+	e.cmpr = c
+	return true
+}
+
+// Decided 压缩决策是否已作出，以及是否选择压缩。
+//
+// 读取方（streamToClient）必须在**发响应头之前**拿到确定答案，因为线上
+// 编码要在头帧里声明一次；头发出后再翻转会让客户端按错误编码解析 body。
+//
+// 未申请压缩的条目（旧客户端 / 未声明能力）视为立即已决定（且不压缩）：
+// 否则读方会为一个永远不会发生的决策空等超时。
+func (e *Entry) Decided() (bool, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.wantCompress {
+		return true, e.compressed
+	}
+	return e.decided, e.compressed
+}
+
+// ForceDecide 立刻拍板（读方超时后调用）：够大就压，否则落明文。
+//
+// 为什么需要它：延迟决策依赖「攒够 MinUseful」，但上游可能长时间只吐几十
+// 字节（慢速小响应）。一直等会把响应头也扣住，用户看不到任何响应。超时后
+// 按当前量拍板，宁可小响应不压，也不能拖住首字节。
+func (e *Entry) ForceDecide() (bool, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.decided {
+		return true, e.compressed
+	}
+	if !e.wantCompress {
+		// 未申请压缩：直接标记已决定，无需拍板
+		e.decided = true
+		return true, false
+	}
+	// 超时拍板同样要过门槛：等不到更多数据 ≠ 数据够大。
+	// 无条件压缩会让小响应膨胀（实测 180B 错误体 → 328B wire）。
+	if e.settleCompressionLocked(len(e.pending)) {
+		buf := e.pending
+		e.pending = nil
+		if _, werr := e.cmpr.Write(buf); werr != nil {
+			if e.err == nil {
+				e.err = werr
+			}
+		} else {
+			e.written += int64(len(buf))
+		}
+		return true, true
+	}
+	e.decided = true
+	if len(e.pending) > 0 {
+		if err := e.writePlainLocked(e.pending); err != nil {
+			if e.err == nil {
+				e.err = err
+			}
+		}
+		e.pending = nil
+	}
+	return true, e.compressed
+}
+
+// Compressed 该条目的 .dat 是否为 zstd 流
+func (e *Entry) Compressed() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.compressed
+}
+
+// WireBytes .dat 实际占用字节（压缩后；未压缩时等于 Written）
+func (e *Entry) WireBytes() int64 {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if !e.compressed {
+		return e.written
+	}
+	return e.wire
+}
+
+// sinkWriter 压缩器的输出端：写到 .dat 当前尾部。调用方必须持有 e.mu。
+type sinkWriter struct{ e *Entry }
+
+func (s sinkWriter) Write(p []byte) (int, error) {
+	e := s.e
+	if e.file == nil {
+		return 0, errors.New("spool: entry closed")
+	}
+	n, err := e.file.WriteAt(p, e.wire)
+	e.wire += int64(n)
+	return n, err
+}
+
+// wireSource 把 .dat 的 wire 字节喂给流式解码器。
+//
+// 返回 io.EOF 的时机必须严格是「条目已完成且字节读尽」：zstd 解码器读到
+// io.EOF 会永久结束该流，若把「暂时没新数据」当 EOF，续传就再也解不出东西。
+type wireSource struct {
+	e   *Entry
+	off int64
+}
+
+func (s *wireSource) Read(p []byte) (int, error) {
+	for {
+		if len(p) == 0 {
+			return 0, nil
+		}
+		s.e.mu.Lock()
+		f, wire, complete := s.e.file, s.e.wire, s.e.complete
+		if f == nil {
+			s.e.mu.Unlock()
+			return 0, errors.New("spool: entry closed")
+		}
+		if s.off < wire {
+			if int64(len(p)) > wire-s.off {
+				p = p[:wire-s.off]
+			}
+			n, err := f.ReadAt(p, s.off)
+			s.off += int64(n)
+			s.e.mu.Unlock()
+			if n > 0 {
+				return n, nil
+			}
+			if err != nil {
+				return 0, err
+			}
+			continue
+		}
+		s.e.mu.Unlock()
+		if complete {
+			return 0, io.EOF
+		}
+		// 等上游继续写，或等空闲超时把缓冲推出来
+		gen := s.e.Gen()
+		if !s.e.WaitMoreFor(downlink.DefaultFlushIdle, gen) {
+			s.e.FlushDown()
+		}
+	}
+}
+
+// cursor 压缩条目的顺序解码游标（由 readMu 保护）
+type cursor struct {
+	dec *zstd.Decoder
+	pos int64 // 已消费的明文字节
+}
+
+// closeCursor 关闭解码游标（回收其后台 goroutine）。可重复调用。
+func (e *Entry) closeCursor() {
+	e.readMu.Lock()
+	defer e.readMu.Unlock()
+	if e.cur != nil {
+		e.cur.dec.Close()
+		e.cur = nil
+	}
 }
 
 // Gen 当前内容版本号（每次 Append / Finish 递增）
@@ -164,6 +513,33 @@ func (e *Entry) WaitMore(ctx <-chan struct{}, observedGen uint64) bool {
 		case <-ch:
 			continue
 		case <-ctx:
+			return false
+		}
+	}
+}
+
+// WaitMoreFor 与 WaitMore 相同，但最多等 d（d<=0 等价于不限时）。
+//
+// 下行压缩需要它：压缩器攒够阈值才输出，客户端只能靠「空闲超时强制 flush」
+// 拿到最后一小段数据。返回 false 只表示「这段时间内没有新数据」，不表示断开
+// ——断开仍由后续写失败感知（与 WaitMore 的语义一致）。
+func (e *Entry) WaitMoreFor(d time.Duration, observedGen uint64) bool {
+	if d <= 0 {
+		return e.WaitMore(nil, observedGen)
+	}
+	deadline := time.After(d)
+	for {
+		e.mu.Lock()
+		if e.complete || e.gen != observedGen {
+			e.mu.Unlock()
+			return true
+		}
+		ch := e.notify
+		e.mu.Unlock()
+
+		select {
+		case <-ch:
+		case <-deadline:
 			return false
 		}
 	}
@@ -204,7 +580,14 @@ func (e *Entry) Head() (int, []byte, bool) {
 	return e.headStatus, e.headHeaders, e.headSet
 }
 
-// Append 追加一段 body 到文件末尾，并唤醒所有等待者
+// Append 追加一段 body 到文件末尾，并唤醒所有等待者。
+//
+// 压缩条目（EnableCompression 后）这里写的是**明文**：压缩器负责压成 wire
+// 字节并直接落到 .dat。written 因此天然保持明文语义，SSE 事件索引也不用改。
+//
+// 压缩决策是「延迟」的：EnableCompression 只是表达意愿，真正的压缩器在累计
+// 明文达到 downlink.MinUseful 时才创建。跨过门槛前那段明文暂存在 pending
+// （上限就是一个门槛的量，可忽略），所以 .dat 里不会出现「半明文半压缩流」。
 func (e *Entry) Append(p []byte) error {
 	if len(p) == 0 {
 		return nil
@@ -214,24 +597,82 @@ func (e *Entry) Append(p []byte) error {
 		e.mu.Unlock()
 		return errors.New("spool: entry closed")
 	}
-	if _, err := e.file.WriteAt(p, e.written); err != nil {
-		e.err = err
-		e.finishLocked()
-		mgr := e.mgr
-		e.mu.Unlock()
-		if mgr != nil {
-			mgr.promote(e, StateComplete)
+
+	// 尚未拍板：先攒在 pending，攒够门槛再一次性决定。
+	// 这样做是因为响应头必须在拍板后才发（线上编码要一次声明），而小响应
+	// 压缩反而更大。pending 上限 ≈ MinUseful(512B)，可忽略。
+	//
+	// written 语义是「已落盘（含压缩器内）的明文」，pending 里的还没落盘，
+	// 所以这里**不能**加 written——否则 Finish 落盘时会重复计数并重写一遍。
+	if e.wantCompress && !e.decided {
+		e.pending = append(e.pending, p...)
+		base := e.written
+		// 门槛看「pending 累计量」，不看 written（pending 尚未落盘）
+		if len(e.pending) >= downlink.MinUseful {
+			buf := e.pending
+			e.pending = nil
+			if e.settleCompressionLocked(len(buf)) {
+				if _, werr := e.cmpr.Write(buf); werr != nil {
+					e.written += int64(len(buf))
+					e.failLocked(werr)
+					return werr
+				}
+				e.written += int64(len(buf))
+			} else if werr := e.writePlainLocked(buf); werr != nil {
+				e.failLocked(werr)
+				return werr
+			}
 		}
+		e.scanEventsLocked(p, base)
+		e.finishAppendLocked()
+		return nil
+	}
+
+	var err error
+	if e.cmpr != nil {
+		var n int
+		n, err = e.cmpr.Write(p)
+		e.written += int64(n)
+	} else {
+		err = e.writePlainLocked(p)
+	}
+	if err != nil {
+		e.failLocked(err)
 		return err
 	}
-	e.written += int64(len(p))
 	e.scanEventsLocked(p, e.written-int64(len(p)))
+	e.finishAppendLocked()
+	return nil
+}
+
+// writePlainLocked 把明文直接写到 .dat 尾部（未压缩路径）。调用方持有 e.mu。
+func (e *Entry) writePlainLocked(p []byte) error {
+	if _, err := e.file.WriteAt(p, e.wire); err != nil {
+		return err
+	}
+	e.wire += int64(len(p))
+	e.written += int64(len(p))
+	return nil
+}
+
+// failLocked 记录写入错误并结束条目。调用方持有 e.mu。
+func (e *Entry) failLocked(err error) {
+	e.err = err
+	e.finishLocked()
+	mgr := e.mgr
+	e.mu.Unlock()
+	if mgr != nil {
+		mgr.promote(e, StateComplete)
+	}
+}
+
+// finishAppendLocked 追加成功后的收尾（唤醒等待者）。调用方持有 e.mu。
+func (e *Entry) finishAppendLocked() {
 	e.lastAccess = time.Now()
 	e.gen++
 	close(e.notify)
 	e.notify = make(chan struct{})
 	e.mu.Unlock()
-	return nil
 }
 
 // scanEventsLocked 在新增字节里找 SSE 事件边界与 id 行。
@@ -287,6 +728,34 @@ func (e *Entry) Finish(err error) {
 func (e *Entry) finishLocked() {
 	if e.complete {
 		return
+	}
+	// 还没拍板就结束（小响应：总量没到 MinUseful）→ 待定明文直接落盘。
+	// 漏掉这步会丢掉整个 body（实测：4 字节响应读回空）。
+	if !e.decided && e.wantCompress && len(e.pending) > 0 {
+		buf := e.pending
+		e.pending = nil
+		if e.settleCompressionLocked(len(buf)) {
+			if _, werr := e.cmpr.Write(buf); werr != nil {
+				if e.err == nil {
+					e.err = werr
+				}
+			} else {
+				e.written += int64(len(buf))
+			}
+		} else {
+			e.decided = true
+			if werr := e.writePlainLocked(buf); werr != nil && e.err == nil {
+				e.err = werr
+			}
+		}
+	}
+	if e.cmpr != nil {
+		// 结束 zstd 流：写出帧尾，让最后一段数据能被解出。
+		// 必须先关压缩器再置 complete，否则读取方可能先看到 complete 却解不到尾部。
+		if err := e.cmpr.Close(); err != nil && e.err == nil {
+			e.err = err
+		}
+		e.cmpr = nil
 	}
 	e.complete = true
 	e.gen++
@@ -354,6 +823,7 @@ func (e *Entry) EventOffset(id string) int64 {
 
 // Close 关闭文件句柄
 func (e *Entry) Close() error {
+	e.closeCursor()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	if e.file != nil {
@@ -483,10 +953,16 @@ func (m *Manager) restoreIdem() {
 		e := &Entry{
 			Key: key, mgr: m, path: path, file: f,
 			state: StateComplete, inIdem: true, // 重启后不知上游状态，保守标记为 Complete
-			written: st.Size(), complete: true,
+			written: sc.Written, complete: true,
+			compressed: sc.Compressed, wire: st.Size(),
 			headStatus: sc.Status, headHeaders: sc.Headers, headSet: true,
 			notify:    make(chan struct{}),
 			createdAt: st.ModTime(), lastAccess: st.ModTime(),
+		}
+		// 老 sidecar 没有 Written 字段（旧版本写入 0）：退回文件大小。
+		// 压缩条目不能这么退——文件大小是 wire 字节，当明文长度会让续传多读。
+		if e.written == 0 && !e.compressed {
+			e.written = st.Size()
 		}
 		e.scanEventsLockedFile() // 重建 SSE 事件索引，续传才能按 event id 定位
 		m.entries[key] = e
@@ -499,12 +975,36 @@ func (e *Entry) scanEventsLockedFile() {
 	if e.file == nil || e.written <= 0 {
 		return
 	}
-	buf := make([]byte, e.written)
-	n, err := e.file.ReadAt(buf, 0)
-	if err != nil && err != io.EOF {
-		return
+	var plain []byte
+	if e.compressed {
+		// 读 wire 字节并解压；不够解满 written 时按实际解出的部分建索引，
+		// 大不了少几个事件标记（续传会退回按字节偏移，仍有正确性）。
+		raw := make([]byte, e.wire)
+		n, err := e.file.ReadAt(raw, 0)
+		if err != nil && err != io.EOF {
+			return
+		}
+		dec, derr := zstd.NewReader(bytes.NewReader(raw[:n]),
+			zstd.WithDecoderConcurrency(1))
+		if derr != nil {
+			return
+		}
+		plain, derr = dec.DecodeAll(raw[:n], nil)
+		dec.Close()
+		if derr != nil {
+			return
+		}
+	} else {
+		plain = make([]byte, e.written)
+		n, err := e.file.ReadAt(plain, 0)
+		if err != nil && err != io.EOF {
+			return
+		}
+		plain = plain[:n]
 	}
-	e.scanEventsLocked(buf[:n], 0)
+	e.mu.Lock()
+	e.scanEventsLocked(plain, 0)
+	e.mu.Unlock()
 }
 
 // Acquire 取得（或创建）一个条目。
@@ -634,7 +1134,7 @@ func (m *Manager) writeSidecar(e *Entry) {
 	e.mu.Lock()
 	path := e.path
 	sc := sidecar{Key: hex.EncodeToString(e.Key[:]), Status: e.headStatus,
-		Headers: e.headHeaders, Written: e.written}
+		Headers: e.headHeaders, Written: e.written, Compressed: e.compressed}
 	headSet := e.headSet
 	e.mu.Unlock()
 
@@ -673,6 +1173,10 @@ func (m *Manager) removeLocked(e *Entry) {
 	e.file = nil
 	e.mu.Unlock()
 
+	// 压缩条目的解码游标持有后台 goroutine（zstd 流解码器），
+	// 条目被淘汰时必须显式关闭，否则每个被淘汰的压缩条目泄漏一个 goroutine。
+	e.closeCursor()
+
 	delete(m.entries, e.Key)
 	if e.elem != nil {
 		if inIdem {
@@ -691,7 +1195,10 @@ func (m *Manager) removeLocked(e *Entry) {
 	}
 }
 
-// regionBytesLocked 统计某区域的已落盘字节（调用方持有 m.mu）。
+// regionBytesLocked 统计某区域的**磁盘占用**（调用方持有 m.mu）。
+//
+// 用 wire 而非 written：预算是磁盘预算，压缩条目 written 是明文长度（远大于
+// 实际占用），按它记账会让压缩响应提前被淘汰。未压缩时 wire == written。
 //
 // 不用增量计数器：Append 在 Entry 锁内、Detach 在 Manager 锁内，增量记账
 // 的竞态会让计数漂移甚至变负（实测 Detach 后 tmpBytes=-1000）。按需汇总
@@ -701,7 +1208,11 @@ func (m *Manager) regionBytesLocked(inIdem bool) int64 {
 	for _, e := range m.entries {
 		e.mu.Lock()
 		if e.inIdem == inIdem {
-			sum += e.written
+			if e.compressed {
+				sum += e.wire
+			} else {
+				sum += e.written
+			}
 		}
 		e.mu.Unlock()
 	}

@@ -103,6 +103,14 @@ type RequestHead struct {
 	IdemKey Hash
 	// ResumeFrom 续传起点：0 表示从头；>0 表示「我已有前 N 字节，从 N 开始推」。
 	ResumeFrom int64
+
+	// AcceptDownZstd 客户端能否解压压缩的下行响应（EncZstd）。
+	//
+	// 服务端必须按此开关决定下行编码：旧客户端不认识 EncZstd，收到压缩流会
+	// 把 zstd 字节直接当明文写给下游（实测：一次升级让线上全部响应变成
+	// 二进制垃圾）。协议无版本协商，故用这个显式能力位——默认 false
+	// （旧客户端不发该位，服务端自然退回 identity）。
+	AcceptDownZstd bool
 }
 
 // ResponseHead 响应帧头部
@@ -156,7 +164,13 @@ func ReadFrame(r io.Reader) (FrameType, []byte, error) {
 //
 // 布局：methodLen(1) method | pathLen(2) path | base(32) | result(32)
 //
-//	encoding(1) bodyLen(8) headerLen(4) | headers | body
+//	encoding(1) bodyLen(8) headerLen(4) | idem(32) resumeFrom(8) | headers | body
+//	| [acceptDownZstd(1)]
+//
+// 能力位放在**帧尾**（body 之后）：旧解码器按 bodyLen 截取 body，尾部的
+// 额外字节会被忽略（DecodeRequest 的越界判断是上界检查），所以新客户端
+// 发给旧服务端不会解析错乱。反过来旧客户端不发这一位，新服务端读不到
+// 就默认不支持压缩——这正是我们要的安全默认值。
 func EncodeRequest(h *RequestHead, headers, body []byte) ([]byte, error) {
 	if len(h.Method) > 255 {
 		return nil, errors.New("meta: method too long")
@@ -164,7 +178,12 @@ func EncodeRequest(h *RequestHead, headers, body []byte) ([]byte, error) {
 	if len(h.Path) > 0xFFFF {
 		return nil, errors.New("meta: path too long")
 	}
-	size := 1 + len(h.Method) + 2 + len(h.Path) + HashSize*2 + 1 + 8 + 4 + HashSize + 8 + len(headers) + len(body)
+	// 能力位仅在为 true 时才写，旧服务端/旧客户端完全不受影响
+	extra := 0
+	if h.AcceptDownZstd {
+		extra = 1
+	}
+	size := 1 + len(h.Method) + 2 + len(h.Path) + HashSize*2 + 1 + 8 + 4 + HashSize + 8 + len(headers) + len(body) + extra
 	buf := make([]byte, 0, size)
 
 	buf = append(buf, byte(len(h.Method)))
@@ -188,6 +207,9 @@ func EncodeRequest(h *RequestHead, headers, body []byte) ([]byte, error) {
 	buf = append(buf, tmpRF[:]...)
 	buf = append(buf, headers...)
 	buf = append(buf, body...)
+	if h.AcceptDownZstd {
+		buf = append(buf, 1)
+	}
 	return buf, nil
 }
 
@@ -256,11 +278,15 @@ func DecodeRequest(b []byte) (*RequestHead, []byte, []byte, error) {
 	headers := b[off : off+int(hdrLen)]
 	off += int(hdrLen)
 	body := b[off : off+int(bodyLen)]
+	off += int(bodyLen)
+
+	// 能力位在 body 之后（可选）。旧客户端不发 → 保持 false（安全默认）。
+	acceptDown := off < len(b) && b[off] == 1
 
 	return &RequestHead{
 		Method: method, Path: path, BaseHash: base, ResultHash: result,
 		Encoding: enc, BodyLen: bodyLen, HeaderLen: int32(hdrLen),
-		IdemKey: idem, ResumeFrom: resumeFrom,
+		IdemKey: idem, ResumeFrom: resumeFrom, AcceptDownZstd: acceptDown,
 	}, headers, body, nil
 }
 
@@ -357,6 +383,10 @@ type ResumeReq struct {
 	// From 客户端已有的字节偏移（-1 表示按 EventID 定位）
 	From    int64
 	EventID string // SSE 事件 id；非空则优先于 From
+
+	// AcceptDownZstd 同 RequestHead.AcceptDownZstd：续传也要协商，
+	// 否则「客户端升级前发起的请求」会在续传时收到解不了的压缩流。
+	AcceptDownZstd bool
 }
 
 // ResumeInfo 续传响应载荷
@@ -371,7 +401,7 @@ type ResumeInfo struct {
 
 // EncodeResumeReq 序列化续传请求
 func EncodeResumeReq(r *ResumeReq) []byte {
-	buf := make([]byte, 0, 32+8+2+len(r.EventID))
+	buf := make([]byte, 0, 32+8+2+len(r.EventID)+1)
 	buf = append(buf, r.IdemKey[:]...)
 	var t8 [8]byte
 	binary.BigEndian.PutUint64(t8[:], uint64(r.From))
@@ -383,6 +413,9 @@ func EncodeResumeReq(r *ResumeReq) []byte {
 	binary.BigEndian.PutUint16(t2[:], uint16(len(r.EventID)))
 	buf = append(buf, t2[:]...)
 	buf = append(buf, r.EventID...)
+	if r.AcceptDownZstd {
+		buf = append(buf, 1)
+	}
 	return buf
 }
 
@@ -399,6 +432,10 @@ func DecodeResumeReq(b []byte) (*ResumeReq, error) {
 		return nil, errors.New("meta: bad resume req length")
 	}
 	r.EventID = string(b[42 : 42+n])
+	// 能力位在尾部（可选）；旧客户端不发 → false（安全默认）
+	if 42+n < len(b) {
+		r.AcceptDownZstd = b[42+n] == 1
+	}
 	return r, nil
 }
 

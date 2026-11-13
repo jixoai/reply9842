@@ -60,6 +60,8 @@ func sendRequest(t *testing.T, c *transport.Conn, key [32]byte) {
 		ResultHash: toMetaHash(codec.Sum([]byte(apiBody))),
 		BodyLen:    int64(len(apiBody)),
 		IdemKey:    mh,
+		// 与真实客户端一致：声明能解压下行压缩
+		AcceptDownZstd: true,
 	}
 	hdr := meta.EncodeHeaders(map[string][]string{"Content-Type": {"application/json"}})
 	payload, err := meta.EncodeRequest(h, hdr, []byte(apiBody))
@@ -77,7 +79,7 @@ func sendRequest(t *testing.T, c *transport.Conn, key [32]byte) {
 
 func sendResume(t *testing.T, c *transport.Conn, key [32]byte, from int64, ev string) {
 	t.Helper()
-	rq := &meta.ResumeReq{IdemKey: key, From: from, EventID: ev}
+	rq := &meta.ResumeReq{IdemKey: key, From: from, EventID: ev, AcceptDownZstd: true}
 	frame, err := meta.WrapFrame(meta.FrameResume, meta.EncodeResumeReq(rq))
 	if err != nil {
 		t.Fatalf("wrap resume: %v", err)

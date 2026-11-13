@@ -188,6 +188,51 @@ func (c *Collector) Observe(r *Record) {
 	c.writeStatsLocked()
 }
 
+// Snapshot 返回当前汇总的副本，供进程内读者（GUI 每秒刷新）使用。
+//
+// 为什么必须深拷贝：Agg 里的 map 是原地更新的，直接把值交出去会让 GUI
+// 在无锁状态下读到正在被请求 goroutine 写的 map——Go 的 map 并发读写是
+// 直接 fatal（不是竞态报告）。拷贝成本是几个小 map，每秒一次可忽略。
+func (c *Collector) Snapshot() Agg {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	out := *c.agg
+	out.Statuses = cloneIntMap(c.agg.Statuses)
+	out.Encodings = cloneStrMap(c.agg.Encodings)
+	out.Transport = cloneStrMap(c.agg.Transport)
+	return out
+}
+
+func cloneStrMap(m map[string]int64) map[string]int64 {
+	out := make(map[string]int64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+func cloneIntMap(m map[int]int64) map[int]int64 {
+	out := make(map[int]int64, len(m))
+	for k, v := range m {
+		out[k] = v
+	}
+	return out
+}
+
+// ReadAgg 读取落盘的汇总快照（CLI 的 status 子命令用）。
+// 文件不存在时返回 os.ErrNotExist，由调用方决定如何提示。
+func ReadAgg(statsPath string) (*Agg, error) {
+	b, err := os.ReadFile(statsPath)
+	if err != nil {
+		return nil, err
+	}
+	var a Agg
+	if err := json.Unmarshal(b, &a); err != nil {
+		return nil, err
+	}
+	return &a, nil
+}
+
 func (c *Collector) writeStatsLocked() {
 	if c.statsPath == "" {
 		return
