@@ -26,6 +26,7 @@ import (
 
 	"github.com/jixoai/reply9842/internal/autostart"
 	"github.com/jixoai/reply9842/internal/glass"
+	"github.com/jixoai/reply9842/internal/netif"
 	"github.com/jixoai/reply9842/internal/relayclient"
 	"github.com/jixoai/reply9842/internal/stats"
 )
@@ -1206,7 +1207,7 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 //
 // 现在用「组标题 + 组间加高间隙」表达分区：
 //
-//	连接  上游地址 / 服务器域名 / 源地址 / 监听地址 / 传输方式
+//	连接  上游地址 / 服务器域名 / 网络（直连·系统·代理）/ 监听地址 / 传输方式
 //	其他  开机自启 / 日志保留 / 显示区间 / 自动更新 / 更新镜像 / 软件更新
 //
 // 组标题本身只有一行 11px 文字（约 26px 含上下留白），比一张卡的装饰开销小一个
@@ -1228,7 +1229,7 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		// utun。代理对 28443 这类非标端口没有正确规则，TLS 握手会被中途切断，
 		// 客户端只看到 "tcp tls: EOF"——看起来像服务端崩了。填物理网卡 IP
 		// （macOS: ipconfig getifaddr en0）让内核直接走该网卡即可绕过。
-		a.configField(c, p, "源地址", &a.localAddr, "留空自动；绕过代理时填网卡 IP", running)
+		a.networkRow(c, p, running)
 		a.configRule(c, p)
 		a.configField(c, p, "监听地址", &a.listen, relayclient.DefaultListen, running)
 		a.configRule(c, p)
@@ -1381,6 +1382,70 @@ func (a *app) configField(c *ui.Context, p *glass.Palette, label string, val *st
 }
 
 // transportRow 传输方式：三段分段控件（设计稿的 seg）
+// networkRow 网络出口三选一：直连 / 系统 / 代理。
+//
+// 为什么需要这一行（owner 2026-11-14）：代理软件的 TUN 全局模式会把整个
+// IPv4 路由接管到虚拟网卡（实测 route get 47.82.76.102 → 198.18.0.1/utun5），
+// 连隧道服务器的包也被导进代理，代理对 28443 这类非标端口没有正确规则，
+// TLS 被切断——客户端只看到 `tcp tls: EOF` 或 QUIC 超时。以前让用户手填
+// 「源地址」，等于把排查工作推给用户；现在三种模式说清楚：
+//
+//	直连  自动探测物理网卡 IP 并绑定（绕开 TUN），换网络也不用改
+//	系统  什么都不做，交给操作系统路由（被 TUN 劫持就连不上）
+//	代理  走 http/https/socks5 代理（QUIC 不可用，自动降级 TCP）
+func (a *app) networkRow(c *ui.Context, p *glass.Palette, disabled bool) {
+	options := []string{relayclient.NetworkDirect, relayclient.NetworkSystem, relayclient.NetworkProxy}
+	labels := []string{"直连", "系统", "代理"}
+	idx := 0
+	for i, o := range options {
+		if o == a.netMode {
+			idx = i
+		}
+	}
+	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
+		ui.Box(c).Width(84).Shrink(0).Children(func() {
+			ui.Text(c, "网络").FontSize(11).TextColor(p.MutedForeground).SingleLine()
+		})
+		ui.Box(c).Grow(1).Children(func() {
+			ui.Segmented(c, &idx, labels...).FontSize(11.5).Height(24).Disabled(disabled)
+		})
+	})
+	if options[idx] != a.netMode {
+		a.netMode = options[idx]
+		// 切到直连时立刻探测一次，界面上能马上看到会绑哪个 IP；探不到
+		// 就留空（Dial 会退回系统路由），不让切换本身失败。
+		if a.netMode == relayclient.NetworkDirect {
+			if ip, iface, err := netif.PrimaryIPv4(); err == nil {
+				a.detectedIP, a.detectedIface = ip, iface
+			}
+		}
+	}
+
+	// 一行说明：三选一各自的含义不同，光看标签猜不出来。
+	hint := ""
+	switch a.netMode {
+	case relayclient.NetworkDirect:
+		if a.detectedIP != "" {
+			hint = "绑定 " + a.detectedIface + " " + a.detectedIP + "，绕开 TUN 代理"
+		} else {
+			hint = "未探测到物理网卡，退回系统路由"
+		}
+	case relayclient.NetworkProxy:
+		hint = "代理只承载 TCP，QUIC 自动降级"
+	default:
+		hint = "跟随系统路由（TUN 全局模式下可能连不上）"
+	}
+	ui.Row(c).Padding(6, 0).Gap(12).Children(func() {
+		ui.Box(c).Width(84).Shrink(0)
+		ui.Text(c, hint).FontSize(10).TextColor(p.Tertiary).SingleLine()
+	})
+
+	if a.netMode == relayclient.NetworkProxy {
+		a.configField(c, p, "代理地址", &a.proxyURL,
+			"http://127.0.0.1:7890 或 socks5://127.0.0.1:7890", disabled)
+	}
+}
+
 func (a *app) transportRow(c *ui.Context, p *glass.Palette, disabled bool) {
 	options := []string{"auto", "quic", "tcp"}
 	labels := []string{"自动", "QUIC", "TCP"}

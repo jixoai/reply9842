@@ -58,6 +58,7 @@ type Config struct {
 	Server     string        // relay-server 地址 host:port
 	ServerName string        // TLS SNI，留空自动推导
 	LocalAddr  string        // 绑定出站源地址（绕 TUN 代理劫持），留空让内核选
+	Proxy      string        // 代理链路 http/https/socks5，留空直连
 	Transport  string        // auto | quic | tcp
 	Insecure   bool          // 跳过服务端证书校验（自签观察期）
 	MinDelta   int           // 小于此字节数的请求体不做 delta
@@ -281,7 +282,7 @@ func (r *Runner) Start() error {
 
 	dialer := &transport.Dialer{
 		Addr: c.Server, ServerName: c.ServerName, LocalAddr: c.LocalAddr,
-		Insecure: c.Insecure, Mode: mode,
+		Proxy: c.Proxy, Insecure: c.Insecure, Mode: mode,
 	}
 	// 连接池：实测单次 TCP+TLS 握手平均约 2 秒（本机→香港），每个请求都新建
 	// 连接等于白扔这份延迟。串行复用一条连接能把握手成本摊到接近零。

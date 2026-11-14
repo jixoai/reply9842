@@ -58,6 +58,12 @@ type Dialer struct {
 	// 这是用户侧「不想改代理配置」时最省事的解法。
 	LocalAddr string
 
+	// Proxy 代理链路（http:// / https:// / socks5:// [user:pass@]host:port）。
+	//
+	// 非空时代理模式生效：先把 TCP 打到代理，再在隧道里跑 TLS。QUIC 走不了
+	// 代理（HTTP CONNECT 与 SOCKS5 都是 TCP 隧道），所以 Dial 会强制只走 TCP。
+	Proxy string
+
 	// auto 模式的粘性记忆：一旦某模式成功，后续优先该模式
 	prefer   atomic.Value // Kind
 	lastKind atomic.Value // Kind
@@ -161,6 +167,10 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 		order = []Kind{KindTCP}
 	default: // auto
 		order = []Kind{KindQUIC, KindTCP}
+		if d.Proxy != "" {
+			// 代理只承载 TCP：先探 QUIC 只会白等一个探测超时。
+			order = []Kind{KindTCP}
+		}
 		if p, ok := d.prefer.Load().(Kind); ok && p == KindTCP {
 			// 上次 QUIC 失败过，先试 TCP（但仍会给 QUIC 一次机会在下次连接）
 			order = []Kind{KindTCP, KindQUIC}
@@ -191,6 +201,19 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 			return c, nil
 		}
 		lastErr = err
+	}
+	// 直连模式下绑了源地址却连不上时，回退一次「系统路由」。
+	//
+	// 为什么需要：源地址是探测出来的（见 internal/netif），多网卡/换网络的
+	// 情况下可能挑错；挑错的代价不该是「整个服务不可用」，而是「这次退回系统
+	// 默认路由」。系统路由若也被 TUN 劫持，那次尝试同样失败，错误照常返回。
+	if lastErr != nil && d.LocalAddr != "" && d.Proxy == "" {
+		alt := *d
+		alt.LocalAddr = ""
+		alt.prefer.Store(Kind("")) // 让回退重新走一遍 normal 顺序
+		if c, err := alt.Dial(ctx); err == nil {
+			return c, nil
+		}
 	}
 	if lastErr == nil {
 		lastErr = errors.New("transport: no usable transport")
@@ -298,10 +321,19 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 		return nil, fmt.Errorf("tcp local addr: %w", err)
 	}
 	hsStart := time.Now()
-	nd := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: la}
-	raw, err := nd.DialContext(ctx, "tcp", d.Addr)
-	if err != nil {
-		return nil, fmt.Errorf("tcp dial: %w", err)
+	var raw net.Conn
+	if d.Proxy != "" {
+		// 代理模式下 LocalAddr 无意义（连的是代理，不是服务器）。
+		raw, err = dialViaProxy(ctx, d.Proxy, d.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("tcp dial: %w", err)
+		}
+	} else {
+		nd := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: la}
+		raw, err = nd.DialContext(ctx, "tcp", d.Addr)
+		if err != nil {
+			return nil, fmt.Errorf("tcp dial: %w", err)
+		}
 	}
 	tc := tls.Client(raw, tlsCfg)
 	if err := tc.HandshakeContext(ctx); err != nil {

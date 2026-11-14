@@ -214,6 +214,23 @@ CLI 与 GUI 是同一套逻辑的两条外壳：托盘常驻、关窗不退出�
 SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v
 ```
 
+### 网络出口：直连 / 系统 / 代理
+
+代理软件的 TUN 全局模式会接管整个 IPv4 路由（macOS 实测
+`route get <服务器IP>` → `198.18.0.1 / utun5`），连隧道服务器的包也被导进代理；
+代理对 28443 这类非标端口没有正确规则，TLS 被切断——客户端只看到
+`tcp tls: EOF` 或 `quic dial: context deadline exceeded`。设置页「网络」三选一：
+
+| 模式 | 行为 | 适合 |
+|---|---|---|
+| **直连** | 自动探测物理网卡 IP（跳过 utun/tun/docker/vmnet…）并绑成出站源地址 | 开着 TUN 全局代理，又不想改代理配置 |
+| 系统 | 什么都不做，跟随系统路由 | 没有 TUN 代理，或代理已给该地址加了直连规则 |
+| 代理 | 走 `http://` / `https://` / `socks5://` 代理（支持用户名密码） | 需要显式指定链路 |
+
+直连的探测失败或绑定后连不上时会自动退回系统路由一次——挑错网卡不至于让服务
+完全不可用。代理模式只承载 TCP：HTTP CONNECT 与 SOCKS5 都是 TCP 隧道，
+QUIC 没有标准承载方式，会在该模式下自动降级。
+
 ### 运行状态与自恢复
 
 运行/停止是**可继承**的状态，写在 `settings.json` 的 `running` 里：

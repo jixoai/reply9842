@@ -44,6 +44,7 @@ import (
 
 	"github.com/jixoai/reply9842/internal/autostart"
 	"github.com/jixoai/reply9842/internal/glass"
+	"github.com/jixoai/reply9842/internal/netif"
 	"github.com/jixoai/reply9842/internal/relayclient"
 	"github.com/jixoai/reply9842/internal/stats"
 	"github.com/jixoai/reply9842/internal/update"
@@ -136,6 +137,12 @@ type app struct {
 	retainIdx int
 	windowIdx int
 	// settingsPath 偏好文件路径（测试可换到临时目录）
+	// 网络出口三选一（直连/系统/代理）与探测到的物理网卡
+	netMode       string
+	proxyURL      string
+	detectedIP    string
+	detectedIface string
+
 	settingsPath string
 	// settingsErr 上次保存偏好失败的原因（nil 表示正常）
 	settingsErr error
@@ -343,10 +350,19 @@ func main() {
 		retainIdx:      relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
 		windowIdx:      relayclient.OptionIndex(st.Window(), relayclient.WindowOptions),
 		settingsPath:   settingsPath,
+		netMode:        st.NetworkModeOr(),
+		proxyURL:       st.ProxyURL,
 		autoUpdate:     st.AutoUpdate,
 		updateMirror:   st.UpdateMirror,
 		skipAutoUpdate: *noAutoUpdate,
 	}
+	// 直连模式：启动时先探一次物理网卡，设置页能立刻显示会绑哪个 IP。
+	if a.netMode == relayclient.NetworkDirect {
+		if ip, iface, err := netif.PrimaryIPv4(); err == nil {
+			a.detectedIP, a.detectedIface = ip, iface
+		}
+	}
+
 	a.runner = relayclient.New(cfg)
 	a.runner.SetLogger(logger)
 	a.runner.OnEvent = a.onRunnerEvent
@@ -685,7 +701,20 @@ func (a *app) start() {
 	cfg.Server = strings.TrimSpace(a.server)
 	cfg.Transport = a.transport
 	cfg.ServerName = strings.TrimSpace(a.serverName)
-	cfg.LocalAddr = strings.TrimSpace(a.localAddr)
+	// 网络出口按模式决定：直连探测物理网卡、系统留空、代理走 ProxyURL。
+	// 探测失败时留空并让 Dial 退回系统路由（见 transport.Dial 的 fallback）。
+	cfg.LocalAddr = ""
+	cfg.Proxy = ""
+	switch a.netMode {
+	case relayclient.NetworkDirect:
+		if ip, iface, err := netif.PrimaryIPv4(); err == nil {
+			cfg.LocalAddr, a.detectedIP, a.detectedIface = ip, ip, iface
+		} else if a.localAddr != "" {
+			cfg.LocalAddr = strings.TrimSpace(a.localAddr) // 手工覆盖优先
+		}
+	case relayclient.NetworkProxy:
+		cfg.Proxy = strings.TrimSpace(a.proxyURL)
+	}
 	cfg.Insecure = a.insecure
 	if err := a.runner.SetConfig(cfg); err != nil {
 		a.setNotice(humanError(err), true)
@@ -805,6 +834,8 @@ func (a *app) currentSettings() relayclient.Settings {
 		WindowSec:    int64(window / time.Second),
 		AutoUpdate:   a.autoUpdate,
 		UpdateMirror: strings.TrimSpace(a.updateMirror),
+		NetworkMode:  a.netMode,
+		ProxyURL:     strings.TrimSpace(a.proxyURL),
 		Server:       strings.TrimSpace(a.server),
 		ServerName:   strings.TrimSpace(a.serverName),
 		Listen:       strings.TrimSpace(a.listen),

@@ -75,6 +75,18 @@ type Settings struct {
 	// 更新状态行里。
 	UpdateMirror string `json:"update_mirror"`
 
+	// NetworkMode 网络出口：direct / system / proxy。
+	//
+	//	direct  自动探测物理网卡 IP 并把它绑成出站源地址（绕开 TUN 代理）
+	//	system  什么都不做，交给操作系统路由（被 TUN 劫持就连不上）
+	//	proxy   走 ProxyURL 指定的代理（http/https/socks5，QUIC 不可用）
+	//
+	// 空串按旧的 LocalAddr 迁移：填过源地址的视为 direct，否则 system。
+	NetworkMode string `json:"network_mode,omitempty"`
+
+	// ProxyURL 代理链路，如 http://127.0.0.1:7890 或 socks5://user:pass@host:1080。
+	ProxyURL string `json:"proxy_url,omitempty"`
+
 	// ---- 连接参数（2026-11-14 起持久化）----
 	//
 	// 这四个字段以前只活在命令行 flag 里，GUI 重启就回默认值。用户机器上的
@@ -114,6 +126,25 @@ func (s Settings) Retain() time.Duration { return time.Duration(s.RetainSec) * t
 
 // Window 显示区间
 func (s Settings) Window() time.Duration { return time.Duration(s.WindowSec) * time.Second }
+
+// 网络出口的三种模式。
+const (
+	NetworkDirect = "direct"
+	NetworkSystem = "system"
+	NetworkProxy  = "proxy"
+)
+
+// NetworkModeOr 返回规范化后的网络模式（空/非法 → system）。
+func (s Settings) NetworkModeOr() string {
+	switch s.NetworkMode {
+	case NetworkDirect, NetworkSystem, NetworkProxy:
+		return s.NetworkMode
+	}
+	if s.LocalAddr != "" {
+		return NetworkDirect // 老的「源地址」配置：等价于直连
+	}
+	return NetworkSystem
+}
 
 // ApplyTo 把配置里的连接参数盖到 cfg 上（只盖非空项）。
 //
