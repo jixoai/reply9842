@@ -1207,7 +1207,7 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 //
 // 现在用「组标题 + 组间加高间隙」表达分区：
 //
-//	连接  上游地址 / 服务器域名 / 网络（直连·系统·代理）/ 监听地址 / 传输方式
+//	连接  目标机器（域名或 IP）/ 证书域名（仅 IP 时）/ 网络 / 监听地址 / 传输方式
 //	其他  开机自启 / 日志保留 / 显示区间 / 自动更新 / 更新镜像 / 软件更新
 //
 // 组标题本身只有一行 11px 文字（约 26px 含上下留白），比一张卡的装饰开销小一个
@@ -1217,14 +1217,20 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 
 	glass.Surface(ui.Column(c).Padding(3, 14, 6), p, glass.Card).Children(func() {
 		a.groupTitle(c, p, "连接", true)
-		a.configField(c, p, "上游地址", &a.server, relayclient.DefaultServer, running)
+		// 目标机器：域名或 IP 都行，一个字段说清「连哪儿」。
+		//
+		// 为什么并掉了原来的「服务器域名」：目标是域名时 SNI 就是它自己，
+		// 再填一遍是重复；本质这就是一次代理请求，配置只需要一个目标。
+		// 只有目标是 IP 时才需要额外知道用哪个名字校验证书（证书 SAN 通常
+		// 只有 DNS），那一行届时才出现。
+		a.configField(c, p, "目标机器", &a.server,
+			"host:port，域名或 IP 均可", running)
 		a.configRule(c, p)
-		// TLS SNI：用 IP 连服务器时必须填证书上的域名，否则 x509 校验失败
-		// （证书 SAN 只有 DNS，没有 IP）。留空时按上游地址推导，只在
-		// 「上游地址是域名且证书就是那个域名」时才成立。
-		a.configField(c, p, "服务器域名", &a.serverName,
-			relayclient.DefaultServerName, running)
-		a.configRule(c, p)
+		if relayclient.SNINeeded(a.server) {
+			a.configField(c, p, "证书域名", &a.serverName,
+				relayclient.DefaultServerName, running)
+			a.configRule(c, p)
+		}
 		// 源地址绑定：开代理 TUN 全局模式时，发往隧道服务器的流量也会被导进
 		// utun。代理对 28443 这类非标端口没有正确规则，TLS 握手会被中途切断，
 		// 客户端只看到 "tcp tls: EOF"——看起来像服务端崩了。填物理网卡 IP

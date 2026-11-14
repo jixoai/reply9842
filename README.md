@@ -168,8 +168,8 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-listen` | `127.0.0.1:18899` | 本地 HTTP 入口 |
-| `-server` | `47.82.76.102:28443` | relay-server 的 host:port |
-| `-server-name` | `magpie.aiweb.xin` | TLS SNI（用 IP 连时必须填证书域名）|
+| `-server` | `magpie.aiweb.xin:28443` | 目标机器 host:port（域名或 IP 都行）|
+| `-server-name` | 空 | 仅当目标填的是 **IP** 时才需要：证书上的域名（SAN 一般只有 DNS）|
 | `-local-addr` | 空 | 绑定出站源地址，绕过代理 TUN 劫持 |
 | `-transport` | `auto` | `auto` / `quic` / `tcp` |
 | `-insecure` | `false` | 跳过证书校验（自签观察期）|
@@ -186,7 +186,8 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 |---|---|---|
 | `-listen` | `0.0.0.0:28443` | 隧道监听（QUIC + TCP 同端口）|
 | `-upstream` | `http://127.0.0.1:3431` | 上游 base URL |
-| `-uphost` | `magpie.aiweb.xin` | 转发时覆盖的 Host 头 |
+| `-uphost` | `magpie.aiweb.xin` | 转发时覆盖的 Host 头（等价于 `-header 'Host: …'`）|
+| `-header` | 空 | 转发到上游时附加/覆盖的请求头，可重复：`-header 'Host: x' -header 'X-Foo: bar'` |
 | `-cert` / `-key` | 必填 | TLS 证书 |
 | `-cache-mb` | `256` | 基版本缓存上限（内存，内容寻址 LRU）|
 | `-spool-dir` | `/var/lib/reply9842/spool` | 流式响应 spool 根目录 |

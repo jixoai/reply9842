@@ -176,7 +176,7 @@ func TestVersionShownOnce(t *testing.T) {
 func TestPanelTabHasNoConfig(t *testing.T) {
 	a := newTestApp(t)
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
-	for _, banned := range []string{"上游地址", "监听地址", "传输方式", "开机自启"} {
+	for _, banned := range []string{"目标机器", "监听地址", "传输方式", "开机自启"} {
 		if tt.HasText(banned) {
 			t.Errorf("面板 tab 出现了设置项 %q：%q", banned, tt.Texts())
 		}
@@ -189,7 +189,7 @@ func TestSettingsTab(t *testing.T) {
 	a.tab = tabSettings
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
-	for _, want := range []string{"上游地址", "监听地址", "传输方式", "日志保留", "显示区间"} {
+	for _, want := range []string{"目标机器", "监听地址", "传输方式", "日志保留", "显示区间"} {
 		if !tt.HasText(want) {
 			t.Errorf("设置 tab 缺少 %q：%q", want, tt.Texts())
 		}
@@ -793,7 +793,7 @@ func TestTabsSwitchByClick(t *testing.T) {
 		t.Fatalf("点「设置」后 tab = %d，期望 %d", a.tab, tabSettings)
 	}
 	// 切到设置后，设置的内容必须在
-	for _, want := range []string{"上游地址", "监听地址", "传输方式"} {
+	for _, want := range []string{"目标机器", "监听地址", "传输方式"} {
 		if !tt.HasText(want) {
 			t.Errorf("设置 pane 缺少 %q：%q", want, tt.Texts())
 		}
@@ -1069,7 +1069,7 @@ func TestSettingsFitsShippedWindow(t *testing.T) {
 	// 每一项都必须可见。前五项是「连接」组，其余在「其他」组——
 	// 任何一项被切掉都说明分区把行顶出了窗口。
 	rows := []string{
-		"连接", "上游地址", "服务器域名", "网络", "监听地址", "传输方式",
+		"连接", "目标机器", "证书域名", "网络", "监听地址", "传输方式",
 		"其他", "开机自启", "日志保留", "显示区间", "自动更新", "更新镜像", "软件更新",
 		"检查更新",
 	}
@@ -1110,7 +1110,7 @@ func TestSettingsHasTwoGroups(t *testing.T) {
 	// 分区标题的字重必须高于行标签（否则它读起来就是个字段名）。
 	// 用「颜色不同」间接验证：标题用 Foreground，行标签用 MutedForeground。
 	head, okH := tt.Find("连接")
-	label, okL := tt.Find("上游地址")
+	label, okL := tt.Find("目标机器")
 	if !okH || !okL {
 		t.Fatalf("找不到标题或行标签")
 	}

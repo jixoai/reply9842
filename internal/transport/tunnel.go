@@ -329,8 +329,26 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 			return nil, fmt.Errorf("tcp dial: %w", err)
 		}
 	} else {
+		target := d.Addr
+		if la != nil {
+			// 直连模式：自己解析域名。系统解析器在 TUN 全局模式下会返回
+			// fake-IP（实测 198.18.x.x），绑源地址只能修正「发包路径」，
+			// 修不了「拿到的 IP 是假的」。见 dns.go 顶部注释。
+			host, port, herr := net.SplitHostPort(d.Addr)
+			if herr == nil && net.ParseIP(host) == nil {
+				bindIP := ""
+				if la.IP != nil {
+					bindIP = la.IP.String()
+				}
+				ips, derr := resolveHost(ctx, host, bindIP)
+				if derr != nil {
+					return nil, fmt.Errorf("tcp dial: 解析 %s: %w", host, derr)
+				}
+				target = net.JoinHostPort(ips[0].String(), port)
+			}
+		}
 		nd := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second, LocalAddr: la}
-		raw, err = nd.DialContext(ctx, "tcp", d.Addr)
+		raw, err = nd.DialContext(ctx, "tcp", target)
 		if err != nil {
 			return nil, fmt.Errorf("tcp dial: %w", err)
 		}

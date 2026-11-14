@@ -25,6 +25,7 @@ import (
 	"net/http/pprof"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -41,6 +42,7 @@ type cfg struct {
 	listen         string
 	upstream       string
 	upHost         string
+	headers        headerList // -header 可重复：转发到上游时附加/覆盖的请求头
 	cert           string
 	key            string
 	cacheMB        int64
@@ -59,7 +61,10 @@ func main() {
 	c := cfg{}
 	flag.StringVar(&c.listen, "listen", "0.0.0.0:28443", "隧道监听（QUIC 与 TCP 同端口）")
 	flag.StringVar(&c.upstream, "upstream", "http://127.0.0.1:3431", "上游 base URL（同机回环最优）")
-	flag.StringVar(&c.upHost, "uphost", "magpie.aiweb.xin", "转发时覆盖的 Host 头")
+	flag.StringVar(&c.upHost, "uphost", "magpie.aiweb.xin",
+		"转发时覆盖的 Host 头（等价于 -header 'Host: ...'，保留兼容）")
+	flag.Var(&c.headers, "header",
+		"转发到上游时附加/覆盖的请求头，可重复：-header 'Host: example.com' -header 'X-Foo: bar'")
 	flag.StringVar(&c.cert, "cert", "", "TLS 证书（fullchain）")
 	flag.StringVar(&c.key, "key", "", "TLS 私钥")
 	flag.Int64Var(&c.cacheMB, "cache-mb", 256, "基版本缓存上限（MB，内存）")
@@ -135,6 +140,14 @@ func main() {
 	log.Printf("relay-server 启动")
 	log.Printf("  隧道监听    %s（QUIC + TCP/TLS 同端口）", c.listen)
 	log.Printf("  上游        %s (Host: %s)", c.upstream, c.upHost)
+	if hs := c.headerMap(); len(hs) > 0 {
+		names := make([]string, 0, len(hs))
+		for k := range hs {
+			names = append(names, k)
+		}
+		sort.Strings(names)
+		log.Printf("  附加请求头  %s", strings.Join(names, ", "))
+	}
 	log.Printf("  基版本缓存  %d MB（内存，内容寻址）", c.cacheMB)
 	log.Printf("  spool       %s（tmp %dMB / idem %dMB）", c.spoolDir, c.tmpMB, c.idemMB)
 	log.Printf("  上游超时    %s（不随客户端断开取消）", c.upstreamTimout)
@@ -602,8 +615,18 @@ func (s *server) startPump(e *spool.Entry, h *meta.RequestHead, hdrRaw, body []b
 				req.Header.Add(k, v)
 			}
 		}
+		// Host 先按 -uphost 的默认值设，随后被 -header 'Host: ...' 覆盖——
+		// 自定义头的语义就是「我明确要这个值」，不该被旧的单字段挡住。
 		req.Header.Set("Host", s.c.upHost)
 		req.Host = s.c.upHost
+		for k, v := range s.c.headerMap() {
+			if strings.EqualFold(k, "Host") {
+				req.Host = v
+				req.Header.Set("Host", v)
+				continue
+			}
+			req.Header.Set(k, v)
+		}
 		req.Header.Del("Accept-Encoding")
 		req.ContentLength = int64(len(body))
 

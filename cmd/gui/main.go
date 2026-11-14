@@ -700,7 +700,13 @@ func (a *app) start() {
 	cfg.Listen = strings.TrimSpace(a.listen)
 	cfg.Server = strings.TrimSpace(a.server)
 	cfg.Transport = a.transport
-	cfg.ServerName = strings.TrimSpace(a.serverName)
+	// 目标是域名时 SNI 就用它自己（transport 会按 Addr 的 host 推导）；
+	// 是 IP 时才用「证书域名」那一栏。
+	if relayclient.SNINeeded(cfg.Server) {
+		cfg.ServerName = strings.TrimSpace(a.serverName)
+	} else {
+		cfg.ServerName = ""
+	}
 	// 网络出口按模式决定：直连探测物理网卡、系统留空、代理走 ProxyURL。
 	// 探测失败时留空并让 Dial 退回系统路由（见 transport.Dial 的 fallback）。
 	cfg.LocalAddr = ""

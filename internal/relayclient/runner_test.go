@@ -145,3 +145,27 @@ func TestServeSafelyTurnsPanicIntoError(t *testing.T) {
 		t.Fatal("panicked 时 err 不能是 nil")
 	}
 }
+
+// TestSNINeeded 只有目标是 IP 字面量时才需要单独填证书域名。
+//
+// 这是「上游地址 + 服务器域名合并成一个『目标机器』」的依据：域名目标下
+// SNI 就是它自己，第二栏纯属重复；IP 目标的证书 SAN 一般只有 DNS，
+// 才必须额外知道用哪个名字校验。
+func TestSNINeeded(t *testing.T) {
+	cases := []struct {
+		server string
+		want   bool
+	}{
+		{"47.82.76.102:28443", true},
+		{"[2001:db8::1]:28443", true},
+		{"2001:db8::1", true},
+		{"relay.example.com:28443", false},
+		{"relay.example.com", false},
+		{"", false},
+	}
+	for _, tc := range cases {
+		if got := SNINeeded(tc.server); got != tc.want {
+			t.Errorf("SNINeeded(%q) = %v，期望 %v", tc.server, got, tc.want)
+		}
+	}
+}

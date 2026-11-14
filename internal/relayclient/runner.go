@@ -40,7 +40,10 @@ import (
 // 避免「文档写的默认」与「代码跑的默认」漂移。
 const (
 	DefaultListen = "127.0.0.1:18899"
-	DefaultServer = "47.82.76.102:28443"
+	// DefaultServer 用**域名**而不是 IP：证书是按这个域名签的，域名目标下
+	// SNI 自动等于它，用户不需要再填第二栏；IP 变了也只改 DNS，客户端不用动。
+	// （2026-11-14 DNS 已切到香港，域名可解析。）
+	DefaultServer = "magpie.aiweb.xin:28443"
 	// DefaultServerName 是 TLS SNI。上游用 IP 连接时**必须**填证书上的域名——
 	// 服务端证书的 SAN 通常只有 DNS 没有 IP，留空推导成 IP 会直接
 	// x509: cannot validate certificate for <ip> because it doesn't contain any IP SANs。
@@ -51,6 +54,20 @@ const (
 	DefaultCaptureN   = 30
 	DefaultMaxResume  = 3
 )
+
+// SNINeeded 目标机器是 IPv4/IPv6 字面量时，才需要单独填证书域名。
+//
+// 这就是「上游地址 + 服务器域名」两个字段可以合并的原因：目标是域名时，SNI
+// 就是它自己，填第二遍纯属重复；只有目标是 IP（证书 SAN 一般只有 DNS）时，
+// 才必须额外知道该用哪个名字去校验。见 transport.Dialer.serverName 的推导。
+func SNINeeded(server string) bool {
+	host, _, err := net.SplitHostPort(server)
+	if err != nil {
+		host = server
+	}
+	host = strings.Trim(host, "[]")
+	return net.ParseIP(host) != nil
+}
 
 // Config 一次运行所需的全部配置（与 CLI flag 一一对应）
 type Config struct {
@@ -86,6 +103,8 @@ func (c *Config) Normalize() {
 	if c.ServerName == "" && c.Server == DefaultServer {
 		c.ServerName = DefaultServerName
 	}
+	// 目标是域名时即便留了 ServerName 也用不上（transport 按 Addr 推导），
+	// 这里不再额外清理：显式设置可能来自老配置，留着不影响连通性。
 	if c.Transport == "" {
 		c.Transport = DefaultTransport
 	}
