@@ -169,3 +169,26 @@ func TestSNINeeded(t *testing.T) {
 		}
 	}
 }
+
+// TestNormalizeTarget 「目标机器」不写端口时自动补 28443。
+//
+// 用户的心智模型是「连哪台机器」——端口是产品固定的值，不该让人记。
+func TestNormalizeTarget(t *testing.T) {
+	cases := map[string]string{
+		"magpie.aiweb.xin":            "magpie.aiweb.xin:28443",
+		"magpie.aiweb.xin:8443":       "magpie.aiweb.xin:8443",
+		"https://magpie.aiweb.xin":    "magpie.aiweb.xin:28443",
+		"https://magpie.aiweb.xin/":   "magpie.aiweb.xin:28443",
+		"  magpie.aiweb.xin  ":        "magpie.aiweb.xin:28443",
+		"47.82.76.102":                "47.82.76.102:28443",
+		"47.82.76.102:28443":          "47.82.76.102:28443",
+		"[2001:db8::1]:28443":         "[2001:db8::1]:28443",
+		"[2001:db8::1]":               "[2001:db8::1]:28443",
+		"":                            "",
+	}
+	for in, want := range cases {
+		if got := NormalizeTarget(in); got != want {
+			t.Errorf("NormalizeTarget(%q) = %q，期望 %q", in, got, want)
+		}
+	}
+}

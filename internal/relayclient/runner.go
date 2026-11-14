@@ -43,7 +43,7 @@ const (
 	// DefaultServer 用**域名**而不是 IP：证书是按这个域名签的，域名目标下
 	// SNI 自动等于它，用户不需要再填第二栏；IP 变了也只改 DNS，客户端不用动。
 	// （2026-11-14 DNS 已切到香港，域名可解析。）
-	DefaultServer = "magpie.aiweb.xin:28443"
+	DefaultServer = "magpie.aiweb.xin"
 	// DefaultServerName 是 TLS SNI。上游用 IP 连接时**必须**填证书上的域名——
 	// 服务端证书的 SAN 通常只有 DNS 没有 IP，留空推导成 IP 会直接
 	// x509: cannot validate certificate for <ip> because it doesn't contain any IP SANs。
@@ -54,6 +54,47 @@ const (
 	DefaultCaptureN   = 30
 	DefaultMaxResume  = 3
 )
+
+// DefaultTunnelPort 目标机器不写端口时用的端口（隧道监听口）。
+const DefaultTunnelPort = "28443"
+
+// NormalizeTarget 把用户填的「目标机器」补成 host:port。
+//
+// 为什么允许不写端口：用户脑子里这个字段就是「连哪台机器」，端口是产品
+// 固定的 28443，不该让人记。写法上兼容三种：
+//
+//	magpie.aiweb.xin          → magpie.aiweb.xin:28443
+//	magpie.aiweb.xin:8443     → 原样
+//	https://magpie.aiweb.xin  → 去掉 scheme 再补端口
+//
+// IPv6 字面量必须带方括号与端口（[2001:db8::1]:28443），无括号裸写无法与
+// host:port 区分，按「没写端口」处理会得到非法地址——由 dial 层报错即可。
+func NormalizeTarget(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return s
+	}
+	for _, p := range []string{"https://", "http://", "tcp://", "quic://"} {
+		s = strings.TrimPrefix(s, p)
+	}
+	s = strings.TrimSuffix(s, "/")
+	if s == "" {
+		return s
+	}
+	if strings.HasPrefix(s, "[") { // [v6]:port 或 [v6]
+		if _, _, err := net.SplitHostPort(s); err == nil {
+			return s
+		}
+		return s + ":" + DefaultTunnelPort
+	}
+	if strings.Count(s, ":") == 1 {
+		return s // host:port
+	}
+	if strings.Contains(s, ":") {
+		return s // 裸 IPv6：留给 dial 报错，别瞎改
+	}
+	return s + ":" + DefaultTunnelPort
+}
 
 // SNINeeded 目标机器是 IPv4/IPv6 字面量时，才需要单独填证书域名。
 //
@@ -97,6 +138,7 @@ func (c *Config) Normalize() {
 	if c.Server == "" {
 		c.Server = DefaultServer
 	}
+	c.Server = NormalizeTarget(c.Server)
 	// ServerName 留空时的兜底。注意：只在「上游是 IP 且证书是已知域名」这种
 	// 内置默认组合下填；用户改了 Server 却留空 SNI 时，transport 层会按
 	// Server 的 host 推导（对域名成立，对 IP 会失败——失败信息本身可读）。

@@ -1069,7 +1069,7 @@ func TestSettingsFitsShippedWindow(t *testing.T) {
 	// 每一项都必须可见。前五项是「连接」组，其余在「其他」组——
 	// 任何一项被切掉都说明分区把行顶出了窗口。
 	rows := []string{
-		"连接", "目标机器", "证书域名", "网络", "监听地址", "传输方式",
+		"连接", "目标机器", "网络", "监听地址", "传输方式",
 		"其他", "开机自启", "日志保留", "显示区间", "自动更新", "更新镜像", "软件更新",
 		"检查更新",
 	}
@@ -1771,5 +1771,29 @@ func TestRunStatePersisted(t *testing.T) {
 	}
 	if s := relayclient.LoadSettings(a.settingsPath); s.Running {
 		t.Errorf("停止后 settings.running = true，期望 false")
+	}
+}
+
+// TestCertNameOnlyForIPTarget 「证书域名」只在填 IP 时出现。
+//
+// 这是「一个目标字段」的配套约束：域名目标下 SNI 自动等于它，多一栏只会让人
+// 以为必须填；IP 目标的证书 SAN 一般只有 DNS，那时才真的需要名字。
+func TestCertNameOnlyForIPTarget(t *testing.T) {
+	for _, tc := range []struct {
+		server string
+		want   bool
+	}{
+		{"magpie.aiweb.xin", false},
+		{"magpie.aiweb.xin:28443", false},
+		{"47.82.76.102:28443", true},
+		{"47.82.76.102", true},
+	} {
+		a := newTestApp(t)
+		a.tab = tabSettings
+		a.server = tc.server
+		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+		if got := tt.HasText("证书域名"); got != tc.want {
+			t.Errorf("目标 %q：证书域名行存在=%v，期望 %v", tc.server, got, tc.want)
+		}
 	}
 }

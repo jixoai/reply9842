@@ -1224,7 +1224,7 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		// 只有目标是 IP 时才需要额外知道用哪个名字校验证书（证书 SAN 通常
 		// 只有 DNS），那一行届时才出现。
 		a.configField(c, p, "目标机器", &a.server,
-			"host:port，域名或 IP 均可", running)
+			"域名或 IP；不写端口默认 "+relayclient.DefaultTunnelPort, running)
 		a.configRule(c, p)
 		if relayclient.SNINeeded(a.server) {
 			a.configField(c, p, "证书域名", &a.serverName,

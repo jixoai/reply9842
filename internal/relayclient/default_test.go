@@ -1,28 +1,35 @@
 package relayclient
 
-import "testing"
+import (
+	"net"
+	"testing"
+)
 
 // 默认配置必须能直接连上内置服务端。
 //
-// 回归护栏：曾经 Server 是 IP 而 ServerName 留空，transport 按 host 推导出
-// "47.82.76.102" 作为 SNI，而服务端证书的 SAN 只有 DNS:magpie.aiweb.xin，
-// 于是 TLS 报 `x509: cannot validate certificate for <ip> because it doesn't
-// contain any IP SANs`。TCP 与 QUIC 都会失败，用户完全无法连接。
+// 2026-11-14 起默认目标改成**域名**（magpie.aiweb.xin），理由：
+//   - SNI 就是它自己，客户端不需要第二栏
+//   - DNS 已切香港，IP 变化只改 DNS，客户端不用动
+// 曾经的坑仍要守住：默认目标若是 IP 而没有 SNI，TLS 必然报
+// `x509: cannot validate certificate for <ip> ... no IP SANs`。
 func TestDefaultsAreConnectable(t *testing.T) {
 	c := Config{}
 	c.Normalize()
 
-	if c.Server != DefaultServer {
-		t.Fatalf("Server = %q, 期望 %q", c.Server, DefaultServer)
+	if want := NormalizeTarget(DefaultServer); c.Server != want {
+		t.Fatalf("Server = %q，期望 %q（默认端口要自动补上）", c.Server, want)
 	}
-	// 关键断言：上游是 IP 时 SNI 不能为空，否则推导成 IP 必然校验失败
-	if c.ServerName == "" {
-		t.Fatal("ServerName 为空：上游是 IP 时必须显式指定证书域名，否则 TLS 校验必失败")
+	host, _, err := net.SplitHostPort(c.Server)
+	if err != nil {
+		t.Fatalf("默认目标不是 host:port：%q", c.Server)
 	}
-	if c.ServerName != DefaultServerName {
-		t.Fatalf("ServerName = %q, 期望 %q", c.ServerName, DefaultServerName)
+	if net.ParseIP(host) != nil {
+		t.Fatal("默认目标应当是域名：IP 目标会逼用户再填证书域名")
 	}
-	t.Logf("Server=%s ServerName=%s Transport=%s", c.Server, c.ServerName, c.Transport)
+	if SNINeeded(c.Server) {
+		t.Fatal("域名目标不应需要额外的证书域名")
+	}
+	t.Logf("Server=%s Transport=%s", c.Server, c.Transport)
 }
 
 // 用户自定义上游时不强塞内置 SNI（否则连别家服务端会带错 SNI）。
