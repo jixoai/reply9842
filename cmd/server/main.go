@@ -59,6 +59,11 @@ type cfg struct {
 	statsPath      string
 	hydrate        bool
 	hydrateBatch   int
+
+	// dcz2 上行 dcz2（RFC 9842 §5）开关，默认开。
+	// 置 false 时只接受 reply9842/1、也拒解 EncDcz2 —— 与新客户端协商回落到
+	// reply9842/1（它们只会用私有 dcz），行为与 v0.3.10 完全一致。
+	dcz2 bool
 }
 
 func main() {
@@ -95,6 +100,9 @@ func main() {
 			"启动可用性不依赖它；关掉只影响后续续传的命中速度与磁盘回收")
 	flag.IntVar(&c.hydrateBatch, "spool-hydrate-batch", 200,
 		"后台补水每批条数（每批之间让路 10ms，避免抢请求的磁盘 IO）")
+	flag.BoolVar(&c.dcz2, "dcz2", true,
+		"上行 dcz2（RFC 9842 §5）支持：accept reply9842/2，并解码 EncDcz2 请求。\n"+
+			"置 false 与 v0.3.10 行为完全一致（只 accept reply9842/1，EncDcz2 一律拒绝）")
 	flag.Parse()
 
 	// 上游候选列表在启动时校验：配错了就该立刻退出，而不是等到第一个请求
@@ -170,6 +178,11 @@ func main() {
 		log.Printf("  附加请求头  %s", strings.Join(names, ", "))
 	}
 	log.Printf("  基版本缓存  %d MB（内存，内容寻址）", c.cacheMB)
+	if c.dcz2 {
+		log.Printf("  编码协商    dcz2 开（accept reply9842/2 + reply9842/1；上行 dcz/dcz2 两种都能解）")
+	} else {
+		log.Printf("  编码协商    dcz2 关（-dcz2=false：只 accept reply9842/1，行为与 v0.3.10 一致）")
+	}
 	log.Printf("  spool       %s（tmp %dMB / idem %dMB）", c.spoolDir, c.tmpMB, c.idemMB)
 	log.Printf("  上游超时    %s（不随客户端断开取消）", c.upstreamTimout)
 	log.Printf("  日志        %s", c.logPath)
@@ -190,7 +203,9 @@ func main() {
 		},
 	}
 
-	tr := &transport.Server{Addr: c.listen, CertFile: c.cert, KeyFile: c.key}
+	// Dcz2 显式开启（transport 的零值是「只收 v1」）：只有本进程的 decodeBody
+	// 具备 EncDcz2 分支时，服务端才允许出现在 reply9842/2 连接上。
+	tr := &transport.Server{Addr: c.listen, CertFile: c.cert, KeyFile: c.key, Dcz2: c.dcz2}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
@@ -349,7 +364,8 @@ func (s *server) serveOne(a transport.Accept) (keepAlive bool, err error) {
 		return false, err
 	}
 	rec.Encoding = encName
-	rec.BaseHit = reqHead.Encoding == meta.EncDcz
+	// 两种 dcz 都是「命中基线字典」的 delta 编码（dcz=私有、dcz2=RFC §5）
+	rec.BaseHit = reqHead.Encoding == meta.EncDcz || reqHead.Encoding == meta.EncDcz2
 	rec.UpRaw = int64(len(body))
 
 	// ---- 防静默损坏 ----
@@ -394,7 +410,10 @@ func (s *server) serveOne(a transport.Accept) (keepAlive bool, err error) {
 	// 下行压缩的能力协商在 startPump 里按 reqHead.AcceptDownZstd 决定；
 	// streamToClient 只读条目的最终状态（entry.Compressed()），不自行判断。
 	status := s.streamToClient(a.Conn, entry, 0, start, rec)
-	if status != 0 {
+	// 只在还没定状态时兜底：上游返回 4xx/5xx 时 streamToClient 已把
+	// rec.Status 设成真实状态码，但它的返回值是「本次推送完成度」（200）。
+	// 无条件覆盖会把上游 400 记成 200 —— 统计说谎（2026-11-16 修复）。
+	if rec.Status == 0 && status != 0 {
 		rec.Status = status
 	}
 	rec.MsTotal = time.Since(start).Milliseconds()
@@ -796,7 +815,7 @@ func (s *server) handleResume(a transport.Accept, payload []byte, rec *stats.Rec
 	}
 
 	status := s.streamToClient(a.Conn, entry, from, start, rec)
-	if status != 0 {
+	if rec.Status == 0 && status != 0 {
 		rec.Status = status
 	}
 	rec.Encoding = "resume"
@@ -828,6 +847,27 @@ func (s *server) decodeBody(h *meta.RequestHead, wire []byte) (body []byte, encN
 			return nil, "dcz", true, nil
 		}
 		return b, "dcz", false, nil
+	case meta.EncDcz2:
+		// dcz2（RFC 9842 §5）：头里是 **SHA-256(字典)**，不是 BLAKE3——而 store
+		// 的 key 恒为 BLAKE3（内部寻址不变，避免线上缓存冷启动）。所以字典必须
+		// 靠帧里的 BaseHash 定位；头哈希只用于线格式校验（DecodeDcz2 内部比对）。
+		//
+		// 关掉 -dcz2 时明确拒绝：这是回滚开关，语义是「回到 v0.3.10」，
+		// 不能悄悄按 dcz 试解（两种格式互不兼容，见 codec/dcz2.go）。
+		if !s.c.dcz2 {
+			return nil, "dcz2", false, fmt.Errorf("dcz2 encoding disabled by kill switch (-dcz2=false)")
+		}
+		dict, ok := s.store.Get(codec.Hash(h.BaseHash))
+		if !ok {
+			return nil, "dcz2", true, nil
+		}
+		b, e := codec.DecodeDcz2(wire, dict)
+		if e != nil {
+			// 与 dcz 分支同语义：解不开 = 基线不可用/被换过，让客户端重发全量。
+			// （哈希不符也是这里：DecodeDcz2 会先比 SHA-256 再解。）
+			return nil, "dcz2", true, nil
+		}
+		return b, "dcz2", false, nil
 	}
 	return nil, "unknown", false, fmt.Errorf("unknown encoding %d", h.Encoding)
 }

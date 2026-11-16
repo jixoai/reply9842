@@ -41,8 +41,12 @@ const (
 func (a *app) view(c *ui.Context) {
 	// 每秒刷一次统计：After 是「到点再画一帧」，不占 CPU。
 	// 托盘的菜单文字由同一条心跳驱动（见 trayUI.tick），两处口径因此不会漂移。
+	//
+	// 走 sampleStats 而不是 snapshot：同一个心跳里还要用累计计数的差值更新
+	// 底栏的实时带宽（见 main.go 的 sampleStats）。交互触发的额外重画不会
+	// 破坏它——采样间隔不足一个心跳时会直接沿用上一次读数。
 	c.After(time.Second)
-	a.agg = a.snapshot()
+	a.agg = a.sampleStats()
 
 	// 整个窗口套上 solid-glass 色板：控件（按钮/输入框/Select/滚动条）
 	// 从这里取 Surface/Border/Accent，不必逐个重画
@@ -315,8 +319,8 @@ var (
 func (a *app) panelPane(c *ui.Context, p *glass.Palette) {
 	a.failureLine(c, p)
 	// 两张图的分工（owner 2026-11-13 要求）：
-	//   上：压缩率——「省了多少」，本产品的卖点
-	//   下：流量与延迟——「现在顺不顺」，压缩率图完全看不见的维度
+	//   上：上行体积与压缩——体量（柱高）+ 省下/实发（分层），本产品的卖点
+	//   下：流量与延迟——「现在顺不顺」，第一张图完全看不见的维度
 	//
 	// 高度分配（owner 2026-11-14 定）：两张卡各 Grow(1)，绘图区等高。
 	//
@@ -377,28 +381,46 @@ func (a *app) liveBadge(c *ui.Context, p *glass.Palette, running bool) {
 
 // chartCard 上行体积对比图。这是这一屏的主角。
 //
-// ## 纵轴为什么是「省下的比例」而不是体积
+// ## 纵轴为什么是「体积」而不是「压缩率」（2026-11-16 改）
 //
-// 真实数据算过两种轴，都不行：
+// 上一版柱高 = 省下的比例（1 - UpWire/UpRaw）。真实负载的压缩率几乎恒在
+// 98–99.9%，于是每根柱子都顶满、蓝段（实发）恒等于 3px 的最小高度——用户
+// 看到的是一排高度完全相同的柱子、一个永远不变的蓝块，图等于没画。
+// 压缩率是这一屏的卖点，但它不是能在 30 根柱子上读出差异的量：它本来就趋近于 1。
 //
-//	线性轴   12.5 MB → 139 KB（省 98.9%）时，实发段只有柱高的 1.1%，
-//	         一根 200px 的柱子亮 2px —— 产品最强的场景在图上等于零。
-//	对数轴   把「省 99.9%」和「省 70%」压到视觉上差不多，
-//	         反而看不出比例差异。
+// 现在柱高直接是**这一桶的原始上行体积占本窗口峰值的比例**：
 //
-// 用户要看的是「提升了多少」，不是「数据有多大」。所以柱高直接就是
-// **压缩率**：满高 = 省 100%，零高 = 一点没省。绝对体积交给图下方那行文字。
-// 这样「今天压得好不好」一眼可读，不需要理解任何刻度换算。
+//	barH   = 高度(UpRaw / maxRaw)                   满量程 = 本窗口最大单桶 UpRaw
+//	wireH  = barH × UpWire/UpRaw（>0 时至少 1px）   蓝段，贴底
+//	savedH = barH - wireH                           绿段，在上面
+//
+// 于是柱子高矮直接回答「哪一桶流量大」，蓝段随实发量真实伸缩，绿段是省下的
+// 体积。压缩效果交给图下那行文字（省下 X%）——图回答形状，文字给精确数字。
+//
+// ## 刻度与参考线
+//
+// 纵轴是字节刻度（峰值 / 峰值一半 / 0，与下方流量图共用 humanBytes 口径）。
+// 随「柱高=压缩率」一起删掉的是那条 100% 参考虚线：字节刻度里没有「100%」
+// 这个概念；而若把它改成「峰值参考线」，它与最上刻度、峰值柱顶三者在像素上
+// 重合，纯属重复——最上刻度本身就标着峰值是多少字节。
 //
 // ## 单列分层
 //
-//	每个时间桶一根柱子，柱内两段：
-//	  亮段（p.Foreground）= 省下的部分
-//	  暗段（p.Tertiary）  = 实际发出去的部分，贴底
+//	每个时间桶一根柱子，柱内两段（见卡片右上角的图例）：
+//	  蓝段（p.UpBar）   = 实际发出去的部分，贴底
+//	  绿段（p.DownBar） = 省下的部分，在上面
 //
-// 暗段按「占原始体积的比例」切，且至少有 minWirePx 高——压缩 99.9% 时它本来
-// 只有 0.2px，那会让整根柱子读成「纯亮色」，反而弱化了「还有一点点发出去」
-// 这个事实。
+// 蓝段按「占原始体积的比例」切，但 UpWire>0 时至少有 1px：压缩 99.9% 时它
+// 本来不足一个像素，抗锯齿后会完全消失，整根柱子读成纯绿——那会丢失「仍然
+// 发了东西」这个事实。
+//
+// ## 图下两行摘要（10.5px · tnum）
+//
+//	第一行  保留期总览（近 24 小时 N 请求 · 节省 … · p50 …）
+//	        2026-11-16 从底栏移入：它是这张图的陪读文字，贴在图上比钉在
+//	        窗口底边好读，也为底栏腾出了实时带宽的位置
+//	第二行  本图窗口的口径（最近 X：raw → wire · 省下 Y%）
+//	        不写桶粒度：这行必须在 440 窗口里不被省略号截断（见 chartSummary）
 func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 	g := a.agg
 	running := a.running()
@@ -434,19 +456,24 @@ func (a *app) chartCard(c *ui.Context, p *glass.Palette) {
 				ui.Text(c, a.emptyChartNote()).FontSize(11.5).
 					TextColor(p.MutedForeground).SingleLine()
 			})
+			// 窗口内没有请求不等于统计丢了（保留期可能还有上千条），
+			// 保留期总览照常显示——这正是 emptyChartNote 第三种情况要搭配的信息。
+			a.summaryLine(c, p, a.retentionStatsLine())
 			return
 		}
 
 		a.chartPlot(c, p)
-		ui.Text(c, a.chartSummary(g)).FontSize(10.5).
-			FontFeatures("tnum").TextColor(p.MutedForeground).SingleLine()
+		// 两行摘要，顺序即阅读顺序：先报「一共多少」（保留期总量，也就是从
+		// 底栏移进来的那句），再报「这张图看的那段」（窗口口径）。
+		a.summaryLine(c, p, a.retentionStatsLine())
+		a.summaryLine(c, p, a.chartSummary(g))
 	})
 }
 
 // chartMinHeight 绘图区的最小高度（DIPs）。
 //
-// 图上柱高表达压缩率，太矮时 5% 的差异只剩 2-3px、读不出来。110 是
-// 「25% 刻度间隔 27px」的下限：再矮，四档刻度就会与柱顶互相挤压。
+// 三档字节刻度（8.5px）要互不挤压、高低柱的差异要读得出来：110 是「峰值与
+// 半峰值之间还有约 50px」的下限，窗口拉到最小高度时图也不至于压成一条线。
 const chartMinHeight float32 = 110
 
 // chartAxisWidth / chartAxisGap 两张图共用的左侧刻度列与间距。
@@ -476,17 +503,17 @@ const (
 
 // plotTopHeadroom 比例尺顶端再往下让出的留白（DIPs）。
 //
-// 只有比例尺（柱顶、折线点、100% 虚线）吃这个内缩，刻度文字不吃：峰值柱顶
-// 与最上刻度中心因此留出 3px。两者齐平时（上一版实测差 0.5px）1x 下读作
-// 「柱顶顶到了坐标系上沿」，而柱子必须先于刻度收住，图才有上边框。
+// 只有比例尺（柱顶、折线点）吃这个内缩，刻度文字不吃：峰值柱顶与最上刻度
+// 中心因此留出 3px。两者齐平时（上一版实测差 0.5px）1x 下读作「柱顶顶到了
+// 坐标系上沿」，而柱子必须先于刻度收住，图才有上边框。
 const plotTopHeadroom float32 = 3
 
 // plotScale 绘图区的纵向比例尺：把 [0,1] 的比例换成 y。
 //
-// 唯一的换算入口。柱顶、柱底、折线点、参考虚线、左侧刻度标签**全部**走
-// y()，同一个比例永远落在同一个像素上。上一轮的缺陷正是两套换算并存：
-// 柱高按「96% 可用高度」算、100% 虚线按整高算，于是 100% 被画在 94% 的
-// 位置（实测低 15px），虚线从每根柱顶下方横穿而过。
+// 唯一的换算入口。柱顶、柱底、折线点、左侧刻度标签**全部**走 y()，同一个
+// 比例永远落在同一个像素上。上一轮的缺陷正是两套换算并存（同一条 100% 参考
+// 线，柱高按「96% 可用高度」算、虚线按整高算，两者错开 15px）——教训在柱高
+// 改成体积之后依然成立：换算入口只允许有一个。
 type plotScale struct {
 	top  float32 // frac=1 的 y（轴顶）
 	base float32 // frac=0 的 y（基线）
@@ -557,9 +584,9 @@ func (a *app) axisTicks(c *ui.Context, p *glass.Palette, size float32, labels ..
 // 知道「现在跑得顺不顺」：每秒上下行多少字节、延迟是不是在恶化。这两件事在
 // 压缩率图上完全看不见（压缩率 99.9% 时连接可能同时卡得要死）。
 //
-// ── 纵轴设计（核心，和上一张图不同）────────────────────────────────────────
-// 上一张图的纵轴是百分比，0-100% 天然有界。流量是无界的：一次 30MB 的请求
-// 能把 1KB 的请求压成 0.003%。所以：
+// ── 纵轴设计（核心）───────────────────────────────────────────────────────
+// 两张图的柱都是字节、各自按本窗口峰值归一。第一张画「上行原始体积」
+// （省下 / 实发分层），这张画「实发流量」（上行 / 下行分层），多一条约束：
 //   - 柱：上下行流量，**对同一个桶取同一个比例尺**（两条量共用纵轴基准），
 //     否则「上行比下行小」这种判断会失真
 //   - 线：延迟（毫秒），单独按本窗口的峰值归一，画在同样的绘图区里
@@ -598,12 +625,16 @@ func (a *app) trafficCard(c *ui.Context, p *glass.Palette) {
 				ui.Text(c, "等待流量数据").FontSize(11.5).
 					TextColor(p.MutedForeground).SingleLine()
 			})
+			a.summaryLine(c, p, "")
 			return
 		}
 
 		a.trafficPlot(c, p)
-		ui.Text(c, a.trafficSummary(g)).FontSize(10.5).
-			FontFeatures("tnum").TextColor(p.MutedForeground).SingleLine()
+		// 两行真实摘要（窗口与实发量 / 延迟与复用状态），与上方卡片（保留期
+		// 总览 + 窗口口径）同为两行——绘图区因此继续等高、基线对齐。
+		l1, l2 := a.trafficSummary(g)
+		a.summaryLine(c, p, l1)
+		a.summaryLine(c, p, l2)
 	})
 }
 
@@ -742,7 +773,9 @@ func (a *app) trafficPlot(c *ui.Context, p *glass.Palette) {
 		}).Children(func() {
 		// 字节刻度三档：顶=本窗口峰值、中=峰值的一半、底=0。
 		// 延迟不在同一根轴上（见函数头注释），它的数值在摘要行里。
-		a.axisTicks(c, p, 8, humanBytes(maxBytes), humanBytes(maxBytes/2), "0")
+		// 两档刻度共用峰值的量纲（humanBytesAxis），同一根轴上不混用 KB/MB。
+		top, half := humanBytesAxis(maxBytes)
+		a.axisTicks(c, p, 8, top, half, "0")
 	})
 }
 
@@ -807,14 +840,22 @@ func trafficBarHeight(total, maxBytes int64, plotH float32) float32 {
 	return h
 }
 
-// trafficSummary 流量图下面那行摘要。
+// trafficSummary 流量图下面那**两行**摘要（10.5px，见 summaryLine）。
 //
-// 必须是一行（渲染处 SingleLine）。上一版把「握手 N 次 · 均 X ms」放在末尾，
-// 560 宽时最后一个单位词被折到第二行、独占一个字——读起来像排版事故。
-// 现在的取舍：去掉「首字节」与「握手均值」（它们都可以从别处推出，且不是
-// 这张图要回答的问题），换成延迟的三档读数「当前 / 峰值 / 均值」——
-// 折线本身没有独立右轴，这三个数就是它的量纲。
-func (a *app) trafficSummary(g stats.Agg) string {
+// 2026-11-16 收口：原来挤成一行，560 宽 + 有数据时最后一段「· 全程复用连接」
+// 被省略号吃掉（像素复核实测右缘 x527 贴到内容区 x529），440 宽必然截断。
+// 现在按语义拆成两行，每行都远低于最小内容宽（440 窗口的卡片内容宽 380px）：
+//
+//	第一行  窗口与上下行实发量：最近 X · ↑… · ↓…
+//	第二行  延迟三档读数 + 握手/复用状态
+//
+// 两张卡的摘要区同为两行高（卡片一是「保留期总览 + 窗口口径」），绘图区因此
+// 继续严格等高、基线对齐（见 summaryLine 与 TestChartScaleBarsAndTicks）。
+//
+// 延迟三档读数共用同一个单位（humanMsGroup）：同一句里混 ms/s 时三个数没法
+// 直接比大小。握手 0 次是好事（复用生效），措辞中性偏正面，而不是「无数据」；
+// 均值不写——一个数已经够回答「有没有在反复握手」。
+func (a *app) trafficSummary(g stats.Agg) (line1, line2 string) {
 	var up, down, n, msSum, hsN int64
 	var latest, peak int64
 	for _, b := range g.Series {
@@ -837,7 +878,7 @@ func (a *app) trafficSummary(g stats.Agg) string {
 		latest = b.AvgMs()
 	}
 	if n == 0 {
-		return "这段时间没有请求"
+		return "这段时间没有请求", ""
 	}
 
 	span := int(g.WindowSec)
@@ -846,21 +887,18 @@ func (a *app) trafficSummary(g stats.Agg) string {
 	}
 
 	// 上行/下行用箭头：图例就在上方（上行=蓝柱、下行=绿柱），这里再用四个
-	// 汉字会把「延迟 当前/峰值/均值」这组更重要的读数挤出单行。
-	// 三个延迟读数共用同一个单位（见 humanMsGroup）：同一句里混 ms/s 时
-	// 三个数没法直接比大小。
+	// 汉字会把第二行的延迟读数挤长。
+	line1 = fmt.Sprintf("最近 %s · ↑%s · ↓%s",
+		humanWindow(span), humanBytes(up), humanBytes(down))
+
 	ms := humanMsGroup(latest, peak, msSum/n)
-	text := fmt.Sprintf("最近 %s · ↑%s · ↓%s · 延迟 当前 %s / 峰值 %s / 均值 %s",
-		humanWindow(span), humanBytes(up), humanBytes(down),
-		ms[0], ms[1], ms[2])
-	// 握手：0 次是好事（复用生效），所以措辞要中性偏正面，而不是「无数据」。
-	// 均值不写：一个数已经够回答「有没有在反复握手」，具体耗时不是这行的问题。
+	line2 = fmt.Sprintf("延迟 当前 %s / 峰值 %s / 均值 %s", ms[0], ms[1], ms[2])
 	if hsN == 0 {
-		text += " · 全程复用连接"
+		line2 += " · 全程复用连接"
 	} else {
-		text += fmt.Sprintf(" · 握手 %s 次", groupDigits(hsN))
+		line2 += fmt.Sprintf(" · 握手 %s 次", groupDigits(hsN))
 	}
-	return text
+	return line1, line2
 }
 
 // latencyHasGaps 非空延迟样本之间是否存在空洞（折线因此断开）。
@@ -896,11 +934,12 @@ func (a *app) latencyHasGaps() bool {
 // 上一版这里硬编码了 #4ADE80/#3B82F6，而色板是 #4ec38a/#4c9ef0——同一屏
 // 出现两种「同色系」，叠在一起像没对齐的两种主题。系列色本来就该只有一处定义。
 
-// minWirePx 蓝段（实际发送）的最小可见高度。
-
-// 压缩 99.9% 时它按比例只有 0.2px，抗锯齿后会完全消失，整根柱子读成纯亮色——
-// 那会丢失「仍然发了东西」这个事实。3px 是 Retina 上能稳定看见一条线的高度。
-const minWirePx float32 = 3
+// minWirePx 蓝段（实际发送）的最小可见高度（DIPs）。
+//
+// 压缩 99.9% 时蓝段按比例不足 0.2px，抗锯齿后会完全消失，整根柱子读成纯绿——
+// 那会丢失「仍然发了东西」这个事实。1px 是能稳定画出来的最小高度，只表达
+// 存在性；量级读数在柱高与图下文字里（都是精确的）。
+const minWirePx float32 = 1
 
 // hasSeries 是否有可画的数据（有一秒带流量即可）
 func (a *app) hasSeries() bool {
@@ -971,30 +1010,48 @@ func (a *app) legendLine(c *ui.Context, col ui.Color, label string) {
 	})
 }
 
-// chartPlot 柱状图本体：纵轴刻度 + 100% 参考虚线 + 每分钟一根分层柱。
+// summaryLine 图下摘要的统一样式（两张图共用）：10.5px + 表格数字（tnum）。
 //
-// 每根柱子的画法（自底向上）：
+// 空串渲染成**一整行占位**（空文本同样占一个行高，实测 10.5px 字号为 12.4px）：
+// 两张 Grow(1) 的卡片摘要区因此恒为两行高，绘图区才能严格等高——这是
+// TestChartScaleBarsAndTicks 的等高契约（两图柱底、刻度在同一屏上对齐）的
+// 布局前提。两张卡片各两行：上方是「保留期总览 + 窗口口径」，下方是
+// 「窗口与实发量 + 延迟与复用状态」；空态各留一行（占位），高度仍然对齐。
 //
-//	barH   = max(省下的比例 × 满量程, minWirePx)   ← 柱子总高 = 压缩率
-//	wireH  = min(minWirePx, barH)                 （蓝，贴底）
-//	savedH = barH - wireH                         （绿，在上）
+// 每一行都必须能在最小窗口（440 宽，卡片内容宽 380px）里完整显示、不被
+// 省略号截断——由 TestSummaryLinesFitNarrowWindow 守着。
+func (a *app) summaryLine(c *ui.Context, p *glass.Palette, text string) {
+	ui.Text(c, text).FontSize(10.5).FontFeatures("tnum").
+		TextColor(p.MutedForeground).SingleLine()
+}
+
+// chartPlot 柱状图本体：纵轴字节刻度 + 每桶一根体积堆叠柱。
 //
-// 满量程与 100% 虚线、左侧刻度全部来自 plotScale 的同一个换算（见 plotScale
-// 的注释）：100% 的柱顶与虚线在像素上重合，不会再出现「虚线从柱顶下方穿过」。
+// 每根柱子的画法（自底向上），三个数量关系与 chartCard 的注释一一对应：
 //
-// 为什么蓝段是「固定最小高度」而不是「按比例」：这是「压缩率当柱高」这个
-// 映射本身带来的约束。压缩 99.9% 时按比例算蓝段只有 0.1px，抗锯齿后消失，
-// 整根柱子读成纯绿——用户就看不出「还是发了点东西」。3px 是 Retina 上能稳定
-// 看见一条线的高度，表达的是「这里确实有发送」，而不是一个量化读数
-// （量化读数在图下方那行文字里，是精确的）。
+//	barH   = s.height(UpRaw/maxRaw)          ← 峰值桶精确到轴顶
+//	wireH  = barH × UpWire/UpRaw（>0 时至少 1px，且不超过 barH）
+//	savedH = barH - wireH
 //
-// 语义分工：
+// 比例尺仍只有 plotScale 一个入口（柱顶、柱底、刻度标签全部走它）：上一轮的
+// 缺陷正是两套换算并存（柱高按 96% 可用高度、参考虚线按整高），这类 bug 在
+// 这里的防法是——maxRaw 是唯一的分母，s.height() 是唯一的换算。
 //
-//	柱高  = 这一分钟省了多少（成绩）
-//	蓝段  = 确实发了（存在性，不是数值）
-//	绿段  = 剩下的都是省下的
+// 蓝段「至少 1px」而不是按比例消失，是为了保住「这里确实有发送」这个事实
+// （量化读数在图下文字里，是精确的）；只要 UpWire>0，蓝段就一定画得出来。
 func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 	series := a.agg.Series
+
+	// 满量程：本窗口最大单桶原始上行体积（至少 1，避免除零）。
+	// 用 UpRaw 而不是 Wire：这张图回答「哪一桶流量大 + 其中省了多少」，
+	// 而各桶压缩率不同，按 wire 归一会把「大请求」与「压得好的请求」混淆。
+	var maxRaw int64 = 1
+	for _, b := range series {
+		if b.UpRaw > maxRaw {
+			maxRaw = b.UpRaw
+		}
+	}
+
 	// 绘图区吃掉卡片里的剩余高度，但有下限：窗口被拉到最小高度时
 	// 图仍有 chartMinHeight，不至于压成一条线。
 	ui.Box(c).Grow(1).MinHeight(chartMinHeight).FillWidth().
@@ -1005,19 +1062,10 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 			}
 			s := newPlotScale(area)
 
-			// 基线（0%）：1px 发丝线，不给网格
+			// 基线（0 B）：1px 发丝线，不给网格。
+			// 旧的 100% 参考虚线已删除（理由见 chartCard：字节刻度里没有
+			// 100% 这个概念，峰值参考线又与最上刻度重合）。
 			pt.Fill(ui.Rect{X: area.X, Y: s.base, W: area.W, H: 1}, p.Edge, 0)
-
-			// 100% 参考虚线：y 取 s.y(1)，与一根「省满 100%」的柱顶是
-			// **同一个表达式**。上一版柱高按 96% 的可用高度算、虚线按整高算，
-			// 100% 因此被画在 94% 的位置（截图实测低 15px），1x 下就是虚线
-			// 从每根柱顶下方横穿而过。画实线会与柱顶混在一起，3px/3px 的
-			// 节奏足够让人看出「这是参考，不是数据」。
-			dy := s.y(1)
-			for x := float32(0); x < area.W; x += 6 {
-				w := min(float32(3), area.W-x)
-				pt.Fill(ui.Rect{X: area.X + x, Y: dy, W: w, H: 1}, p.Border, 0)
-			}
 
 			n := len(series)
 			if n == 0 {
@@ -1031,46 +1079,53 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 
 			for i, b := range series {
 				if b.UpRaw <= 0 {
-					continue // 空分钟不画：基线上的空白就是「这段时间没流量」
+					continue // 空桶不画：基线上的空白就是「这一桶没流量」
 				}
-				saved := float32(clampF(1-float64(b.UpWire)/float64(b.UpRaw), 0, 1))
 
-				// 柱高 = 压缩率 × 比例尺的满量程。saved=1 时柱顶 = s.top，
-				// 正好落在上面那条 100% 虚线上（像素差 < 1px）。
-				barH := s.height(saved)
-				// 一点没省（saved=0）时柱子高度为 0，只剩一条蓝线：
-				// 那是准确的——「这一分钟完全没有优化」。
-				wireH := min(minWirePx, barH)
-				if barH < wireH {
-					barH = wireH
+				// 柱高 = 这一桶的原始体积 / 满量程。峰值桶精确到轴顶。
+				barH := s.height(float32(b.UpRaw) / float32(maxRaw))
+				wireH := float32(0)
+				if b.UpWire > 0 {
+					wireH = barH * float32(b.UpWire) / float32(b.UpRaw)
+					// 压缩 99.9% 时按比例不足 1px，抗锯齿后会消失，
+					// 整根柱读成纯绿——至少 1px 保住「确实发了东西」。
+					if wireH < minWirePx {
+						wireH = minWirePx
+					}
+				}
+				if wireH > barH {
+					wireH = barH // 极小桶：蓝段以柱高为限，不许溢出柱顶
 				}
 				savedH := barH - wireH
 
 				x := area.X + float32(i)*slot + (slot-bw)/2
 				top := s.base - barH
 
-				// 绿段（省下）：柱子的主体，从上沿往下
+				// 绿段（省下）：柱子的上半段
 				if savedH > 0 {
 					pt.Fill(ui.Rect{X: x, Y: top, W: bw, H: savedH},
 						p.DownBar, min(2, bw/2))
 				}
-				// 蓝段（实际发送）：贴底
-				pt.Fill(ui.Rect{X: x, Y: s.base - wireH, W: bw, H: wireH},
-					p.UpBar, min(2, bw/2))
+				// 蓝段（实际发送）：贴底，高度随 UpWire 真实伸缩
+				if wireH > 0 {
+					pt.Fill(ui.Rect{X: x, Y: s.base - wireH, W: bw, H: wireH},
+						p.UpBar, min(2, bw/2))
+				}
 			}
 		}).Children(func() {
-		// 纵轴刻度：0/25/50/75/100%。五档是因为柱高直接读作百分数，
-		// 少一档就得靠目测插值。列宽与流量图共用 chartAxisWidth，
-		// 两张图的绘图区因此左右对齐（同一屏叠放时 x 轴不错位）。
-		a.axisTicks(c, p, 8.5, "100%", "75%", "50%", "25%", "0")
+		// 纵轴字节刻度三档：顶=本窗口峰值、中=峰值的一半、底=0。
+		// 两档用 humanBytesAxis 共用**峰值的量纲**（峰值刚过 1 MB 时半峰值
+		// 不会再写成「1001.0 KB」）；与下方流量图同一套口径，列宽也共用
+		// chartAxisWidth，两张图的绘图区左右对齐。
+		top, half := humanBytesAxis(maxRaw)
+		a.axisTicks(c, p, 8.5, top, half, "0")
 	})
 }
 
-// chartSummary 图下方那行文字：图给比例，文字给绝对值，各司其职。
+// chartSummary 图下方第二行文字：图给形状，文字给绝对值，各司其职。
 //
-// 窗口与粒度都从快照里取（WindowSec / BucketSec），不写死：用户切了显示区间，
-// 这句话必须跟着说「最近 6 小时（每 12 分钟一柱）」，否则文字和图说的就不是
-// 同一段时间——那比没有这句话更糟。
+// 窗口从快照里取（WindowSec），不写死：用户切了显示区间，这句话必须跟着说
+// 「最近 6 小时」，否则文字和图说的就不是同一段时间——那比没有这句话更糟。
 func (a *app) chartSummary(g stats.Agg) string {
 	var raw, wire int64
 	var n int64
@@ -1087,14 +1142,41 @@ func (a *app) chartSummary(g stats.Agg) string {
 	if span <= 0 {
 		span = int(stats.DefaultWindow / time.Second)
 	}
-	text := fmt.Sprintf("最近 %s：%s → %s · 省下 %.1f%%（%s 次请求）",
+	// 不追加「每 N 一柱」：这行必须能在最小窗口（440 宽，卡片内容宽 380px）
+	// 里完整显示。桶粒度等于窗口 / stats.SeriesBuckets，是可推的量；而带上
+	// 它的最坏宽度（24 小时窗口 + 六位请求数）实测 416px，会触顶被省略号截断
+	// （视觉复核 2026-11-16 抓到过同类截断）。
+	return fmt.Sprintf("最近 %s：%s → %s · 省下 %.1f%%（%s 次请求）",
 		humanWindow(span), humanBytes(raw), humanBytes(wire), saved*100, groupDigits(n))
-	if g.BucketSec > 0 {
-		// 桶粒度单独一句、允许折到第二行：480px 宽时它和前三段挤不进一行，
-		// 被省略号截掉的会是「每 N 一柱」这个最有用的信息。
-		text += " · 每 " + humanWindow(int(g.BucketSec)) + "一柱"
+}
+
+// retentionStatsLine 「近 <保留期> N 请求 · 节省 … · p50 …」：保留期总览。
+//
+// 2026-11-16 从底栏移入「上行体积对比」卡片（图下第一行摘要，也就是这张图的
+// 陪读文字——图看的是窗口，这句交代窗口之外还有多少历史，两者贴在一起才
+// 对得上；同时为底栏腾出了实时带宽的位置）。口径不变：
+//
+//   - 前缀用保留期（RetainSec）而不是会话时长：统计自 2026-11-13 起从磁盘
+//     日志重建，重启不清零，「本次会话」已名不副实
+//   - 延迟读数走 humanMs（与流量卡摘要的「当前/峰值/均值」同一个换算函数），
+//     同一量纲不出现两种写法（底栏曾写裸毫秒，和卡片里的秒并排出现）
+//
+// 空串 = 没有请求（调用方按 summaryLine 渲染成占位行，或直接跳过）。
+func (a *app) retentionStatsLine() string {
+	g := a.agg
+	if g.Requests == 0 {
+		return ""
 	}
-	return text
+	saved := g.UpRaw - g.UpWire
+	if saved < 0 {
+		saved = 0
+	}
+	retain := int(g.RetainSec)
+	if retain <= 0 {
+		retain = int(stats.DefaultRetain / time.Second)
+	}
+	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %s",
+		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), humanMs(g.P50Ms))
 }
 
 // humanWindow 把秒数说成人话（1800 → "30 分钟"）。
@@ -1545,7 +1627,16 @@ func switchKnobRect(r ui.Rect, on bool) ui.Rect {
 
 // ---- footer ----
 
-// footer 钉在窗口底部的信息条：左侧一句话状态，右侧版本号。
+// footer 钉在窗口底部的信息条：状态 · 实际传输 · 实时带宽 ……… 版本号。
+//
+// 三条口径（2026-11-16）：
+//   - 传输方式报**实际生效**的那种（最近一条请求记录走的是什么，见
+//     effectiveTransportLabel），不再是设置里的「自动选择传输」——意图不是
+//     事实，底栏只报事实；没有任何记录时显示「—」
+//   - 实时带宽是累计计数的差值（见 main.go 的 sampleStats），第一条基线
+//     建起来之前显示「—」
+//   - 历史统计（近 24 小时 N 请求 · 节省 …）搬进了「上行体积对比」卡片：
+//     它是那张图的陪读文字，也为底栏腾出了实时带宽的位置
 //
 // 写用户看得懂的话，不写实现细节（「mygo native UI · solid-glass 材质」对
 // 用户零价值）。版本号只在这里出现一次。
@@ -1562,34 +1653,30 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 			state += " " + humanDuration(time.Since(up))
 		}
 	}
-	// 单栏：状态 · 传输 · 统计摘要 ……… 版本号
+	// 单栏：状态 · 传输 · 实时带宽 ……… 版本号
 	//
 	// 2026-11-13 owner 要求「窗口做大，底部就不用两栏、合并成一栏」。原来的两栏是
 	// 「内容区末尾的统计+复制」和「窗口底部状态条」——它们都只有一行高，各占
 	// 27~32px，合起来在一屏里读作两条重复的底边。合并后信息密度反而更高：
-	// 用户在同一个水平线上从左到右读到「跑没跑 → 走的什么 → 效果如何」。
+	// 用户在同一个水平线上从左到右读到「跑没跑 → 走的什么 → 跑多快」。
 	//
-	// 顺序是有意义的，不是随便排：状态是「最常看」，统计摘要是「顺带看」，
+	// 顺序是有意义的，不是随便排：状态与传输是「最常看」，实时带宽是「顺带看」，
 	// 版本是最不需要看的（放最右，视线最少落到那里）。底栏不再有复制按钮：
 	// 那是一个动作，放在顶栏徽标上；状态栏保持纯读取。
+	//
+	// 空间取舍（窗口最小 440 宽）：状态+传输约 110px、带宽两段约 160px、版本
+	// 约 55px，加上 32px 内边距与三段 4px 间隙共约 370px——440 仍放得下，
+	// 不需要再收字。带宽走 tnum 等宽数字，读数跳动时不推挤后面的版本号。
 	ui.Row(c).Height(32).FillWidth().Padding(0, 16).
 		AlignItems(ui.Center).Background(p.PageDim).Gap(footerSegmentGap).Children(func() {
-		// 状态与传输方式之间、以及与后面的统计摘要之间，用的是同一种分隔点
-		// 「 · 」。上一版把摘要前的点写成独立元素并给 Row 设了 Gap(10)，
-		// 于是同一行里出现两种点距（实测 14/13px vs 7/8px），读起来像
-		// 排版事故而不是分组。「自动选择传输」两侧那种多出来的空隙就是这么来的。
-		head := fmt.Sprintf("%s · %s", state, a.transportLabel())
-
-		// 统计摘要：只在有数据时出现。空态下这一格是「还没有请求记录」，
-		// 而状态区已经说了「未运行」——同一件事说两遍只会稀释信息。
-		if line := a.footerStatsLine(); line != "" {
-			ui.Text(c, head+" ·").FontSize(10.5).TextColor(p.Tertiary).SingleLine()
-			ui.Text(c, line).FontSize(10.5).FontFeatures("tnum").
-				TextColor(p.MutedForeground).MaxLines(1).Grow(1)
-		} else {
-			ui.Text(c, head).FontSize(10.5).TextColor(p.Tertiary).SingleLine()
-			ui.Box(c).Grow(1)
-		}
+		// 状态与传输之间、带宽两段之间，用的是同一种分隔点「 · 」——底栏
+		// 同一行只允许一种点距（上一版把摘要前的点写成独立元素并给 Row 设了
+		// Gap(10)，同一行里出现 14/13px 与 7/8px 两种点距，读起来像排版事故）。
+		ui.Text(c, fmt.Sprintf("%s · %s", state, a.effectiveTransportLabel())).
+			FontSize(10.5).TextColor(p.Tertiary).SingleLine().Shrink(0)
+		ui.Text(c, a.rateLabel()).FontSize(10.5).FontFeatures("tnum").
+			TextColor(p.MutedForeground).SingleLine().Shrink(0)
+		ui.Box(c).Grow(1)
 
 		// 复制入口只在顶栏徽标：底栏不再放第二个按钮（owner 2026-11-13：
 		// 「底部状态栏不需要"复制地址"这个按钮」）。状态栏只负责「读」，
@@ -1611,39 +1698,31 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 // 取 0 会把两段的字挤在一起，取 10 又回到「两种点距」的老问题。
 const footerSegmentGap float32 = 4
 
-// footerStatsLine 底部那一行里的统计摘要（空态返回空串，让调用方跳过）。
+// effectiveTransportLabel 底栏显示**实际生效**的传输方式（QUIC / TCP）。
 //
-// 口径从「本次会话」改成「近 N 小时」：统计自 2026-11-13 起从磁盘日志重建，
-// 重启不清零，所以「本次会话」已名不副实。前缀写明保留期，让时间跨度可见。
+// 设置页的「自动 / QUIC / TCP」是用户的意图；底栏曾经照抄它（「自动选择传输」），
+// 而这个短语在跑了半天之后不携带任何信息。事实来源是请求记录：stats.Agg 的
+// LastTransport = 保留窗口内最近一条带 transport 字段的记录（jsonl 重建同样填，
+// 见 internal/stats 的 accumulateLocked）。
 //
-// 延迟读数走 humanMs（与卡片摘要里的「当前/峰值/均值」同一个换算函数）：
-// 底栏曾经写裸毫秒（"p50 27766 ms"），同一屏上卡片写「31.1 s」——同一量纲
-// 两种写法，读者得自己换算。
-func (a *app) footerStatsLine() string {
-	g := a.agg
-	if g.Requests == 0 {
-		return ""
+// 没有任何记录时显示「—」：不猜、也不回退到设置值——设置是意图，不是事实。
+func (a *app) effectiveTransportLabel() string {
+	t := strings.ToUpper(strings.TrimSpace(a.agg.LastTransport))
+	if t == "" {
+		return "—"
 	}
-	saved := g.UpRaw - g.UpWire
-	if saved < 0 {
-		saved = 0
-	}
-	retain := int(g.RetainSec)
-	if retain <= 0 {
-		retain = int(stats.DefaultRetain / time.Second)
-	}
-	return fmt.Sprintf("近 %s %s 请求 · 节省 %s · p50 %s",
-		humanWindow(retain), groupDigits(g.Requests), humanBytes(saved), humanMs(g.P50Ms))
+	return t
 }
 
-// transportLabel 传输方式的显示名
-func (a *app) transportLabel() string {
-	switch a.transport {
-	case "quic":
-		return "QUIC"
-	case "tcp":
-		return "TCP"
-	default:
-		return "自动选择传输"
+// rateLabel 底栏的实时上下行带宽（字节/秒）。
+//
+// 数据是累计计数器的两次快照差值（见 main.go 的 sampleStats）。第一条基线
+// 还没建起来、或计数被清零重建（改保留期）时显示「↑ — · ↓ —」：宁可说
+// 「不知道」，不摆一个假数字。两个速率共用 format.go 的 humanRate——
+// 与别处的体积口径是同一个换算函数。
+func (a *app) rateLabel() string {
+	if !a.rateValid {
+		return "↑ — · ↓ —"
 	}
+	return fmt.Sprintf("↑ %s · ↓ %s", humanRate(a.upRate), humanRate(a.downRate))
 }

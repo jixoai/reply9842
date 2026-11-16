@@ -19,6 +19,7 @@ import (
 	"net/http"
 	"time"
 
+	"github.com/jixoai/reply9842/internal/codec"
 	"github.com/jixoai/reply9842/internal/meta"
 	"github.com/jixoai/reply9842/internal/transport"
 
@@ -44,6 +45,17 @@ type Session struct {
 	// Fatal 错误不可通过续传恢复（如 4xx 业务状态、帧解析失败）。
 	// 若为 true，调用方不得再重连重放——重放只会换来同样的结果。
 	Fatal bool
+
+	// Dict 下行字典压缩（EncDcz/EncDcz2）的字典解析器。
+	//
+	// hash 的语义由 enc 决定：EncDcz 是 BLAKE3(字典)，EncDcz2 是 SHA-256(字典)
+	// （RFC 9842 §5）。返回 ok=false / 空字典表示本地没有这份字典 —— 此时
+	// 解码必须**明确失败**，绝不把 zstd 字节当明文写给下游（那是静默损坏）。
+	//
+	// 为什么由调用方注入：字典的唯一来源是「本地已保存的正文」（历史正文缓存），
+	// internal/clientstream 不持有内容存储。当前服务端下行只发 zstd/identity，
+	// 所以生产路径上它是 nil；能力与测试由 internal/codec 与本案的字典测试覆盖。
+	Dict func(enc meta.Encoding, hash [32]byte) ([]byte, bool)
 
 	// 下行解压状态不放在 Session 上：解压器生命周期严格等于一次连接
 	// （服务端每条连接都从 ResumeFrom 处新起一条 zstd 流），跨连接复用
@@ -178,13 +190,24 @@ type rawSink struct {
 	done   chan error
 	closed bool
 	broken bool
+
+	// 字典压缩下行（dcz/dcz2）状态。
+	//
+	// 40 字节头可能被切在任意帧边界上，攒够之前不能建解码器（要先拿头里的
+	// 哈希去解字典）。dictEnc 记住本响应声明的字典格式（0=还没开始），
+	// 防止同一条流里换格式。
+	dictEnc meta.Encoding
+	headBuf []byte
 }
 
-// start 建立解压管道（每条连接一次）
-func (r *rawSink) start(w http.ResponseWriter) error {
+// start 建立解压管道（每条连接一次）。
+//
+// dictEnc/dict 决定解码器变体：EncDcz=私有字典 ID、EncDcz2=ID 0（RFC 9842 §5）、
+// 其余（EncZstd）=无字典。字典 ID 的选择只此一处，调用方不必知道细节。
+func (r *rawSink) start(w http.ResponseWriter, dictEnc meta.Encoding, dict []byte) error {
 	r.w = w
 	pr, pw := io.Pipe()
-	d, err := zstd.NewReader(pr, zstd.WithDecoderConcurrency(1))
+	d, err := newDownDecoder(pr, dictEnc, dict)
 	if err != nil {
 		_ = pr.CloseWithError(err)
 		return err
@@ -220,23 +243,116 @@ func (r *rawSink) start(w http.ResponseWriter) error {
 	return nil
 }
 
+// newDownDecoder 按编码建流式解码器（r 里是不含 dcz 头的 zstd 字节流）
+func newDownDecoder(r io.Reader, dictEnc meta.Encoding, dict []byte) (*zstd.Decoder, error) {
+	switch dictEnc {
+	case meta.EncDcz:
+		return codec.StreamDczDecoder(r, dict)
+	case meta.EncDcz2:
+		return codec.StreamDcz2Decoder(r, dict)
+	case meta.EncZstd:
+		return zstd.NewReader(r, zstd.WithDecoderConcurrency(1))
+	default:
+		return nil, fmt.Errorf("downlink: 没有 %v 的解码器", dictEnc)
+	}
+}
+
 func (r *rawSink) write(w http.ResponseWriter, enc meta.Encoding, p []byte) error {
-	if enc != meta.EncZstd {
+	switch enc {
+	case meta.EncIdentity:
 		// 未压缩（服务端压缩启用失败时的降级路径）
 		r.markTTFB()
 		return writeBody(r.s, p, w)
-	}
-	if r.dec == nil {
-		if err := r.start(w); err != nil {
-			r.broken = true
-			return err
+
+	case meta.EncZstd:
+		if r.dec == nil {
+			if err := r.start(w, enc, nil); err != nil {
+				r.broken = true
+				return err
+			}
 		}
+		return r.feed(p)
+
+	case meta.EncDcz, meta.EncDcz2:
+		return r.writeDict(w, enc, p)
+
+	default:
+		// 未知编码绝不按明文兜底：把压缩字节写给下游就是「可读但全错」的
+		// 静默损坏（历史事故：一次不上报能力位让线上全部响应变成二进制垃圾）。
+		r.broken = true
+		return fmt.Errorf("downlink: 未知编码 %v（拒绝按明文处理，可能是版本不匹配）", enc)
+	}
+}
+
+// feed 把一段已确认属于当前解码流的字节写进管道（写满即阻塞 = 天然背压）
+func (r *rawSink) feed(p []byte) error {
+	if len(p) == 0 {
+		return nil
 	}
 	if _, err := r.pw.Write(p); err != nil {
 		r.broken = true
 		return fmt.Errorf("downlink: %w", err)
 	}
 	return nil
+}
+
+// writeDict 处理字典压缩下行（dcz/dcz2）：
+// 先攒够 40 字节头 → 校验 magic 并取出声明的字典哈希 → 从 Session.Dict 取字典
+// → 建字典解码器 → 余下字节喂进管道。头本身是线格式，不写给下游。
+func (r *rawSink) writeDict(w http.ResponseWriter, enc meta.Encoding, p []byte) error {
+	if r.dec != nil {
+		return r.feed(p) // 已经在解码了
+	}
+	if r.dictEnc == 0 {
+		r.dictEnc = enc
+	} else if r.dictEnc != enc {
+		r.broken = true
+		return fmt.Errorf("downlink: 同一条响应流的编码从 %v 变成了 %v（协议异常）", r.dictEnc, enc)
+	}
+	if need := codec.HeaderLen - len(r.headBuf); need > 0 && len(p) > 0 {
+		take := need
+		if take > len(p) {
+			take = len(p)
+		}
+		r.headBuf = append(r.headBuf, p[:take]...)
+		p = p[take:]
+	}
+	if len(r.headBuf) < codec.HeaderLen {
+		return nil // 头还没攒齐，等下一帧（不写任何东西给下游）
+	}
+
+	// 头到手：校验 magic + 取出声明的字典哈希（语义由 enc 决定）
+	var (
+		declared [32]byte
+		herr     error
+	)
+	switch enc {
+	case meta.EncDcz:
+		var h codec.Hash
+		h, herr = codec.PeekDczHash(r.headBuf)
+		copy(declared[:], h[:])
+	case meta.EncDcz2:
+		var h codec.SHA256
+		h, herr = codec.PeekDcz2Hash(r.headBuf)
+		copy(declared[:], h[:])
+	}
+	if herr != nil {
+		r.broken = true
+		return fmt.Errorf("downlink: %v 头非法: %w", enc, herr)
+	}
+	var dict []byte
+	if r.s.Dict != nil {
+		dict, _ = r.s.Dict(enc, declared)
+	}
+	if len(dict) == 0 {
+		r.broken = true
+		return fmt.Errorf("downlink: %v 需要字典 %x，本地没有（拒绝按明文处理）", enc, declared[:8])
+	}
+	if err := r.start(w, enc, dict); err != nil {
+		r.broken = true
+		return err
+	}
+	return r.feed(p)
 }
 
 // markTTFB 记录首个明文字节写给下游的时刻（只看第一个）。
@@ -248,7 +364,19 @@ func (r *rawSink) markTTFB() {
 
 // flush 由 FrameDone 触发：关管道让解码器读到 EOF，等它把尾巴写完。
 func (r *rawSink) flush() error {
-	if r.dec == nil || r.closed {
+	if r.dec == nil {
+		if r.closed {
+			return nil
+		}
+		r.closed = true
+		// 字典压缩流连 40 字节头都没收齐就结束：截断的流不能当成功收尾
+		if r.dictEnc != 0 {
+			r.broken = true
+			return fmt.Errorf("downlink: %v 流在 40 字节头收齐前结束（截断）", r.dictEnc)
+		}
+		return nil
+	}
+	if r.closed {
 		return nil
 	}
 	r.closed = true

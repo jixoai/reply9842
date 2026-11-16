@@ -145,6 +145,15 @@ type Agg struct {
 	Encodings  map[string]int64 `json:"encodings"`
 	Transport  map[string]int64 `json:"transport"`
 
+	// LastTransport 保留窗口内**最近一条带传输信息**的记录的传输方式
+	// （"quic"/"tcp"）。Transport 计数只知道「各出现过多少次」，答不出
+	// 「现在是哪一种」——界面底栏要显示实际生效的传输就必须有这一格。
+	//
+	// 空串 = 窗口内没有任何带 transport 字段的记录（新用户、或旧版本日志）。
+	// 重建路径天然填对：rebuild 按文件、按行从旧到新扫，最后写入的值就是
+	// 窗口内最新一条（accumulateLocked 是所有路径的唯一累加入口）。
+	LastTransport string `json:"last_transport,omitempty"`
+
 	// RetainSec / WindowSec / BucketSec 让「这份快照说的是哪段时间」自带说明：
 	// 图表横轴、图下那句「最近 30 分钟（每 1 分钟一柱）」都从这里取，
 	// 不再假设某个写死的窗口。
@@ -374,6 +383,9 @@ func (c *Collector) accumulateLocked(r *Record, t time.Time) {
 	a.Encodings[r.Encoding]++
 	if r.Transport != "" {
 		a.Transport[r.Transport]++
+		// 只记「最近一次」：为空（旧日志/未走隧道）时保留上一个有效值，
+		// 这样界面永远显示「最近一次真实用过的传输」而不是被空值抹掉。
+		a.LastTransport = r.Transport
 	}
 
 	c.bucketLocked(t, r)

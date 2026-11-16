@@ -36,7 +36,49 @@ const (
 )
 
 // ALPN 隧道协议标识（QUIC 与 TLS 共用）
-const ALPN = "reply9842/1"
+//
+// 两个版本名同时是**编码协商的载波**：
+//
+//	reply9842/1  老协议：上行 delta 用私有 dcz（BLAKE3 头 + 私有字典 ID）
+//	reply9842/2  新协议：上行 delta 默认用 dcz2（RFC 9842 §5，SHA-256 头 + 无字典 ID）
+//
+// 为什么编码协商放在 ALPN 而不是帧里（对比"能力位/hello 帧"两条路）：
+//
+//  1. 能力位只能表达「我支持什么」，表达不了「**对端**支持什么」。客户端要发
+//     dcz2，必须先知道服务端能不能解——而第一个请求帧本身就是探针，帧内位
+//     来不及帮它。要么加 hello 帧（老服务端 default 分支直接断连），要么让
+//     客户端先发错一次再按错误降级（每个连接白付一次 round trip，还把
+//     "未知编码"这种硬错误掺进正常路径）。
+//  2. ALPN 在握手期就定论，零额外 round trip，且能**被老服务端接受**：
+//     老服务端只认 v1，它从我们的 offer 列表里挑 v1 即可，不需要理解 v2。
+//  3. 降级语义是硬要求，而 ALPN 的降级语义有坑，必须显式处理：
+//     crypto/tls 的 negotiateALPN 在「双方无交集」时直接让握手失败
+//     （"tls: client requested unsupported application protocols"），**不是**
+//     自动降级。所以新客户端必须同时 offer [v2, v1]——老服务端挑 v1、新服务端
+//     挑 v2（Go/quic-go 都按**服务端**偏好列表顺序选，服务端把 v2 放前面即可）。
+//     客户端只报 v2 就会对老服务端直接握手失败，这是"新客户端 × 老服务端自动
+//     降级"能成立的唯一写法（见 internal/transport/alpn_test.go 的协商矩阵）。
+const (
+	ALPN = "reply9842/1"
+	// ALPNv1 老协议名；ALPN 是本包历史名字（老客户端与既有测试都在用），保留不删。
+	ALPNv1 = ALPN
+	// ALPNv2 新协议名：双方都支持 dcz2 时协商到它。
+	ALPNv2 = "reply9842/2"
+)
+
+// clientProtos 客户端 offer 列表。v2 在前只是意图声明，选择权在服务端
+// （Go 的 negotiateALPN 按服务端列表顺序取第一个交集）。**v1 必须在列**，
+// 否则对老服务端握手失败而不是降级。
+func clientProtos() []string { return []string{ALPNv2, ALPNv1} }
+
+// serverProtos 服务端 accept 列表。enableDcz2=false 时与今天完全一致
+// （只认 v1，老客户端行为、新客户端自动降级都在这一条上成立）。
+func serverProtos(enableDcz2 bool) []string {
+	if enableDcz2 {
+		return []string{ALPNv2, ALPNv1}
+	}
+	return []string{ALPNv1}
+}
 
 // Dialer 客户端连接工厂
 type Dialer struct {
@@ -76,6 +118,11 @@ type Conn struct {
 	recv    func() ([]byte, error)
 	closeFn func() error
 
+	// proto 握手协商出的 ALPN 协议名（ALPNv2=双方支持 dcz2；ALPNv1=老协议）。
+	// 由 Dial/Accept 在建连后从 TLS 状态里取出并固化成字段：调用方（relayclient、
+	// 服务端）要按它选编码，而 TLS 状态每次读都要加锁。
+	// 空串只在「测试里手工构造的 Conn」上出现，按 v1 语义处理。
+	proto string
 	// reused 表示这条连接是从池里复用的（true）还是本次新建的（false）。
 	// 由 PooledDialer 在 Get 时设置，供上层统计「这次请求是否付了握手代价」。
 	reused bool
@@ -126,6 +173,21 @@ func (c *Conn) IdleFor() time.Duration { return c.idleFor }
 
 // Kind 当前连接使用的传输
 func (c *Conn) Kind() Kind { return c.kind }
+
+// Proto 握手协商出的 ALPN 协议名（ALPNv2 / ALPNv1；空串按 v1 处理）。
+func (c *Conn) Proto() string {
+	if c.proto == "" {
+		return ALPNv1
+	}
+	return c.proto
+}
+
+// SupportsDcz2 这条连接是否协商到了 dcz2（RFC 9842 §5）。
+//
+// 语义是「双方都能处理 dcz2」：上行用 dcz2 编码的前提，也是下行收到 dcz2
+// 编码响应帧的前提。v1 连接上一律 false——这就是「老客户端不会被塞 dcz2、
+// 新客户端对老服务端自动降级」在代码里的唯一判据。
+func (c *Conn) SupportsDcz2() bool { return c.Proto() == ALPNv2 }
 
 // Send 发送一个完整帧（长度前缀由上层 meta 负责）
 func (c *Conn) Send(b []byte) error { return c.send(b) }
@@ -231,7 +293,7 @@ func (d *Dialer) LastKind() Kind {
 
 func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 	tlsCfg := &tls.Config{
-		NextProtos:         []string{ALPN},
+		NextProtos:         clientProtos(),
 		ServerName:         d.serverName(),
 		InsecureSkipVerify: d.Insecure,
 		MinVersion:         tls.VersionTLS13,
@@ -297,6 +359,7 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 	}
 	return &Conn{
 		kind:             KindQUIC,
+		proto:            qc.ConnectionState().TLS.NegotiatedProtocol,
 		handshake:        time.Since(hsStart),
 		send:             func(b []byte) error { return writeAll(st, b) },
 		recv:             func() ([]byte, error) { return readFrame(st) },
@@ -311,7 +374,7 @@ func (d *Dialer) dialQUIC(ctx context.Context) (*Conn, error) {
 
 func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 	tlsCfg := &tls.Config{
-		NextProtos:         []string{ALPN},
+		NextProtos:         clientProtos(),
 		ServerName:         d.serverName(),
 		InsecureSkipVerify: d.Insecure,
 		MinVersion:         tls.VersionTLS12,
@@ -360,6 +423,7 @@ func (d *Dialer) dialTCP(ctx context.Context) (*Conn, error) {
 	}
 	return &Conn{
 		kind:             KindTCP,
+		proto:            tc.ConnectionState().NegotiatedProtocol,
 		handshake:        time.Since(hsStart),
 		send:             func(b []byte) error { return writeAll(tc, b) },
 		recv:             func() ([]byte, error) { return readFrame(tc) },
@@ -402,6 +466,15 @@ type Server struct {
 	KeyFile  string
 	Insecure bool // 自签证书时仍要提供证书；此字段仅记录语义
 
+	// Dcz2 开启 dcz2（RFC 9842 §5）协商：服务端 ALPN 接受 [v2, v1]，
+	// 新客户端会被选到 v2、老客户端（只 offer v1）照旧选中 v1。
+	//
+	// **零值是 false**（零值=只收 v1=今天的行为）：服务端能解 dcz2 是主程序侧
+	// 的事实（cmd/server 的 decodeBody 有 EncDcz2 分支），transport 关不掉它，
+	// 所以这个开关必须由主程序显式打开——隐式 default-on 会让「忘记接线」的服务端
+	// 对外宣称支持 dcz2，然后每个新客户端的请求都死在未知编码上。
+	Dcz2 bool
+
 	tlsCfg *tls.Config
 }
 
@@ -421,7 +494,7 @@ func (s *Server) Listen(ctx context.Context) (<-chan Accept, error) {
 	}
 	s.tlsCfg = &tls.Config{
 		Certificates: []tls.Certificate{cert},
-		NextProtos:   []string{ALPN},
+		NextProtos:   serverProtos(s.Dcz2),
 		MinVersion:   tls.VersionTLS12,
 	}
 
@@ -458,6 +531,7 @@ func (s *Server) Listen(ctx context.Context) (<-chan Accept, error) {
 					go func(st *quic.Stream) {
 						c := &Conn{
 							kind:    KindQUIC,
+							proto:   qc.ConnectionState().TLS.NegotiatedProtocol,
 							send:    func(b []byte) error { return writeAll(st, b) },
 							recv:    func() ([]byte, error) { return readFrame(st) },
 							closeFn: func() error { st.Close(); return nil },
@@ -486,9 +560,16 @@ func (s *Server) Listen(ctx context.Context) (<-chan Accept, error) {
 				return
 			}
 			go func(c net.Conn) {
+				// 协商结果从 TLS 状态取（tls.Listen 交出来的都是 *tls.Conn；
+				// 用带 ok 的断言而不是裸断言：拿不到就当 v1，不让类型意外变成 panic）
+				proto := ""
+				if tc, ok := c.(*tls.Conn); ok {
+					proto = tc.ConnectionState().NegotiatedProtocol
+				}
 				// 与 QUIC 侧对称：用 send/recv 闭包封装，避免半包写入
 				cc := &Conn{
 					kind:    KindTCP,
+					proto:   proto,
 					send:    func(b []byte) error { return writeAll(c, b) },
 					recv:    func() ([]byte, error) { return readFrame(c) },
 					closeFn: c.Close,

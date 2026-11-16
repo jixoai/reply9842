@@ -124,6 +124,14 @@ type app struct {
 	// snap 统计来源。正常运行时就是 runner.Snapshot；测试与自动化截图
 	// 需要在不启监听的前提下喂数据，所以留一个可替换的接口（nil 时走 Runner）。
 	snap func() stats.Agg
+	// 底栏实时带宽：累计计数器的两次采样基线与结果（见 sampleStats）。
+	// 只在主线程（view 构建时）读写，与 app 的其它界面状态同一条约束。
+	ratePrevAt   time.Time // 上一次采样的时刻（零值 = 还没有基线）
+	ratePrevUp   int64     // 上一次采样的 UpWire 累计值
+	ratePrevDown int64     // 上一次采样的 DownWire 累计值
+	upRate       float64   // 最近一次算出的上行字节/秒
+	downRate     float64   // 最近一次算出的下行字节/秒
+	rateValid    bool      // false = 还没有可信读数（底栏显示「—」）
 	// fakeRun / fakeErr 是给测试与自动化截图用的状态注入（nil / nil 时走 Runner）。
 	// 生产路径永远不设这两个字段，所以它们不影响真实行为。
 	fakeRun *bool
@@ -556,6 +564,67 @@ func (a *app) snapshot() stats.Agg {
 	return a.runner.Snapshot()
 }
 
+// rateSampleMinGap 实时带宽两次采样之间的最小间隔。
+//
+// 视图一秒心跳一次（view 里的 c.After(time.Second)），但悬停、点击也会
+// 立刻重画；间隔太小读数会剧烈抖动，太大又会让「实时」变钝。800ms 让速率
+// 基本按每秒一次更新，抖动帧直接复用上一次的读数（不重算、不动基线）。
+const rateSampleMinGap = 800 * time.Millisecond
+
+// rateSampleMaxGap 两次采样相隔超过它就丢弃这次读数。
+//
+// 窗口关着（托盘驻留）、系统休眠时视图不会重建，重新打开的第一帧与上一次
+// 采样可能相隔几分钟——差值除以几分钟得到的是「这段时间的平均」，把它标成
+// 实时速率就是撒谎。丢掉基线、显示「—」，下一个间隔重建。
+const rateSampleMaxGap = 5 * time.Second
+
+// sampleStats 取统计快照，并用累计计数器的差值更新底栏实时带宽。
+//
+// 为什么用差值：Agg 的 UpWire/DownWire 是**累计**计数（从磁盘日志重建，
+// 重启不清零），粒度 ≥1s 的分桶只服务图表。两次刷新的差除以真实流逝的时间，
+// 就是这一秒实际通过隧道的字节数——数据全部来自真实记录，不做插值或伪造。
+//
+// 四种情况不产生读数（rateValid=false，底栏显示「—」）：
+//   - 第一次采样：只建基线，差值的分母（时间差）还不存在
+//   - 计数变小：保留期改小、日志被压实、统计源换了——差值无意义，重置基线
+//   - 采样间隔不足 rateSampleMinGap：连读数都不更新，沿用上一次
+//   - 采样间隔超过 rateSampleMaxGap：那是中断期间的平均值，不能冒充实时速率
+func (a *app) sampleStats() stats.Agg {
+	g := a.snapshot()
+	now := time.Now()
+	switch {
+	case a.ratePrevAt.IsZero():
+		// 第一次采样：建基线，读数从下一个间隔开始才有意义。
+		a.ratePrevAt, a.ratePrevUp, a.ratePrevDown = now, g.UpWire, g.DownWire
+	case now.Sub(a.ratePrevAt) >= rateSampleMinGap:
+		dt := now.Sub(a.ratePrevAt)
+		du, dd := g.UpWire-a.ratePrevUp, g.DownWire-a.ratePrevDown
+		switch {
+		case du < 0 || dd < 0:
+			a.rateValid = false // 计数前移：不是流量，是另一份统计
+		case dt > rateSampleMaxGap:
+			a.rateValid = false // 采样断档：先前的平均值不能冒充实时
+		default:
+			a.upRate = float64(du) / dt.Seconds()
+			a.downRate = float64(dd) / dt.Seconds()
+			// 零流量也是可信读数（0 B/s），不是「没有数据」。
+			a.rateValid = true
+		}
+		a.ratePrevAt, a.ratePrevUp, a.ratePrevDown = now, g.UpWire, g.DownWire
+	}
+	return g
+}
+
+// resetRate 丢弃实时带宽的采样基线，等下一次采样重建。
+//
+// 改保留期/显示区间会触发统计重建，累计计数器可能整体前移（扫到的历史变了），
+// 不丢基线的话那一帧的差值会被算成一波虚假流量——「不伪造数字」在这个边界上
+// 同样成立。
+func (a *app) resetRate() {
+	a.ratePrevAt = time.Time{}
+	a.rateValid = false
+}
+
 // running 是否在运行（可被测试注入）
 func (a *app) running() bool {
 	if a.fakeRun != nil {
@@ -889,6 +958,8 @@ func (a *app) applyTimeSettings() {
 		a.setNotice("统计重建失败："+err.Error(), true)
 		return
 	}
+	// 重建后累计计数器可能整体前移，实时带宽的旧基线作废（见 resetRate）。
+	a.resetRate()
 	a.invalidate()
 }
 

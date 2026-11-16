@@ -53,7 +53,21 @@ const (
 	EncIdentity Encoding = 0 // 明文
 	EncGzip     Encoding = 1
 	EncZstd     Encoding = 2
-	EncDcz      Encoding = 3 // RFC 9842 dcz：40 字节头 + zstd 流（基于 BaseHash 字典）
+	EncDcz      Encoding = 3 // 私有 dcz：40 字节头 + zstd 流（头里是 BLAKE3(BaseHash)，私有字典 ID）
+	// EncDcz2 RFC 9842 §5 正式 dcz：同样 40 字节头（同样 magic）+ zstd 流，
+	// 但头里是 **SHA-256(字典)**（不是 BLAKE3 基线），且 zstd 帧**不写字典 ID**。
+	//
+	// 为什么必须新增枚举值而不是复用 EncDcz：两个格式 magic 相同、头里的哈希
+	// 长度也相同，只有哈希语义不同，**不可能靠嗅探区分**（见 internal/codec/dcz2.go）。
+	// 复用同一个枚举值等于让解码端去猜，猜错就是静默出垃圾或解不开。
+	//
+	// 谁可以发/收（协商结果决定，见 internal/transport 的 ALPN）：
+	//   - EncDcz2 只允许出现在 reply9842/2 连接上（双方都支持 dcz2）；
+	//   - reply9842/1 连接（老客户端或老服务端）沿用 EncDcz，行为与今天一致。
+	//
+	// 新增枚举值本身不改帧布局：Encoding 字段本来就是显式声明，老解码器读到
+	// 未知值会报错而不是误判——这正是我们要的「宁可报错，不可猜错」。
+	EncDcz2 Encoding = 4
 )
 
 func (e Encoding) String() string {
@@ -66,6 +80,8 @@ func (e Encoding) String() string {
 		return "zstd"
 	case EncDcz:
 		return "dcz"
+	case EncDcz2:
+		return "dcz2"
 	}
 	return fmt.Sprintf("enc(%d)", e)
 }
@@ -92,7 +108,7 @@ func (h Hash) String() string { return fmt.Sprintf("%x", h[:8]) }
 type RequestHead struct {
 	Method     string
 	Path       string
-	BaseHash   Hash // dcz 基线；EncDcz 时有效
+	BaseHash   Hash // 基线字典的内部标识（恒为 BLAKE3）；EncDcz/EncDcz2 时有效
 	ResultHash Hash // 应用 delta 后应得到的 body 哈希，用于防静默损坏
 	Encoding   Encoding
 	BodyLen    int64 // 编码后的 body 字节数
@@ -334,17 +350,22 @@ func DecodeResponse(b []byte) (*ResponseHead, []byte, []byte, error) {
 }
 
 // EncodeHeaders / DecodeHeaders 简化的 headers 扁平化：k:v\nk:v\n
-// 只保留首值（多值头在 LLM API 场景极少见），大小写原样保留。
+// 同名头每个值各写一行（DecodeHeaders 会 append 成多值），大小写原样保留。
+//
+// 旧实现只写 vs[0]，任何重复头（Set-Cookie、X-Magpie-Kept-Body、多值 Accept…）
+// 都会在两个方向上静默丢值。2026-11-16 由透传测试钉住后修复。
 func EncodeHeaders(h map[string][]string) []byte {
 	var buf []byte
 	for k, vs := range h {
 		if len(vs) == 0 {
 			continue
 		}
-		buf = append(buf, k...)
-		buf = append(buf, ':')
-		buf = append(buf, vs[0]...)
-		buf = append(buf, '\n')
+		for _, v := range vs {
+			buf = append(buf, k...)
+			buf = append(buf, ':')
+			buf = append(buf, v...)
+			buf = append(buf, '\n')
+		}
 	}
 	return buf
 }

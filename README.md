@@ -56,6 +56,20 @@ Agent → :18899
 Agent 完全无感：只是把 `base_url` 指向 `http://127.0.0.1:18899`。
 隧道两端都是有状态的压缩器——**上一轮的请求体就是这一轮的字典**。
 
+**两种线格式（同一 magic，靠协商区分）**。上行 delta 的两种头都是 40 字节、magic
+完全相同，因此**不能靠嗅探分辨**，只能由连接协商显式声明：
+
+| 连接（ALPN） | 上行编码 | 40 字节头里的哈希 | zstd 字典 ID |
+|---|---|---|---|
+| `reply9842/2`（新） | `dcz2`（RFC 9842 §5） | **SHA-256(字典)** | 不写（ID 0） |
+| `reply9842/1`（旧） | `dcz`（私有变体） | BLAKE3(基线) | 私有 `RF98` |
+
+版本在 TLS/QUIC 的 ALPN 握手里定：新客户端同时 offer `[reply9842/2, reply9842/1]`，
+新服务端选 `/2`、老服务端只会选中 `/1`（**自动降级，不报错**）；老客户端只 offer `/1`，
+新服务端照常接受（老客户端行为一字不变）。服务端 `-dcz2=false` 可一键回到只收 `/1` 的
+旧行为。两种格式的内部寻址始终是 BLAKE3（store 的 key 不变，缓存不冷启动），SHA-256
+只出现在 dcz2 的线格式头里。
+
 ## 实测效果
 
 ### 14 条连续真实请求（生产日志）
@@ -474,7 +488,7 @@ tools/probe-proxy/    测上游各阶段耗时的透明流式代理（排障用�
 
 | 规范 | 用途 | 采纳程度 |
 |---|---|---|
-| RFC 9842 (Compression Dictionary Transport) | dcz 线格式、内容哈希协商 | 线格式一致；请求方向为自研扩展 |
+| RFC 9842 (Compression Dictionary Transport) | dcz2 线格式、内容哈希协商 | dcz2 与 §5 逐字节一致（`reply9842/2` 连接）；`reply9842/1` 为私有变体（BLAKE3 头 + 私有字典 ID） |
 | RFC 8878 (Zstandard) | raw content dictionary | 直接用 |
 | RFC 9530 (Repr-Digest) | 表示身份摘要 | 语义参考 |
 | RFC 7694 (Client-Initiated Content-Encoding) | 请求方向编码协商 | 语义参考 |

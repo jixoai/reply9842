@@ -119,13 +119,17 @@ func TestViewBuilds(t *testing.T) {
 // 看起来像坏掉的进度条；「0×」又会被读成「压缩率是 0」）。
 //
 // 这是本轮改版最重要的一条视觉约束，用文本 + 像素双重断言守住。
+//
+// 断「独立成元素的占位巨号」而不是 HasText：底栏有两处**长文本内嵌**的「—」
+// （未知的实际传输 / 未建立基线的实时带宽，2026-11-16 起的明确要求），
+// 它们不是 hero 巨号；巨号是独占一行、文本恰为「—」/「0×」的元素，精确匹配能抓住。
 func TestIdleHasNoHeroNumber(t *testing.T) {
 	a := newTestApp(t)
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
-	for _, banned := range []string{"—", "0×", "0.0×"} {
-		if tt.HasText(banned) {
-			t.Errorf("空态出现了占位巨号 %q：%q", banned, tt.Texts())
+	for _, s := range tt.Texts() {
+		if s == "—" || s == "0×" || s == "0.0×" {
+			t.Errorf("空态出现了占位巨号 %q：%q", s, tt.Texts())
 		}
 	}
 	if tt.HasText("请求数") {
@@ -260,8 +264,9 @@ func TestWindowCannotExceedRetain(t *testing.T) {
 
 // TestChartSummaryFollowsWindow 图下那句话的窗口必须来自快照。
 //
-// 不要求桶粒度后缀：一行装不下四段（会被省略号截断），设计上保留
-// 「请求数」而不是「每桶多久」——桶粒度可由窗口长度除以 30 推出。
+// 不带桶粒度后缀：一行装不下四段（440 窗口下会被省略号截断，见
+// TestSummaryLinesFitNarrowWindow），所以保留「请求数」而不是「每桶多久」——
+// 桶粒度等于窗口 / stats.SeriesBuckets，是可推的量。
 func TestChartSummaryFollowsWindow(t *testing.T) {
 	a := newTestApp(t)
 	agg := stats.Agg{
@@ -536,6 +541,9 @@ func TestSnapshotFrames(t *testing.T) {
 			setRunning(a, true)
 			a.agg = stats.Agg{Requests: 1204, UpRaw: 1400 * 1024, UpWire: 70 * 1024,
 				UpRatio: 70.0 / 1400, P50Ms: 28}
+			// 底栏显示的是「实际生效的传输」= 最近一条请求记录的 transport；
+			// 假数据也要把这格填上，否则截图展示的是「—」（那是无数据态）。
+			a.agg.LastTransport = "quic"
 			a.agg.Series = fakeSeries()
 			a.snap = func() stats.Agg { return a.agg }
 			a.transport = "quic"
@@ -1140,12 +1148,162 @@ func TestFooterHasNoCopyEntry(t *testing.T) {
 	}
 }
 
-// TestTrafficSummaryOneLine 摘要必须单行，且延迟的三个读数都在。
+// TestFooterEffectiveTransport 底栏显示**实际生效**的传输（最近一条请求记录），
+// 而不是设置里的「自动选择传输」——意图不是事实。
+func TestFooterEffectiveTransport(t *testing.T) {
+	// 有记录：显示最近一次的传输（大写）。a.transport 故意设成 "auto"，
+	// 证明显示值来自记录而不是设置。
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.transport = "auto"
+	a.agg = stats.Agg{Requests: 3, UpRaw: 3000, UpWire: 30, RetainSec: 86400, LastTransport: "quic"}
+	a.snap = func() stats.Agg { return a.agg }
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if !tt.HasText("运行中") || !tt.HasText("QUIC") {
+		t.Errorf("底栏应显示实际传输 QUIC：%q", tt.Texts())
+	}
+	if tt.HasText("自动选择传输") {
+		t.Errorf("「自动选择传输」应已从底栏移除：%q", tt.Texts())
+	}
+
+	// 无记录：显示「—」，且不回退到设置值（设置了 quic 也不显示）
+	b := newTestApp(t)
+	b.transport = "quic"
+	tt2 := ui.NewTester(b.view, defaultWinWidth, defaultWinHeight)
+	if !tt2.HasText("未运行 · —") {
+		t.Errorf("无记录时底栏应显示「未运行 · —」：%q", tt2.Texts())
+	}
+	// 设置页仍保留「自动 / QUIC / TCP」选择器（用户的意图在设置里表达）
+	b.tab = tabSettings
+	tt2.Frame()
+	if !tt2.HasText("传输方式") {
+		t.Errorf("设置页的传输方式选择器不该被删掉：%q", tt2.Texts())
+	}
+}
+
+// TestFooterRateLabel 底栏实时带宽的显示形态：无基线是「↑ — · ↓ —」，
+// 有读数走 humanRate（与别处同一个字节换算）。
+func TestFooterRateLabel(t *testing.T) {
+	a := &app{}
+	if got := a.rateLabel(); got != "↑ — · ↓ —" {
+		t.Errorf("无基线时 rateLabel = %q，期望 ↑ — · ↓ —", got)
+	}
+	a.rateValid, a.upRate, a.downRate = true, 12345, 456*1024
+	if got := a.rateLabel(); !strings.Contains(got, "↑ 12.1 KB/s") || !strings.Contains(got, "↓ 456.0 KB/s") {
+		t.Errorf("rateLabel = %q，期望含 ↑ 12.1 KB/s 与 ↓ 456.0 KB/s", got)
+	}
+}
+
+// TestFooterFitsNarrowWindow 底栏在最小窗口宽度（440）下不溢出：
+// 「状态 · 实际传输」与「↑ ↓ 实时带宽」两段都要完整落在窗口里，且不重叠。
+// 用偏宽的模拟读数（258 KB/s / 1.4 MB/s）压测——底栏从两段变三段后，
+// 空间余量是这个改动的核心取舍。
+func TestFooterFitsNarrowWindow(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{Requests: 9, UpRaw: 9000, UpWire: 90, RetainSec: 86400, LastTransport: "quic"}
+	a.snap = func() stats.Agg { return a.agg }
+	a.rateValid, a.upRate, a.downRate = true, 258*1024+128, 1.4*1024*1024
+
+	tt := ui.NewTester(a.view, 440, 400)
+	tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
+
+	head, ok := tt.Find("运行中 · QUIC")
+	if !ok {
+		t.Fatalf("底栏状态段缺失：%q", tt.Texts())
+	}
+	rate, ok := tt.Find(a.rateLabel())
+	if !ok {
+		t.Fatalf("底栏带宽段缺失（rateLabel=%q）：%q", a.rateLabel(), tt.Texts())
+	}
+	if head.X+head.W > rate.X+0.5 {
+		t.Errorf("状态段右缘 %.1f 压住带宽段左缘 %.1f", head.X+head.W, rate.X)
+	}
+	if rate.X+rate.W > 440-8 {
+		t.Errorf("带宽段右缘 %.1f 超出窗口（440）", rate.X+rate.W)
+	}
+	if rate.W < 90 {
+		t.Errorf("带宽段宽度只有 %.1fpx，可能被截断：%q", rate.W, a.rateLabel())
+	}
+}
+
+// TestHumanRate 实时带宽的字节口径（复用 humanBytes，负数按 0）。
+func TestHumanRate(t *testing.T) {
+	cases := []struct {
+		in   float64
+		want string
+	}{
+		{0, "0 B/s"},
+		{512, "512 B/s"},
+		{12345, "12.1 KB/s"},
+		{1048576, "1.0 MB/s"},
+		{-5, "0 B/s"},
+	}
+	for _, tc := range cases {
+		if got := humanRate(tc.in); got != tc.want {
+			t.Errorf("humanRate(%v) = %q，期望 %q", tc.in, got, tc.want)
+		}
+	}
+}
+
+// TestSampleStatsRates 实时带宽 = 累计计数的差值 / 时间差：第一次采样只建
+// 基线（没有读数）；计数变小（统计重建/清零）时回到「—」，不把前移算成流量。
+func TestSampleStatsRates(t *testing.T) {
+	a := newTestApp(t)
+	agg := stats.Agg{UpWire: 1000, DownWire: 2000}
+	a.snap = func() stats.Agg { return agg }
+
+	// 第一次：只建基线，没有读数（除零防线）
+	a.sampleStats()
+	if a.rateValid {
+		t.Fatalf("第一次采样不该有读数")
+	}
+	if a.ratePrevAt.IsZero() {
+		t.Fatalf("第一次采样没有建基线")
+	}
+
+	// 拨回 2 秒再采样：+100/+200 字节 → 约 50/100 B/s
+	a.ratePrevAt = a.ratePrevAt.Add(-2 * time.Second)
+	agg = stats.Agg{UpWire: 1100, DownWire: 2200}
+	a.sampleStats()
+	if !a.rateValid {
+		t.Fatalf("第二次采样应有读数")
+	}
+	if a.upRate < 40 || a.upRate > 60 || a.downRate < 80 || a.downRate > 120 {
+		t.Errorf("速率 = %.1f/%.1f B/s，期望约 50/100（100/200 字节 in 2s）", a.upRate, a.downRate)
+	}
+
+	// 计数变小：视为重建/清零，回到「—」
+	a.ratePrevAt = a.ratePrevAt.Add(-2 * time.Second)
+	agg = stats.Agg{UpWire: 10, DownWire: 20}
+	a.sampleStats()
+	if a.rateValid {
+		t.Fatalf("计数变小后 rateValid 应为 false")
+	}
+
+	// 采样断档（窗口关着/休眠）：中断期间的平均值不能冒充实时速率
+	a.ratePrevAt = a.ratePrevAt.Add(-30 * time.Second)
+	agg = stats.Agg{UpWire: 5000, DownWire: 9000}
+	a.sampleStats()
+	if a.rateValid {
+		t.Fatalf("采样间隔超过上限后 rateValid 应为 false")
+	}
+
+	// resetRate 丢基线（改保留期的路径）
+	a.rateValid = true
+	a.resetRate()
+	if a.rateValid || !a.ratePrevAt.IsZero() {
+		t.Errorf("resetRate 未清空基线：valid=%v prevAt=%v", a.rateValid, a.ratePrevAt)
+	}
+}
+
+// TestTrafficSummaryTwoLines 流量摘要按语义拆成两行：第一行窗口与实发量、
+// 第二行延迟三个读数；两行各自单独成行（不折行）。
 //
-// 守的是一个实际缺陷：「握手 N 次 · 均 X ms」太长，560 宽时最后一个
-// 单位词被折到第二行、独占一个字。现在改成「当前/峰值/均值」，并用
-// SingleLine 兜底；这里同时断言文案字段与渲染高度（单行约 13px）。
-func TestTrafficSummaryOneLine(t *testing.T) {
+// 守的是一个实际缺陷（2026-11-16 视觉复核）：原来挤成一行，560 宽 + 有数据时
+// 尾巴被省略号吃掉（「…全程复用连…」），440 宽必然截断。拆行后的宽度上界由
+// TestSummaryLinesFitNarrowWindow 统一守。
+func TestTrafficSummaryTwoLines(t *testing.T) {
 	a := newTestApp(t)
 	setRunning(a, true)
 	a.agg = stats.Agg{
@@ -1160,24 +1318,115 @@ func TestTrafficSummaryOneLine(t *testing.T) {
 	}
 	a.snap = func() stats.Agg { return a.agg }
 
-	text := a.trafficSummary(a.agg)
+	l1, l2 := a.trafficSummary(a.agg)
+	if !strings.Contains(l1, "最近 1 小时") || !strings.Contains(l1, "↑") || !strings.Contains(l1, "↓") {
+		t.Errorf("第一行 = %q，应为「窗口 · ↑实发 · ↓下行」", l1)
+	}
 	for _, want := range []string{"延迟 当前", "/ 峰值", "/ 均值"} {
-		if !strings.Contains(text, want) {
-			t.Errorf("trafficSummary = %q，缺少 %q", text, want)
+		if !strings.Contains(l2, want) {
+			t.Errorf("第二行 = %q，缺少 %q", l2, want)
 		}
 	}
 	// 旧格式的「 · 均 2449 ms」是折行的元凶：不允许它回来。
-	if strings.Contains(text, " 均 ") {
-		t.Errorf("trafficSummary = %q，仍带「 均 X ms」尾巴", text)
+	if strings.Contains(l1+l2, " 均 ") {
+		t.Errorf("摘要仍带「 均 X ms」尾巴：%q", l1+l2)
 	}
 
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
-	r, ok := tt.Find(text)
-	if !ok {
-		t.Fatalf("找不到摘要文本：%q", tt.Texts())
+	for _, line := range []string{l1, l2} {
+		r, ok := tt.Find(line)
+		if !ok {
+			t.Fatalf("找不到摘要行 %q：%q", line, tt.Texts())
+		}
+		if r.H > 16 {
+			t.Errorf("摘要行高度 %.1f（>16px）说明折成了多行：%q", r.H, line)
+		}
 	}
-	if r.H > 16 {
-		t.Errorf("摘要高度 %.1f（>16px）说明折成了多行：%q", r.H, text)
+}
+
+// TestSummaryLinesFitNarrowWindow 440/560 宽 + 有数据时，两张卡的每一行摘要
+// 都必须完整显示（不许省略号）。
+//
+// 守的缺陷（2026-11-16 视觉复核）：「流量与延迟」的摘要行在 560 宽下右缘
+// x527 贴到内容区 x529，尾巴被吃成「…全程复用连…」；440 宽必然更糟。
+//
+// 判据：MeasureText 的自然宽度（×1.01 + 4px，吸收 tnum 与抗锯齿的实测差
+// 295.45 vs 292.75）必须不超过该行元素的宽度——Text 在卡片列里横向拉满，
+// 元素的 W 就是卡片内容宽。fixture 取最长的合理读数：30 天保留 / 24 小时
+// 窗口 / 六位请求数 / 近 1 GB 体积 / 99.9 s 延迟 / 非零握手。
+func TestSummaryLinesFitNarrowWindow(t *testing.T) {
+	agg := stats.Agg{
+		Requests:      12_847,
+		UpRaw:         999_000_000,
+		UpWire:        12_000_000,
+		DownRaw:       999_000_000,
+		DownWire:      999_000_000,
+		P50Ms:         99_900,
+		RetainSec:     30 * 86400,
+		WindowSec:     24 * 3600,
+		BucketSec:     48 * 60,
+		LastTransport: "quic",
+	}
+	agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	agg.Series[0] = stats.Bucket{
+		UpRaw: agg.UpRaw, UpWire: agg.UpWire, DownRaw: agg.DownRaw, DownWire: agg.DownWire,
+		Count: agg.Requests, MsSum: agg.Requests * 99_900,
+		HsCount: agg.Requests, HsSum: agg.Requests * 2_000,
+	}
+
+	for _, width := range []int{440, 560} {
+		a := newTestApp(t)
+		setRunning(a, true)
+		a.agg = agg
+		a.snap = func() stats.Agg { return agg }
+
+		l1, l2 := a.trafficSummary(agg)
+		lines := []string{a.retentionStatsLine(), a.chartSummary(agg), l1, l2}
+		var natural []float32
+		tt := ui.NewTester(func(c *ui.Context) {
+			a.view(c)
+			natural = natural[:0]
+			for _, s := range lines {
+				w, _ := c.MeasureText(0, ui.Span{Text: s, Size: 10.5})
+				natural = append(natural, w)
+			}
+		}, width, defaultWinHeight)
+		tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
+
+		for i, line := range lines {
+			r, ok := tt.Find(line)
+			if !ok {
+				t.Fatalf("w=%d: 找不到摘要行 %q：%q", width, line, tt.Texts())
+			}
+			if limit := natural[i]*1.01 + 4; limit > r.W {
+				t.Errorf("w=%d: 摘要行自然宽度 %.1f（容差后 %.1f）超过可用宽 %.1f，会被省略号截断：%q",
+					width, natural[i], limit, r.W, line)
+			}
+		}
+	}
+}
+
+// TestHumanBytesAxis 同一根纵轴的两档刻度必须共用峰值的量纲。
+//
+// 守的缺陷（2026-11-16 视觉复核）：golden 帧出现「2.0 MB / 1001.0 KB」——
+// humanBytes 各自独立选单位，在 1 MB 边界上两档混排两种单位。
+func TestHumanBytesAxis(t *testing.T) {
+	cases := []struct {
+		peak      int64
+		top, half string
+	}{
+		{2_050_000, "2.0 MB", "1.0 MB"},   // 旧实现 half 是 "1001.0 KB"
+		{800_000, "781.2 KB", "390.6 KB"}, // 与 TestChartScaleBarsAndTicks 同值
+		{13_000_000, "12.4 MB", "6.2 MB"},
+		{500_000, "488.3 KB", "244.1 KB"},
+		{1500, "1.5 KB", "0.7 KB"}, // 小流量：半值不退回 B（同量纲）
+	}
+	for _, tc := range cases {
+		top, half := humanBytesAxis(tc.peak)
+		if top != tc.top || half != tc.half {
+			t.Errorf("humanBytesAxis(%d) = (%q, %q)，期望 (%q, %q)",
+				tc.peak, top, half, tc.top, tc.half)
+		}
 	}
 }
 
@@ -1270,28 +1519,6 @@ func barTopRow(img *image.RGBA, x0, x1, y0, y1 int) int {
 	return -1
 }
 
-// dashRow 找参考虚线所在行：虚线段 3px 实 3px 空，一行里有几十段同色像素，
-// 覆盖行宽约一半；取 [y0,y1) 里「同一颜色重复次数最多」的行。要求覆盖率在
-// 30%..65%，把整行同色的卡片边/基线（≈100%）排除掉。
-func dashRow(img *image.RGBA, x0, x1, y0, y1 int) int {
-	width := x1 - x0
-	lo, hi := width*3/10, width*65/100
-	best, bestN := -1, 0
-	for y := y0; y < y1; y++ {
-		count := map[color.RGBA]int{}
-		for x := x0; x < x1; x++ {
-			r, g, b, a := img.At(x, y).RGBA()
-			count[color.RGBA{uint8(r >> 8), uint8(g >> 8), uint8(b >> 8), uint8(a >> 8)}]++
-		}
-		for _, n := range count {
-			if n >= lo && n <= hi && n > bestN {
-				best, bestN = y, n
-			}
-		}
-	}
-	return best
-}
-
 // inkCenterRow [y0,y1) 里某色文字的最上一组连续墨迹行的中心（-1 表示没找到）。
 func inkCenterRow(img *image.RGBA, x0, x1, y0, y1 int, rgb [3]uint8, tol int) float64 {
 	lo, hi := -1, -1
@@ -1318,26 +1545,32 @@ func inkCenterRow(img *image.RGBA, x0, x1, y0, y1 int, rgb [3]uint8, tol int) fl
 	return float64(lo+hi) / 2
 }
 
-// TestChartScaleBarsAndTicks 两张图的柱、参考虚线、刻度标签共用同一个 scale。
+// TestChartScaleBarsAndTicks 两张图的柱、刻度标签共用同一个 scale；第一张图的
+// 柱高表达**体积**（2026-11-16 改版的核心契约）。
 //
-// 三条断言对应上一轮独立像素复核的三条 blocker：
-//  1. 第一图：100% 压缩的柱顶与 100% 虚线在同一像素行（≤1px）。上一版柱高
-//     用 96% 可用高度、虚线用整高，虚线从每根柱顶下方 15px 处横穿。
-//  2. 第二图：峰值柱顶不高于最上刻度（≥0），且落在刻度上（≤2px）。
-//  3. 两个绘图区等高（由刻度反算，≤1px）。
+// 五条断言，每条都对应一个真实修过的缺陷：
+//  1. 第一图：峰值柱顶落在最上刻度中心之下 2..4px（与第二图同一条约定——
+//     柱顶先于刻度收住，图才有上边框）
+//  2. 第一图：柱高按体积——raw 只有峰值 1/4 的桶，柱高正好约 1/4。旧版柱高
+//     画的是压缩率（真实负载恒在 98-99.9%），所有柱几乎一样高；这条直接盯住它
+//  3. 第一图：蓝段贴底、随 UpWire 真实伸缩——50% 实发的桶蓝段与绿段相当，
+//     而实发 1% 的峰值桶蓝段只剩 1-3px（旧版恒为 3px 常量，即「蓝块永远不变」）
+//  4. 第一图：wire=0 的桶没有蓝段（不许用最小高度伪造发送）
+//  5. 两图绘图区等高（由各自刻度行距反算，≤1px）——摘要区同为两行高的布局前提
 func TestChartScaleBarsAndTicks(t *testing.T) {
 	a := newTestApp(t)
 	setRunning(a, true)
 	a.agg = stats.Agg{Requests: 40, WindowSec: 1800, BucketSec: 60}
 	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
-	// 桶 0：wire=0 → 压缩率 100%，柱顶必须压在 100% 虚线上。
-	a.agg.Series[0] = stats.Bucket{UpRaw: 800_000, UpWire: 0, DownWire: 60_000, Count: 1, MsSum: 120}
-	for i := 1; i < 12; i++ {
-		a.agg.Series[i] = stats.Bucket{
-			UpRaw: 800_000, UpWire: int64(20_000 * i), DownWire: int64(30_000 * i),
-			Count: 1, MsSum: int64(400 * i),
-		}
-	}
+	// 四个桶拉开体积与实发比例：
+	//   桶 2  峰值 800KB、实发 1%   → 最高柱，蓝段只剩存在性
+	//   桶 5  1/4 体积、实发 1%     → 柱高应为峰值的 1/4
+	//   桶 8  一半体积、实发 50%    → 蓝段 ≈ 绿段
+	//   桶 11 1/8 体积、实发 0      → 纯绿，没有蓝段
+	a.agg.Series[2] = stats.Bucket{UpRaw: 800_000, UpWire: 8_000, Count: 1, MsSum: 120}
+	a.agg.Series[5] = stats.Bucket{UpRaw: 200_000, UpWire: 2_000, Count: 1, MsSum: 130}
+	a.agg.Series[8] = stats.Bucket{UpRaw: 400_000, UpWire: 200_000, Count: 1, MsSum: 140}
+	a.agg.Series[11] = stats.Bucket{UpRaw: 100_000, UpWire: 0, Count: 1, MsSum: 150}
 	a.snap = func() stats.Agg { return a.agg }
 
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
@@ -1346,32 +1579,102 @@ func TestChartScaleBarsAndTicks(t *testing.T) {
 		t.Fatal("Image() 返回 nil")
 	}
 
+	// 百分数刻度与 100% 参考虚线已随「柱高=压缩率」删除：字节刻度里没有
+	// 「100%」这个概念，而峰值参考线与最上刻度、峰值柱顶三者在像素上重合。
+	for _, gone := range []string{"100%", "75%", "50%", "25%"} {
+		if tt.HasText(gone) {
+			t.Errorf("第一张图仍残留百分数刻度 %q（应为字节刻度）：%q", gone, tt.Texts())
+		}
+	}
+
 	// 绘图区横向范围：左边是刻度列 + 间距，右边到卡片右边距。
 	// 右缘跟着窗口宽度走（560 宽时是 529），写死会在改尺寸后量到卡片外。
 	const x0 = 84
 	x1 := defaultWinWidth - 31
 
-	// ---- 1. 第一图的柱顶 vs 100% 虚线 ----
-	r100, ok := tt.Find("100%")
+	// 纵向扫描的下界取「流量与延迟」标题：两张图共用同一组系列色，往下扫
+	// 会把第二张图的柱子也当成第一张图的。
+	lower, ok := tt.Find("流量与延迟")
 	if !ok {
-		t.Fatalf("找不到 100%% 刻度：%q", tt.Texts())
+		t.Fatalf("找不到第二张图标题：%q", tt.Texts())
 	}
-	yTop := int(r100.Y)
-	if yTop < 40 || yTop > 500 {
-		t.Fatalf("100%% 刻度 y=%.1f 不合理", r100.Y)
+	yBot := int(lower.Y) - 4
+
+	peakTick, ok := tt.Find(humanBytes(800_000))
+	if !ok {
+		t.Fatalf("找不到峰值刻度 %q：%q", humanBytes(800_000), tt.Texts())
 	}
-	dash := dashRow(img, x0, x1, yTop-4, yTop+12)
-	bar := barTopRow(img, x0, x1, yTop-4, yTop+40)
-	if dash < 0 || bar < 0 {
-		t.Fatalf("第一图找不到虚线(%d)或柱顶(%d)", dash, bar)
+	yTop := int(peakTick.Y) - 4
+
+	// ---- 1. 峰值柱顶 vs 最上刻度 ----
+	tick := inkCenterRow(img, 20, 84, int(peakTick.Y)-6, int(peakTick.Y)+8,
+		[3]uint8{0x94, 0x94, 0x94}, 40)
+	if tick < 0 {
+		t.Fatalf("找不到峰值刻度文字：%q", tt.Texts())
 	}
-	if d := absInt(bar - dash); d > 1 {
-		t.Errorf("柱顶 y=%d 与 100%% 虚线 y=%d 相差 %dpx（要求 ≤1）", bar, dash, d)
+	peakTop := barTopRow(img, x0, x1, yTop, yBot)
+	if peakTop < 0 {
+		t.Fatalf("第一张图找不到柱子")
+	}
+	if d := float64(peakTop) - tick; d < 2 || d > 4 {
+		t.Errorf("峰值柱顶 y=%d、最上刻度 y=%.1f，差 %.1fpx（要求 2..4：柱顶先于刻度收住）",
+			peakTop, tick, d)
 	} else {
-		t.Logf("第一图：柱顶 y=%d / 100%% 虚线 y=%d（差 %dpx）", bar, dash, d)
+		t.Logf("第一图：峰值柱顶 y=%d / 最上刻度 y=%.1f（差 %.1fpx）", peakTop, tick, d)
 	}
 
-	// ---- 2/3. 第二图：峰值柱顶 vs 最上刻度；两图等高 ----
+	// 扫出四根柱的列段（左 → 右 = 桶 2 / 5 / 8 / 11）
+	segs := barColumns(img, x0, x1, yTop, yBot)
+	if len(segs) != 4 {
+		t.Fatalf("扫到 %d 根柱，期望 4（桶 2/5/8/11）：%v", len(segs), segs)
+	}
+	// 基线：所有柱都坐在它上面 → 最下一行柱色像素 + 1
+	base := barBottomRow(img, x0, x1, yTop, yBot)
+	if base < 0 {
+		t.Fatalf("找不到柱底")
+	}
+	base++
+	barHeight := func(seg [2]int) float64 {
+		return float64(base - barTopRow(img, seg[0], seg[1]+1, yTop, base))
+	}
+	blueHeight := func(seg [2]int) float64 {
+		top := colorTopRow(img, seg[0], seg[1]+1, yTop, base, rgbUpBar, 26)
+		if top < 0 {
+			return 0
+		}
+		return float64(base - top)
+	}
+
+	// ---- 2. 柱高按体积 ----
+	hPeak, hQuarter := barHeight(segs[0]), barHeight(segs[1])
+	if d := hPeak/4 - hQuarter; d < -2.5 || d > 2.5 {
+		t.Errorf("体积 1/4 的桶柱高 %.1fpx，峰值柱高 %.1fpx 的 1/4 是 %.1fpx（差 %.1f）：柱高不是体积",
+			hQuarter, hPeak, hPeak/4, d)
+	} else {
+		t.Logf("柱高：峰值 %.1fpx / 1/4 体积桶 %.1fpx", hPeak, hQuarter)
+	}
+
+	// ---- 3. 蓝段贴底、随 UpWire 真实伸缩 ----
+	bPeak, bHalf, bZero := blueHeight(segs[0]), blueHeight(segs[2]), blueHeight(segs[3])
+	if bPeak <= 0 || bPeak > 5 {
+		t.Errorf("峰值桶（实发 1%%）蓝段 %.0fpx，应只有 1-3px（存在性、按比例算）", bPeak)
+	}
+	if bHalf-bPeak < 20 {
+		t.Errorf("50%% 实发的桶蓝段 %.0fpx vs 峰值桶 %.0fpx：蓝段没有随流量真实变化", bHalf, bPeak)
+	}
+	if bZero != 0 {
+		t.Errorf("wire=0 的桶出现蓝段（%.0fpx）：不许用最小高度伪造发送", bZero)
+	}
+	// 蓝段在最底：实发 >0 的柱，最下一行像素必须是蓝的
+	for i := 0; i < 3; i++ {
+		bottom := barBottomRow(img, segs[i][0], segs[i][1]+1, yTop, base)
+		if bottom < 0 || !rowHasColor(img, bottom, segs[i][0], segs[i][1]+1, rgbUpBar, 30) {
+			t.Errorf("第 %d 根柱（实发>0）底行不是蓝段：蓝段必须贴底", i)
+		}
+	}
+	t.Logf("蓝段高度：峰值桶 %.0fpx / 50%% 实发桶 %.0fpx", bPeak, bHalf)
+
+	// ---- 4. 第二图：峰值柱顶 vs 最上刻度（原契约不变）----
 	a2 := newTestApp(t)
 	setRunning(a2, true)
 	a2.agg = stats.Agg{Requests: 40, WindowSec: 1800, BucketSec: 60}
@@ -1401,36 +1704,71 @@ func TestChartScaleBarsAndTicks(t *testing.T) {
 	if peak < 0 {
 		t.Fatal("第二图找不到峰值柱")
 	}
-	tick := inkCenterRow(img2, 20, 84, int(rt.Y)-6, int(rt.Y)+8,
+	tick2 := inkCenterRow(img2, 20, 84, int(rt.Y)-6, int(rt.Y)+8,
 		[3]uint8{0x94, 0x94, 0x94}, 40)
-	if tick < 0 {
+	if tick2 < 0 {
 		t.Fatalf("找不到峰值刻度文字")
 	}
-	if d := float64(peak) - tick; d < 2 || d > 4 {
+	if d := float64(peak) - tick2; d < 2 || d > 4 {
 		t.Errorf("峰值柱顶 y=%d、最上刻度 y=%.1f，差 %.1fpx（要求 2..4：柱顶必须在刻度"+
 			"中心之下留出 2-3px 的顶部余量，齐平会读成「柱顶顶到坐标系上沿」）",
-			peak, tick, d)
+			peak, tick2, d)
 	} else {
-		t.Logf("第二图：峰值柱顶 y=%d / 最上刻度 y=%.1f（差 %.1fpx）", peak, tick, d)
+		t.Logf("第二图：峰值柱顶 y=%d / 最上刻度 y=%.1f（差 %.1fpx）", peak, tick2, d)
 	}
 
-	// 等高：第一图由 100%/25% 两档反算（间隔 0.75H），第二图由峰值/半峰值
-	// 反算（间隔 0.5H）。用刻度行距而不是绝对 y，避免标签居中带来的偏移。
-	r25, ok := tt.Find("25%")
+	// ---- 5. 两图绘图区等高 ----
+	// 两张图各自用「峰值/半峰值」两档刻度反算（间隔 0.5H）：用刻度行距而不是
+	// 绝对 y，避免标签居中带来的偏移。
+	half1, ok := tt.Find(humanBytes(800_000 / 2))
 	if !ok {
-		t.Fatalf("找不到 25%% 刻度")
+		t.Fatalf("找不到第一图的半峰值刻度 %q：%q", humanBytes(800_000/2), tt.Texts())
 	}
-	h1 := (r25.Y - r100.Y) / 0.75
-	half, ok := tt2.Find(humanBytes(13_000_000 / 2))
+	h1 := (half1.Y - peakTick.Y) / 0.5
+	half2, ok := tt2.Find(humanBytes(13_000_000 / 2))
 	if !ok {
 		t.Fatalf("找不到半峰值刻度 %q：%q", humanBytes(13_000_000/2), tt2.Texts())
 	}
-	h2 := (half.Y - rt.Y) / 0.5
+	h2 := (half2.Y - rt.Y) / 0.5
 	if d := float64(h1 - h2); d < -1 || d > 1 {
 		t.Errorf("两个绘图区高度不等：%.1f vs %.1f（差 %.1fpx）", h1, h2, d)
 	} else {
 		t.Logf("绘图区高度：第一图 %.1fpx / 第二图 %.1fpx", h1, h2)
 	}
+}
+
+// barBottomRow [y0,y1) × [x0,x1) 里最下面一行柱色像素（-1 表示没有）。
+func barBottomRow(img *image.RGBA, x0, x1, y0, y1 int) int {
+	for y := y1 - 1; y >= y0; y-- {
+		for x := x0; x < x1; x++ {
+			if nearRGB(img.At(x, y), rgbDownBar, 20) || nearRGB(img.At(x, y), rgbUpBar, 20) {
+				return y
+			}
+		}
+	}
+	return -1
+}
+
+// colorTopRow [y0,y1) × [x0,x1) 里最上面一行指定柱色的像素（-1 表示没有）。
+func colorTopRow(img *image.RGBA, x0, x1, y0, y1 int, rgb [3]uint8, tol int) int {
+	for y := y0; y < y1; y++ {
+		for x := x0; x < x1; x++ {
+			if nearRGB(img.At(x, y), rgb, tol) {
+				return y
+			}
+		}
+	}
+	return -1
+}
+
+// rowHasColor 一行 y × [x0,x1) 里是否有指定颜色像素。
+func rowHasColor(img *image.RGBA, y, x0, x1 int, rgb [3]uint8, tol int) bool {
+	for x := x0; x < x1; x++ {
+		if nearRGB(img.At(x, y), rgb, tol) {
+			return true
+		}
+	}
+	return false
 }
 
 // barColumns 扫出连续的「有柱色」列，返回 [left, right] 段（含端点）。
@@ -1497,7 +1835,10 @@ func TestLatencyVerticesOnBarCenters(t *testing.T) {
 	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
 	for i := range a.agg.Series {
 		b := stats.Bucket{
-			UpRaw: 1_000_000, UpWire: 200_000, DownWire: 300_000,
+			// UpRaw 取 1.5M：第一张图的刻度（峰值 1.4 MB / 半峰值 0.7 MB，
+			// humanBytesAxis 同量纲）与第二张图的峰值刻度（humanBytes(500000)
+			// =「488.3 KB」）不同串——否则 tt.Find 会先命中上面那张图的刻度。
+			UpRaw: 1_500_000, UpWire: 200_000, DownWire: 300_000,
 			Count: 2,
 		}
 		// 锯齿：偶数桶慢、奇数桶快 → 每个桶都是折线的拐点。
@@ -1609,7 +1950,10 @@ func TestLatencySkipsZeroMsBuckets(t *testing.T) {
 	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
 	var maxTotal int64
 	put := func(i int, msSum int64) {
-		b := stats.Bucket{UpRaw: 1_000_000, UpWire: 200_000, DownWire: 300_000,
+		// UpRaw 取 1.5M：把第一张图的刻度（humanBytesAxis → 1.4 MB / 0.7 MB）
+		// 与第二张图的峰值刻度（humanBytes(500000) =「488.3 KB」）错开，
+		// tt.Find 才能唯一命中。
+		b := stats.Bucket{UpRaw: 1_500_000, UpWire: 200_000, DownWire: 300_000,
 			Count: 2, MsSum: msSum}
 		a.agg.Series[i] = b
 		if v := b.UpWire + b.DownWire; v > maxTotal {

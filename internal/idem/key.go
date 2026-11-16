@@ -24,7 +24,7 @@ import (
 //
 // 组成（顺序敏感）：
 //
-//	callerKeyId || method || path || sortedHeaderSubset || body
+//	callerKeyId || method || path || rawQuery || sortedHeaderSubset || body
 //
 // 只取影响模型输出的请求头（content-type / anthropic-version 等），
 // 忽略 authorization（已由 callerKeyId 表达）、user-agent、trace 类噪音头。
@@ -41,6 +41,9 @@ func Key(callerKeyID string, req *http.Request, body []byte) [32]byte {
 	writeStr(callerKeyID)
 	writeStr(req.Method)
 	writeStr(req.URL.Path)
+	// query 参与寻址：?beta=true 与裸路径是两个不同的请求，共用幂等键
+	// 会把前者的响应重放给后者（2026-11-16 修复）。
+	writeStr(req.URL.RawQuery)
 
 	// 参与计算的头部白名单（小写）
 	keep := []string{

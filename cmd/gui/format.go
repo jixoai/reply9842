@@ -19,16 +19,58 @@ func humanBytes(n int64) string {
 	if n < 0 {
 		return "-" + humanBytes(-n)
 	}
+	div, exp := byteUnit(n)
+	return formatBytesIn(n, div, exp)
+}
+
+// byteUnit 选一个体积读数的量纲（1024 进制）：div 是 1 个该量纲单位的字节数，
+// exp 是它在 "KMGTPE" 里的下标。n 小于 1024 时退回字节（div=1, exp=0）。
+//
+// 抽出来是为了「同一根轴上的两档刻度必须同量纲」——见 humanBytesAxis。
+func byteUnit(n int64) (div int64, exp int) {
+	if n < 0 {
+		n = -n
+	}
 	const unit = 1024
 	if n < unit {
-		return fmt.Sprintf("%d B", n)
+		return 1, 0
 	}
-	div, exp := int64(unit), 0
+	div = unit
 	for m := n / unit; m >= unit; m /= unit {
 		div *= unit
 		exp++
 	}
+	return div, exp
+}
+
+// formatBytesIn 用给定的量纲（div/exp）格式化体积。
+func formatBytesIn(n, div int64, exp int) string {
+	if div <= 1 {
+		return fmt.Sprintf("%d B", n)
+	}
 	return fmt.Sprintf("%.1f %cB", float64(n)/float64(div), "KMGTPE"[exp])
+}
+
+// humanBytesAxis 一根纵轴上的顶部/中值两档刻度，**共用峰值的量纲**。
+//
+// humanBytes 各自独立选单位，会在量纲边界上给出混排：峰值 2,050,000 是
+// 「2.0 MB」，而半峰值 1,025,000 是「1001.0 KB」——同一根轴一个字说 MB、
+// 一个字说 KB（视觉复核在 golden 帧里抓到）。这里两档都按峰值的量纲格式化，
+// 得「2.0 MB / 1.0 MB」。
+func humanBytesAxis(peak int64) (top, half string) {
+	div, exp := byteUnit(peak)
+	return formatBytesIn(peak, div, exp), formatBytesIn(peak/2, div, exp)
+}
+
+// humanRate 实时带宽的显示口径（字节/秒）：复用 humanBytes，补上 /s。
+//
+// 速率由两次快照的差值算出，天然是浮点；四舍五入到整字节后再交给 humanBytes，
+// 保证底栏的「12.3 KB/s」与别处的 12.3 KB 是同一个函数、同一套换算。
+func humanRate(bytesPerSec float64) string {
+	if bytesPerSec < 0 {
+		bytesPerSec = 0
+	}
+	return humanBytes(int64(bytesPerSec+0.5)) + "/s"
 }
 
 // humanDuration 计时（02:14:08 / 14:08 / 8s），与设计稿的 uptime 同口径

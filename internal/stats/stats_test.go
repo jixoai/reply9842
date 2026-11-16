@@ -3,7 +3,43 @@ package stats
 import (
 	"path/filepath"
 	"testing"
+	"time"
 )
+
+// TestLastTransportFollowsMostRecentRecord GUI 底栏要显示「实际生效的传输」：
+// Transport 计数答不出「最近一次」，LastTransport 必须答得出，且 JSONL 重建
+// 路径（进程重启后）同样成立。
+func TestLastTransportFollowsMostRecentRecord(t *testing.T) {
+	dir := t.TempDir()
+	logPath := filepath.Join(dir, "client-"+time.Now().Format("2006-01-02")+".jsonl")
+	now := time.Now()
+	writeRecords(t, logPath, now, []Record{
+		{Status: 200, UpRaw: 1, UpWire: 1, Transport: "tcp"},
+		{Status: 200, UpRaw: 1, UpWire: 1, Transport: "quic", Time: now.Add(time.Second).Format(time.RFC3339Nano)},
+		// 最后一条没有 transport（旧版本日志的形态）：不该把最近一次有效值抹掉
+		{Status: 200, UpRaw: 1, UpWire: 1, Time: now.Add(2 * time.Second).Format(time.RFC3339Nano)},
+	})
+
+	c, err := Open(Options{LogPath: logPath, StatsPath: filepath.Join(dir, "s.json")})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer c.Close()
+
+	// 重建路径：按文件/行序从旧到新扫描，最后写入的是最新一条带传输的记录。
+	if got := c.Snapshot().LastTransport; got != "quic" {
+		t.Errorf("重建后 LastTransport=%q，期望 quic", got)
+	}
+	// 计数仍照常（两种都出现过）
+	if m := c.Snapshot().Transport; m["tcp"] != 1 || m["quic"] != 1 {
+		t.Errorf("Transport 计数 = %v，期望 tcp/quic 各 1", m)
+	}
+	// 实时路径：Observe 一条 tcp，最近一次必须跟着变
+	c.Observe(&Record{Status: 200, UpRaw: 1, UpWire: 1, Transport: "tcp"})
+	if got := c.Snapshot().LastTransport; got != "tcp" {
+		t.Errorf("Observe 后 LastTransport=%q，期望 tcp", got)
+	}
+}
 
 // 线上现象：client-stats.json 里 p50_ttfb_ms/p90_ttfb_ms 恒为 0。
 // 根因之一：流式路径从不复写 MsUpstrm（恒 0），而 0 被当有效样本参与分位。

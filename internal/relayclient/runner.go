@@ -557,7 +557,7 @@ func (h *handler) capture(body []byte) {
 
 func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	start := time.Now()
-	rec := &stats.Record{Method: r.Method, Path: r.URL.Path}
+	rec := &stats.Record{Method: r.Method, Path: r.URL.RequestURI()}
 
 	// ---- 读请求体 ----
 	body, err := io.ReadAll(r.Body)
@@ -575,11 +575,47 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.capture(body)
 	}
 
+	// ---- 先取连接：上行编码按**这条连接**的 ALPN 协商结果选 ----
+	//
+	// 为什么取连接要排在编码之前：dcz2 只有双方都支持时才能用（见
+	// transport.ALPNv2），而「对面能不能解 dcz2」写在连接协商结果里。池里可能
+	// 混着 v1/v2 两种连接（服务端滚动升级期间），所以判据必须是本次要用的
+	// 那条连接，而不是「客户端自己支持 dcz2」。选错的下场不是降级：老服务端
+	// 收到 EncDcz2 只会报未知编码，请求整个失败。
+	conn, err := h.pool.Get(r.Context())
+	if err != nil {
+		http.Error(w, "dial: "+err.Error(), 502)
+		rec.Status, rec.Err = 502, err.Error()
+		rec.MsTotal = time.Since(start).Milliseconds()
+		h.col.Observe(rec)
+		return
+	}
+	// 复用连接先探活。服务端重启后池里的连接已经死了，但**写进去不会立刻报错**：
+	// 数据进了内核缓冲，接着读就等到 QUIC 的 MaxIdleTimeout（实测 120 秒）才失败。
+	// 用户看到的是「本地客户端卡死/闪退」，而这本来一个 ping 就能判定。
+	// 只在闲置较久（probeIdleGap）时才探，刚用完的连接必活，不必付这次 RTT。
+	if conn.Reused() && conn.IdleFor() > probeIdleGap {
+		if perr := pingConn(conn); perr != nil {
+			h.logf("池里的连接已失效（%v），换新连接", perr)
+			h.pool.Drop(conn)
+			if conn, err = h.pool.Get(r.Context()); err != nil {
+				http.Error(w, "dial: "+err.Error(), 502)
+				rec.Status, rec.Err = 502, err.Error()
+				rec.MsTotal = time.Since(start).Milliseconds()
+				h.col.Observe(rec)
+				return
+			}
+		}
+	}
+
 	// ---- 选择编码 ----
 	enc := meta.EncIdentity
 	encName := "identity"
 	var payload []byte
 	var baseHash codec.Hash
+	// dcz2 = 这条连接协商到了 ALPNv2（双方都支持 RFC 9842 §5 的 dcz2）。
+	// v1 连接上继续用私有 dcz —— 线上老服务端只认它。
+	dcz2 := conn.SupportsDcz2()
 
 	encStart := time.Now()
 	switch {
@@ -600,10 +636,22 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		bh, baseBody := h.finder.Pick(body)
 		if !bh.IsZero() {
 			lvl := codec.PickLevel(len(body))
-			z, err := codec.EncodeDcz(body, bh, lvl, baseBody)
-			if err == nil {
-				payload, enc, baseHash = z, meta.EncDcz, bh
+			var (
+				z    []byte
+				derr error
+			)
+			if dcz2 {
+				// RFC 9842 §5：40 字节头里放 SHA-256(基线)，zstd 帧不写字典 ID
+				z, derr = codec.EncodeDcz2(body, lvl, baseBody)
+			} else {
+				z, derr = codec.EncodeDcz(body, bh, lvl, baseBody)
+			}
+			if derr == nil {
+				payload, baseHash, enc = z, bh, meta.EncDcz
 				encName = fmt.Sprintf("dcz(L%d)", lvl)
+				if dcz2 {
+					enc, encName = meta.EncDcz2, fmt.Sprintf("dcz2(L%d)", lvl)
+				}
 				rec.BaseHit = true
 			}
 		}
@@ -631,8 +679,11 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// ---- 构造帧 ----
 	headers := meta.EncodeHeaders(r.Header)
+	// Path 带 query（RequestURI）：上游据此还原 URL，幂等键也据此区分
+	// 不同 query 的同一路径。旧实现只带 r.URL.Path，`?beta=true` 到上游
+	// 就没了（2026-11-16 由透传测试钉住后修复）。
 	reqHead := &meta.RequestHead{
-		Method: r.Method, Path: r.URL.Path,
+		Method: r.Method, Path: r.URL.RequestURI(),
 		BaseHash: convertHash(baseHash), ResultHash: convertHash(codec.Sum(body)),
 		Encoding: enc, BodyLen: int64(len(payload)),
 		IdemKey:    convertHash(idemKeyToCodec(idemKey)),
@@ -643,6 +694,8 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	reqPayload, err := meta.EncodeRequest(reqHead, headers, payload)
 	if err != nil {
+		// 一个字节都没写出去，连接是干净的：回池，别浪费一次握手
+		h.pool.Put(conn)
 		http.Error(w, "encode: "+err.Error(), 500)
 		rec.Status, rec.Err = 500, err.Error()
 		h.col.Observe(rec)
@@ -650,6 +703,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	frame, err := meta.WrapFrame(meta.FrameRequest, reqPayload)
 	if err != nil {
+		h.pool.Put(conn)
 		http.Error(w, "wrap frame: "+err.Error(), 500)
 		rec.Status, rec.Err = 500, err.Error()
 		h.col.Observe(rec)
@@ -660,38 +714,30 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	wireStart := time.Now()
 	stream := &clientstream.Session{IdemKey: idemKey}
 
-	conn, err := h.pool.Get(r.Context())
-	if err != nil {
-		http.Error(w, "dial: "+err.Error(), 502)
-		rec.Status, rec.Err = 502, err.Error()
-		rec.MsTotal = time.Since(start).Milliseconds()
-		h.col.Observe(rec)
-		return
-	}
-	// 复用连接先探活。服务端重启后池里的连接已经死了，但**写进去不会立刻报错**：
-	// 数据进了内核缓冲，接着读就等到 QUIC 的 MaxIdleTimeout（实测 120 秒）才失败。
-	// 用户看到的是「本地客户端卡死/闪退」，而这本来一个 ping 就能判定。
-	// 只在闲置较久（probeIdleGap）时才探，刚用完的连接必活，不必付这次 RTT。
-	if conn.Reused() && conn.IdleFor() > probeIdleGap {
-		if perr := pingConn(conn); perr != nil {
-			h.logf("池里的连接已失效（%v），换新连接", perr)
-			h.pool.Drop(conn)
-			if conn, err = h.pool.Get(r.Context()); err != nil {
-				http.Error(w, "dial: "+err.Error(), 502)
-				rec.Status, rec.Err = 502, err.Error()
-				rec.MsTotal = time.Since(start).Milliseconds()
-				h.col.Observe(rec)
-				return
-			}
-		}
-	}
 	if err := transport.WriteFrame(conn, frame); err != nil {
 		h.pool.Drop(conn)
-		http.Error(w, "send: "+err.Error(), 502)
-		rec.Status, rec.Err = 502, err.Error()
-		rec.MsTotal = time.Since(start).Milliseconds()
-		h.col.Observe(rec)
-		return
+		// 池里的连接可能在「探活之后、写之前」的窗口里死掉（这个窗口在
+		// 按连接 ALPN 选编码之后变宽了一个编码耗时，见 dcz2 协商）：换一条
+		// 新连接重发一次。帧已完整物化，且服务端按幂等键去重，重发不会让
+		// 上游被请求两次——半截帧只会让旧连接报错关闭，不影响新连接。
+		retried := false
+		if conn.Reused() {
+			if c2, e := h.pool.Get(r.Context()); e == nil {
+				if e2 := transport.WriteFrame(c2, frame); e2 == nil {
+					conn, retried = c2, true
+				} else {
+					h.pool.Drop(c2)
+				}
+			}
+		}
+		if !retried {
+			http.Error(w, "send: "+err.Error(), 502)
+			rec.Status, rec.Err = 502, err.Error()
+			rec.MsTotal = time.Since(start).Milliseconds()
+			h.col.Observe(rec)
+			return
+		}
+		h.logf("池中连接写入失败（%v），已换新连接重发", err)
 	}
 	clientstream.Drain(conn, w, stream, start)
 	// 归还策略：只有「响应完整读完、且连接没出错」才进池。
