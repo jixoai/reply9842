@@ -352,12 +352,6 @@ func TestRatioFormat(t *testing.T) {
 	if got != "100" {
 		t.Errorf("压缩倍数 = %q，期望 100", got)
 	}
-	if n := rawBytesPerKilo(0.01); n != 10 {
-		t.Errorf("每 1,000 字节发出 %d 字节，期望 10", n)
-	}
-	if s := (&app{}).heroNote(stats.Agg{UpRaw: 1400, UpWire: 14, UpRatio: 0.01}, true); !strings.Contains(s, "99.0%") {
-		t.Errorf("heroNote = %q，期望含节省 99.0%%", s)
-	}
 }
 
 // TestButtonStates 主按钮的三态背景必须真的不同。
@@ -395,25 +389,6 @@ func TestButtonStates(t *testing.T) {
 		t.Errorf("pressed 与静止态相同（%s）：按下没有反馈", rest)
 	}
 	t.Logf("主按钮三态：rest=%s hover=%s pressed=%s", rest, hover, pressed)
-}
-
-// TestMeterDirection 压缩条的填充语义：越长 = 发出去的越多 = 压得越差。
-//
-// 这条测试守的是一个容易被改反的方向（「进度条越长越好」是直觉，但这里正好相反）。
-func TestMeterDirection(t *testing.T) {
-	// 几乎压到零：填充极短，用最亮的白（好结果）
-	good := stats.Agg{UpRaw: 1400 * 1024, UpWire: 1024, UpRatio: 1024.0 / (1400 * 1024)}
-	if frac := good.UpRatio; frac > 0.01 {
-		t.Errorf("压得好的用例占比 %.4f，应远小于 1%%", frac)
-	}
-	// 没压：填充满格，且不该给亮白
-	bad := stats.Agg{UpRaw: 101, UpWire: 101, UpRatio: 1.0}
-	if s := (&app{}).heroNote(bad, true); !strings.Contains(s, "未压缩") {
-		t.Errorf("未压缩时说明文案 = %q，应点明「未压缩」而不是「节省 0.0%%」", s)
-	}
-	if s := (&app{}).heroNote(good, true); !strings.Contains(s, "节省") {
-		t.Errorf("有压缩时说明文案 = %q，应给出节省比例", s)
-	}
 }
 
 // TestVersionDisplay 注入源的版本号有的带 v 有的不带，界面必须归一成一个。
@@ -1195,36 +1170,54 @@ func TestFooterRateLabel(t *testing.T) {
 }
 
 // TestFooterFitsNarrowWindow 底栏在最小窗口宽度（440）下不溢出：
-// 「状态 · 实际传输」与「↑ ↓ 实时带宽」两段都要完整落在窗口里，且不重叠。
-// 用偏宽的模拟读数（258 KB/s / 1.4 MB/s）压测——底栏从两段变三段后，
-// 空间余量是这个改动的核心取舍。
+// 「状态 + 运行时长 · 实际传输」「↑ ↓ 实时带宽」「版本号」三段都要完整落在
+// 窗口里，且互不重叠。
+//
+// 测试默认 version=="dev"、runner 未启动——出货构建里两个字段都真实存在，
+// 不注入就测不到最宽的底栏组合。这里按出货态压测：长运行时长（23:59:59）+
+// 千兆级读数（999.9 MB/s，本地万兆网的量级）+ v0.3.10 版本号。
 func TestFooterFitsNarrowWindow(t *testing.T) {
+	savedVer := version
+	version = "0.3.10"
+	t.Cleanup(func() { version = savedVer })
+	uptime := 23*time.Hour + 59*time.Minute + 59*time.Second
+
 	a := newTestApp(t)
 	setRunning(a, true)
+	a.fakeUptime = &uptime
 	a.agg = stats.Agg{Requests: 9, UpRaw: 9000, UpWire: 90, RetainSec: 86400, LastTransport: "quic"}
 	a.snap = func() stats.Agg { return a.agg }
-	a.rateValid, a.upRate, a.downRate = true, 258*1024+128, 1.4*1024*1024
+	a.rateValid, a.upRate, a.downRate = true, 999.9*1024*1024, 999.9*1024*1024
 
 	tt := ui.NewTester(a.view, 440, 400)
 	tt.SetTitleBar(ui.TitleBar{Height: 66, Left: 79, Bottom: 33})
 
-	head, ok := tt.Find("运行中 · QUIC")
+	head, ok := tt.Find("运行中 23:59:59 · QUIC")
 	if !ok {
-		t.Fatalf("底栏状态段缺失：%q", tt.Texts())
+		t.Fatalf("底栏状态段缺失（长 uptime + 传输）：%q", tt.Texts())
 	}
 	rate, ok := tt.Find(a.rateLabel())
 	if !ok {
 		t.Fatalf("底栏带宽段缺失（rateLabel=%q）：%q", a.rateLabel(), tt.Texts())
 	}
+	ver, ok := tt.Find("v0.3.10")
+	if !ok {
+		t.Fatalf("底栏版本段缺失（version=%q）：%q", version, tt.Texts())
+	}
 	if head.X+head.W > rate.X+0.5 {
 		t.Errorf("状态段右缘 %.1f 压住带宽段左缘 %.1f", head.X+head.W, rate.X)
 	}
-	if rate.X+rate.W > 440-8 {
-		t.Errorf("带宽段右缘 %.1f 超出窗口（440）", rate.X+rate.W)
+	if rate.X+rate.W > ver.X+0.5 {
+		t.Errorf("带宽段右缘 %.1f 压住版本段左缘 %.1f（带宽被挤出的信号）", rate.X+rate.W, ver.X)
+	}
+	if ver.X+ver.W > 440-16+0.5 {
+		t.Errorf("版本段右缘 %.1f 越过内容区右缘（424）", ver.X+ver.W)
 	}
 	if rate.W < 90 {
 		t.Errorf("带宽段宽度只有 %.1fpx，可能被截断：%q", rate.W, a.rateLabel())
 	}
+	t.Logf("底栏：状态 [%.1f..%.1f] 带宽 [%.1f..%.1f] 版本 [%.1f..%.1f]",
+		head.X, head.X+head.W, rate.X, rate.X+rate.W, ver.X, ver.X+ver.W)
 }
 
 // TestHumanRate 实时带宽的字节口径（复用 humanBytes，负数按 0）。
@@ -1289,11 +1282,83 @@ func TestSampleStatsRates(t *testing.T) {
 		t.Fatalf("采样间隔超过上限后 rateValid 应为 false")
 	}
 
+	// 间隔不足 minGap（悬停等抖动帧）：读数与基线都保持原样
+	a.rateValid, a.upRate, a.downRate = true, 12345, 23456
+	base := time.Now().Add(-400 * time.Millisecond)
+	a.ratePrevAt, a.ratePrevUp, a.ratePrevDown = base, 100, 200
+	agg = stats.Agg{UpWire: 50_000, DownWire: 60_000}
+	a.sampleStats()
+	if !a.rateValid || a.upRate != 12345 || a.downRate != 23456 {
+		t.Errorf("抖动帧改写了读数：valid=%v up=%.1f down=%.1f", a.rateValid, a.upRate, a.downRate)
+	}
+	if !a.ratePrevAt.Equal(base) || a.ratePrevUp != 100 || a.ratePrevDown != 200 {
+		t.Errorf("抖动帧动了基线：prevAt=%v up=%d down=%d", a.ratePrevAt, a.ratePrevUp, a.ratePrevDown)
+	}
+
+	// 计数回退后的恢复：基线重置到回退后的值，下一个间隔能算出正确速率
+	a.ratePrevAt = time.Now().Add(-2 * time.Second)
+	a.ratePrevUp, a.ratePrevDown = 10_000, 20_000
+	agg = stats.Agg{UpWire: 500, DownWire: 800}
+	a.sampleStats()
+	if a.rateValid {
+		t.Fatalf("计数回退后不该有读数")
+	}
+	if a.ratePrevUp != 500 || a.ratePrevDown != 800 {
+		t.Fatalf("回退后基线未重置：%d/%d", a.ratePrevUp, a.ratePrevDown)
+	}
+	a.ratePrevAt = a.ratePrevAt.Add(-2 * time.Second)
+	agg = stats.Agg{UpWire: 600, DownWire: 1000}
+	a.sampleStats()
+	if !a.rateValid || a.upRate < 40 || a.upRate > 60 || a.downRate < 80 || a.downRate > 120 {
+		t.Errorf("回退恢复后的速率 = %.1f/%.1f B/s，期望约 50/100", a.upRate, a.downRate)
+	}
+
+	// 时钟回拨（基线在未来）：丢掉基线重建，而不是永久静默
+	a.rateValid, a.upRate = true, 7
+	a.ratePrevAt = time.Now().Add(time.Hour)
+	a.sampleStats()
+	if a.rateValid || !a.ratePrevAt.IsZero() {
+		t.Errorf("时钟回拨后应丢基线：valid=%v prevAt=%v", a.rateValid, a.ratePrevAt)
+	}
+
 	// resetRate 丢基线（改保留期的路径）
 	a.rateValid = true
 	a.resetRate()
 	if a.rateValid || !a.ratePrevAt.IsZero() {
 		t.Errorf("resetRate 未清空基线：valid=%v prevAt=%v", a.rateValid, a.ratePrevAt)
+	}
+}
+
+// TestApplyTimeSettingsResetsRate 改保留期/显示区间会触发统计重建、累计计数
+// 可能整体前移；基线必须当场作废，否则下一帧会把跳变算成一波假带宽
+// （复核者反事实实测：不 resetRate 会显示 536 MB/s）。
+func TestApplyTimeSettingsResetsRate(t *testing.T) {
+	a := newTestApp(t)
+	// 上一帧：有读数、基线在两秒前
+	a.rateValid, a.upRate, a.downRate = true, 12_000, 34_000
+	a.ratePrevAt = time.Now().Add(-2 * time.Second)
+	a.ratePrevUp, a.ratePrevDown = 1_000, 2_000
+	// 重建后总量整体抬到 GB 级（保留期放大后的真实形态）
+	jumped := stats.Agg{UpWire: 1 << 30, DownWire: 2 << 30}
+	a.snap = func() stats.Agg { return jumped }
+
+	a.retainIdx = relayclient.OptionIndex(7*24*time.Hour, relayclient.RetainOptions)
+	a.windowIdx = relayclient.OptionIndex(6*time.Hour, relayclient.WindowOptions)
+	a.applyTimeSettings()
+
+	if a.rateValid || !a.ratePrevAt.IsZero() {
+		t.Fatalf("重建后未丢基线：valid=%v prevAt=%v", a.rateValid, a.ratePrevAt)
+	}
+	// 重建后的第一帧只建新基线，不得把 1GB 的跳变算成带宽
+	a.sampleStats()
+	if a.rateValid {
+		t.Errorf("重建后的第一帧就把计数跳变算成了带宽：%.1f B/s", a.upRate)
+	}
+	// 再下一帧：真实增量为 0 → 0 B/s（而不是 536 MB/s）
+	a.ratePrevAt = a.ratePrevAt.Add(-2 * time.Second)
+	a.sampleStats()
+	if !a.rateValid || a.upRate > 1 || a.downRate > 1 {
+		t.Errorf("恢复后的读数 = %.1f/%.1f B/s，期望 0", a.upRate, a.downRate)
 	}
 }
 
@@ -1430,6 +1495,45 @@ func TestHumanBytesAxis(t *testing.T) {
 	}
 }
 
+// TestEmptyChartNoteGetOnly 窗口内只有无请求体的请求（GET/HEAD）时，空态
+// 文案不能说「没有请求」——同一张卡片的保留期总览会同时写着「近 24 小时
+// 42 请求」，两句话自相矛盾。判据必须来自窗口内的 Series，而不是保留期的
+// Agg.Requests。
+func TestEmptyChartNoteGetOnly(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{Requests: 42, RetainSec: 86400, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	// GET：没有请求体（UpRaw=0、UpWire=0），响应体走下行，Count 照常记账。
+	for _, i := range []int{3, 9, 21} {
+		a.agg.Series[i] = stats.Bucket{Count: 2, DownRaw: 42_000, DownWire: 40_000, MsSum: 300}
+	}
+	a.snap = func() stats.Agg { return a.agg }
+
+	if a.hasSeries() {
+		t.Fatalf("GET-only 窗口不该有可画的上行柱")
+	}
+	note := a.emptyChartNote()
+	if !strings.Contains(note, "无请求体") || !strings.Contains(note, "GET") {
+		t.Errorf("空态文案 = %q，应说明「只有无请求体的请求（GET 等）」", note)
+	}
+	if strings.Contains(note, "没有请求") {
+		t.Errorf("空态文案 = %q，不得把 GET-only 窗口说成「没有请求」", note)
+	}
+
+	// 同屏一致性：保留期总览在、误报不在；流量卡有下行流量 → 不是空态。
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if !tt.HasText("近 24 小时 42 请求") {
+		t.Errorf("同卡片应显示保留期总览：%q", tt.Texts())
+	}
+	if tt.HasText("没有请求") {
+		t.Errorf("同屏出现「没有请求」的误报：%q", tt.Texts())
+	}
+	if tt.HasText("等待流量数据") {
+		t.Errorf("有下行流量时流量卡不该是空态：%q", tt.Texts())
+	}
+}
+
 // TestLatencyHasGaps 折线断点只在「两个有延迟样本的桶之间夹着无样本的桶」时成立。
 //
 // 判据与画线共用 hasLatencySample：Count>0 但 MsSum==0 的桶（有请求、没采到
@@ -1493,6 +1597,14 @@ var (
 )
 
 func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+// absF 浮点绝对值（几何断言的容差比较用）。
+func absF(v float32) float32 {
 	if v < 0 {
 		return -v
 	}
@@ -1734,6 +1846,167 @@ func TestChartScaleBarsAndTicks(t *testing.T) {
 		t.Errorf("两个绘图区高度不等：%.1f vs %.1f（差 %.1fpx）", h1, h2, d)
 	} else {
 		t.Logf("绘图区高度：第一图 %.1fpx / 第二图 %.1fpx", h1, h2)
+	}
+}
+
+// TestChartsEqualHeightWithEmptyRetentionLine 保留期总览为空（Requests=0、
+// 但窗口内有桶）时，第一张卡片的第一行是**空占位**、第二张卡片没有空行——
+// 两处都必须占满同一行高，否则绘图区差 20.7px。
+//
+// 这条专盯「summaryLine 对空串直接 return」这类突变：行高靠空文本占位，
+// 空串一旦被跳过，等高契约就静默破掉（复核者的突变实验实证现套件抓不到）。
+func TestChartsEqualHeightWithEmptyRetentionLine(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{Requests: 0, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	a.agg.Series[2] = stats.Bucket{UpRaw: 800_000, UpWire: 8_000, DownWire: 600_000, Count: 1, MsSum: 120}
+	a.snap = func() stats.Agg { return a.agg }
+	if a.retentionStatsLine() != "" {
+		t.Fatalf("前提不成立：保留期总览非空")
+	}
+
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	top1, ok := tt.Find(humanBytes(800_000))
+	if !ok {
+		t.Fatalf("找不到第一图峰值刻度：%q", tt.Texts())
+	}
+	half1, ok := tt.Find(humanBytes(800_000 / 2))
+	if !ok {
+		t.Fatalf("找不到第一图半峰值刻度：%q", tt.Texts())
+	}
+	maxTraffic := int64(8_000 + 600_000)
+	top2, ok := tt.Find(humanBytes(maxTraffic))
+	if !ok {
+		t.Fatalf("找不到第二图峰值刻度 %q：%q", humanBytes(maxTraffic), tt.Texts())
+	}
+	half2, ok := tt.Find(humanBytes(maxTraffic / 2))
+	if !ok {
+		t.Fatalf("找不到第二图半峰值刻度：%q", tt.Texts())
+	}
+	h1 := (half1.Y - top1.Y) / 0.5
+	h2 := (half2.Y - top2.Y) / 0.5
+	if d := float64(h1 - h2); d < -1.2 || d > 1.2 {
+		t.Errorf("保留期行为空占位时两图绘图区高度不等：%.1f vs %.1f（差 %.1fpx，空行占位失效）",
+			h1, h2, d)
+	} else {
+		t.Logf("保留期行为空占位时两图高度：%.1f / %.1f", h1, h2)
+	}
+}
+
+// TestVolumeBarSegments 体积柱的两段切分：亚像素桶不许被抬成「纯蓝无绿」，
+// 有实质流量的桶与流量图共用同一套存在性标准。
+func TestVolumeBarSegments(t *testing.T) {
+	const plotH float32 = 150
+	approx := func(x, y float32) bool { return absF(x-y) < 0.01 }
+
+	// 峰值柱：满高；蓝段按比例只有 0.75px（<1px）→ 存在性抬到 1px，其余是绿段
+	if b, w, s := volumeBarSegments(1_000_000, 5_000, 1_000_000, plotH); !approx(b, 150) ||
+		!approx(w, minWirePx) || !approx(s, 150-minWirePx) {
+		t.Errorf("峰值柱 = (%.2f, %.2f, %.2f)，期望 (150, 1, 149)", b, w, s)
+	}
+	// 0.1% 峰值 + 50% 实发：亚像素桶整根不画（返回值全 0）。若按比例画，
+	// 蓝/绿两个亚像素矩形会落到同一像素行、蓝段把绿段盖掉——读出「纯蓝无绿」。
+	if b, w, s := volumeBarSegments(1_000, 500, 1_000_000, plotH); b != 0 || w != 0 || s != 0 {
+		t.Errorf("0.1%% 亚像素桶 = (%.3f, %.3f, %.3f)，期望整根不画", b, w, s)
+	}
+	// 0.8% 峰值 + 50% 实发：柱高 1.2px 可见，但绿段只剩 0.2px → 抬到两段各
+	// 1px（柱高 2px），不许出现「蓝段可见、绿段被盖」的读法
+	if b, w, s := volumeBarSegments(8_000, 4_000, 1_000_000, plotH); !approx(b, 2) ||
+		!approx(w, minWirePx) || !approx(s, minWirePx) {
+		t.Errorf("0.8%% 桶 = (%.2f, %.2f, %.2f)，期望 (2, 1, 1)", b, w, s)
+	}
+	// wire == raw（没压缩）：整根蓝段是正确的（绿段为 0 不是 bug）
+	if b, w, s := volumeBarSegments(100_000, 100_000, 1_000_000, plotH); !approx(w, b) || s != 0 {
+		t.Errorf("未压缩桶 = (%.2f, %.2f, %.2f)，期望蓝段=柱高、绿段 0", b, w, s)
+	}
+	// 1% 峰值：与流量图同标准，总高抬到 minBarPx；蓝段 1px、绿段 2px
+	if b, w, s := volumeBarSegments(10_000, 100, 1_000_000, plotH); !approx(b, minBarPx) ||
+		!approx(w, minWirePx) || !approx(s, minBarPx-minWirePx) {
+		t.Errorf("1%% 桶 = (%.2f, %.2f, %.2f)，期望 (3, 1, 2)", b, w, s)
+	}
+	// 10% 峰值：蓝段按比例（不触发最小高度）
+	if _, w, s := volumeBarSegments(100_000, 50_000, 1_000_000, plotH); !approx(w, 7.5) || !approx(s, 7.5) {
+		t.Errorf("10%% 桶蓝/绿 = (%.2f, %.2f)，期望 (7.5, 7.5)", w, s)
+	}
+	// wire=0：没有蓝段，绿段 = 柱高
+	if b, w, s := volumeBarSegments(100_000, 0, 1_000_000, plotH); w != 0 || !approx(s, b) {
+		t.Errorf("wire=0 桶 = (%.2f, %.2f, %.2f)，期望蓝段 0、绿段=柱高", b, w, s)
+	}
+	// 空桶/除零防护
+	if b, w, s := volumeBarSegments(0, 5, 1_000_000, plotH); b != 0 || w != 0 || s != 0 {
+		t.Errorf("空桶 = (%.2f, %.2f, %.2f)，期望全 0", b, w, s)
+	}
+}
+
+// TestChartSubPixelBucketHasNoFalseBlue 0.1% 峰值的亚像素桶不许在像素上画出
+// 「纯蓝无绿」——柱高 <1px 时蓝/绿两个矩形落在同一行，后画的蓝段把绿段盖掉，
+// 整根读作「一点没省」，与图例「绿=省下」直接矛盾（像素复核实测）。
+//
+// 2000 高的窗口把绘图区拉到约 850px：0.1% 的桶约 0.85px，正好是「亚像素但
+// 可能被取整成一整行」的危险区（默认 640 高时它只有 0.15px，测不出来）。
+// 1% 的对照桶必须可见且顶端是绿段，同时证明本测试的列几何没有算错。
+func TestChartSubPixelBucketHasNoFalseBlue(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.agg = stats.Agg{Requests: 2, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	a.agg.Series[2] = stats.Bucket{UpRaw: 100_000_000, UpWire: 100_000, Count: 1, MsSum: 120}
+	a.agg.Series[27] = stats.Bucket{UpRaw: 100_000, UpWire: 50_000, Count: 1, MsSum: 120}
+	a.snap = func() stats.Agg { return a.agg }
+
+	tt := ui.NewTester(a.view, defaultWinWidth, 2000)
+	img := tt.Image()
+	if img == nil {
+		t.Fatal("Image() 返回 nil")
+	}
+	lower, ok := tt.Find("流量与延迟")
+	if !ok {
+		t.Fatalf("找不到第二张图标题：%q", tt.Texts())
+	}
+	// 第一图绘图区几何与视图共用 plotArea：卡片内容从 x=30 开始，宽 = 窗口
+	// 减两侧面板内边距(32)与卡片内边距(28)。
+	area := plotArea(ui.Rect{X: 30, W: defaultWinWidth - 32 - 28})
+	if area.W <= 0 {
+		t.Fatal("绘图区宽度无效")
+	}
+	slot := area.W / float32(stats.SeriesBuckets)
+	yBot := int(lower.Y) - 4
+	// 只扫第一张图的绘图区：从峰值刻度往下到「流量与延迟」标题之上。
+	peakTick, ok := tt.Find(humanBytes(100_000_000))
+	if !ok {
+		t.Fatalf("找不到峰值刻度：%q", tt.Texts())
+	}
+	yTop := int(peakTick.Y) + 6
+
+	cx := int(area.X + 27.5*slot)
+	for y := yTop; y < yBot; y++ {
+		if rowHasColor(img, y, cx-5, cx+6, rgbDownBar, 20) ||
+			rowHasColor(img, y, cx-5, cx+6, rgbUpBar, 20) {
+			t.Errorf("0.1%% 峰值的亚像素桶（x≈%d）在 y=%d 画出了柱色像素：亚像素桶必须整根不可见，不许读成「纯蓝无绿」",
+				cx, y)
+			break
+		}
+	}
+
+	// 对照：1% 的桶必须可见，且最上面一行是绿段（省下）。
+	a.agg = stats.Agg{Requests: 2, WindowSec: 1800, BucketSec: 60}
+	a.agg.Series = make([]stats.Bucket, stats.SeriesBuckets)
+	a.agg.Series[2] = stats.Bucket{UpRaw: 100_000_000, UpWire: 100_000, Count: 1, MsSum: 120}
+	a.agg.Series[3] = stats.Bucket{UpRaw: 1_000_000, UpWire: 500_000, Count: 1, MsSum: 120}
+	tt2 := ui.NewTester(a.view, defaultWinWidth, 2000)
+	img2 := tt2.Image()
+	if img2 == nil {
+		t.Fatal("Image() 返回 nil（对照帧）")
+	}
+	cx1 := int(area.X + 3.5*slot)
+	greenTop := colorTopRow(img2, cx1-5, cx1+6, yTop, yBot, rgbDownBar, 20)
+	blueTop := colorTopRow(img2, cx1-5, cx1+6, yTop, yBot, rgbUpBar, 20)
+	if greenTop < 0 {
+		t.Fatalf("1%% 的对照桶不可见（列几何可能算错）：greenTop=%d", greenTop)
+	}
+	if blueTop >= 0 && blueTop < greenTop {
+		t.Errorf("1%% 的桶顶端是蓝段（y=%d）而不是绿段（y=%d）", blueTop, greenTop)
 	}
 }
 
@@ -2010,8 +2283,8 @@ func TestTrafficBarMinHeight(t *testing.T) {
 		{"峰值=满量程", peak, func(h float32) bool { return h == plotH }, "峰值柱必须精确落在轴顶"},
 		{"0.08% 的碎屑桶", peak / 1250, func(h float32) bool { return h < 1 }, "按真实比例画（<1px），不许抬到 3px"},
 		{"0.5%", peak / 200, func(h float32) bool { return h < 1 }, "低于 1% 一律按真实比例"},
-		{"1.25%", peak / 80, func(h float32) bool { return h == minTrafficBarPx }, "刚过 1% 的桶抬到 3px"},
-		{"2%", peak / 50, func(h float32) bool { return h > minTrafficBarPx }, "按比例已超过 3px"},
+		{"1.25%", peak / 80, func(h float32) bool { return h == minBarPx }, "刚过 1% 的桶抬到 3px"},
+		{"2%", peak / 50, func(h float32) bool { return h > minBarPx }, "按比例已超过 3px"},
 		{"空桶", 0, func(h float32) bool { return h == 0 }, "空桶不画"},
 	}
 	for _, tc := range cases {

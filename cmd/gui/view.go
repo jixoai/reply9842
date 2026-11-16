@@ -944,16 +944,19 @@ func (a *app) latencyHasGaps() bool {
 const minWirePx float32 = 1
 
 // volumeBarSegments 一根体积堆叠柱的两段高度（像素）：蓝段（实发）与绿段
-// （省下）。存在性口径与流量图的 trafficBarHeight 完全一致：
+// （省下）。存在性口径与流量图的 trafficBarHeight 对齐：
 //
 //	barH   = plotH × raw/maxRaw；占峰值 ≥ minBarFrac 的桶总高至少 minBarPx，
-//	         更小的桶按真实比例（可能亚像素、不可见）
-//	wireH  = barH × wire/raw；**只有 barH ≥ 1px 时**才把不足 1px 的蓝段抬到 1px
+//	         更小的桶按真实比例（可能亚像素）
+//	wireH  = barH × wire/raw；蓝段至少 1px，且要给绿段留至少 1px（两段都
+//	         非零时柱高至少 2px）
 //	savedH = barH - wireH（恒 ≥ 0）
 //
-// 为什么蓝段最小高度要以 barH ≥ 1px 为前提：柱高不足 1px 时，把蓝段抬到
-// 柱高上限会把绿段挤成 0——整根柱子读成「一点没省」，而图例承诺绿=省下。
-// 亚像素桶宁可整根不可见（与流量图 <1% 的桶同一条标准），也不伪造「纯蓝」。
+// 返回值全 0 表示「这根桶不画」：柱高不足 1px 时整根跳过。为什么不是按
+// 比例画：亚像素的两个矩形会落到同一像素行，后画的蓝段把绿段盖掉——像素
+// 复核实测 0.1% 峰值的桶渲染成一整行纯蓝，读起来就是「一点没省」，与图例
+// 「绿=省下」矛盾。宁可不可见（与流量图 <1% 的桶同一条存在性标准），也不
+// 伪造错误的颜色语义。
 func volumeBarSegments(raw, wire, maxRaw int64, plotH float32) (barH, wireH, savedH float32) {
 	if raw <= 0 || maxRaw <= 0 || plotH <= 0 {
 		return 0, 0, 0
@@ -963,10 +966,19 @@ func volumeBarSegments(raw, wire, maxRaw int64, plotH float32) (barH, wireH, sav
 	if frac >= minBarFrac && barH < minBarPx {
 		barH = minBarPx
 	}
+	if barH < minWirePx {
+		return 0, 0, 0 // 亚像素桶：整根不可见（见函数头）
+	}
 	if wire > 0 {
 		wireH = barH * float32(wire) / float32(raw)
-		if barH >= minWirePx && wireH < minWirePx {
+		if wireH < minWirePx {
 			wireH = minWirePx
+		}
+		// 两段都要看得见：蓝段 ≥1px 之外还要给绿段留 ≥1px。柱高不足 2px
+		// 时抬到 2px——这是「两段各 1px」的下限，与流量图「≥1% 的桶至少
+		// minBarPx」是同一类存在性抬升，两图对小桶的标准不双标。
+		if wire < raw && barH-wireH < minWirePx {
+			barH = wireH + minWirePx
 		}
 	}
 	if wireH > barH {
