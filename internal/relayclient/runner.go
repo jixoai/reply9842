@@ -732,31 +732,18 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		if conn.Reused() {
 			if c2, e := h.pool.Get(r.Context()); e == nil {
 				f2 := frame
-				if (enc == meta.EncDcz) != c2.SupportsDcz2() && baseBody != nil {
-					wantDcz2 := c2.SupportsDcz2()
+				// 唯一**不兼容**的方向是 dcz2 → v1 连接（v1 服务端只认
+				// 私有 dcz，会回 unknown encoding）；反向（dcz → v2 连接）
+				// 兼容，v2 服务端两种都解，不必重编。
+				if enc == meta.EncDcz2 && !c2.SupportsDcz2() && baseBody != nil {
 					lvl := codec.PickLevel(len(body))
-					var (
-						z2   []byte
-						derr error
-					)
-					if wantDcz2 {
-						z2, derr = codec.EncodeDcz2(body, lvl, baseBody)
-					} else {
-						z2, derr = codec.EncodeDcz(body, baseHash, lvl, baseBody)
-					}
-					if derr == nil {
+					if z2, derr := codec.EncodeDcz(body, baseHash, lvl, baseBody); derr == nil {
 						reqHead.Encoding = meta.EncDcz
-						if wantDcz2 {
-							reqHead.Encoding = meta.EncDcz2
-						}
 						reqHead.BodyLen = int64(len(z2))
 						if pl, e1 := meta.EncodeRequest(reqHead, headers, z2); e1 == nil {
 							if f3, e2 := meta.WrapFrame(meta.FrameRequest, pl); e2 == nil {
 								f2, payload = f3, z2
-								rec.Encoding = fmt.Sprintf("dcz2(L%d)", lvl)
-								if !wantDcz2 {
-									rec.Encoding = fmt.Sprintf("dcz(L%d)", lvl)
-								}
+								rec.Encoding = fmt.Sprintf("dcz(L%d)", lvl)
 								rec.UpWire = int64(len(z2))
 							}
 						}
