@@ -90,7 +90,7 @@ reply9842 不绑定任何特定服务商或协议实现，它只是一个 HTTP �
 ```bash
 reply9842-server \
   -listen 0.0.0.0:28443 \
-  -upstream http://127.0.0.1:3431 \
+  -upstream http://127.0.0.1:3425 \
   -cert /path/to/fullchain.pem \
   -key /path/to/privkey.pem
 ```

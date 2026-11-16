@@ -11,7 +11,7 @@
 ### Requirement: 启动参数集合与默认值
 
 服务端 SHALL 支持且仅支持以下参数（默认值以代码为准，README / DEPLOY.md 必须与之一致）：
-`-listen`(0.0.0.0:28443) `-upstream`(http://127.0.0.1:3431)
+`-listen`(0.0.0.0:28443) `-upstream`(http://127.0.0.1:3425)
 `-uphost`(magpie.aiweb.xin) `-cert`/`-key`(必填) `-cache-mb`(256)
 `-spool-dir`(/var/lib/reply9842/spool) `-tmp-mb`(512) `-idem-mb`(2048)
 `-upstream-timeout`(10m) `-log` `-stats` `-health-addr`(空) `-health-probe`(false)。

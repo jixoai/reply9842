@@ -118,7 +118,7 @@ go build -o relay-server ./cmd/server
 
 ./relay-server \
   -listen 0.0.0.0:28443 \
-  -upstream http://127.0.0.1:3431 \
+  -upstream http://127.0.0.1:3425 \
   -uphost magpie.aiweb.xin \
   -cert /path/to/fullchain.pem \
   -key  /path/to/privkey.pem
@@ -185,7 +185,7 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-listen` | `0.0.0.0:28443` | 隧道监听（QUIC + TCP 同端口）|
-| `-upstream` | `http://127.0.0.1:3431` | 上游 base URL |
+| `-upstream` | `http://127.0.0.1:3425,http://127.0.0.1:3426` | 上游 base URL；逗号分隔多个候选，按序拨号、第一个连通的生效（适配蓝绿双槽轮转）|
 | `-uphost` | `magpie.aiweb.xin` | 转发时覆盖的 Host 头（等价于 `-header 'Host: …'`）|
 | `-header` | 空 | 转发到上游时附加/覆盖的请求头，可重复：`-header 'Host: x' -header 'X-Foo: bar'` |
 | `-cert` / `-key` | 必填 | TLS 证书 |

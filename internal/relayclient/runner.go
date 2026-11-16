@@ -773,6 +773,16 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// 收尾兜底：一个字节都没写给下游时，必须补一个真实的 5xx。
+	//
+	// 两个来源会走到这里：
+	//  1. 服务端在响应头产生前就失败（上游不可达/超时），发来 FrameError；
+	//  2. 幂等键连续两次未命中（delta-miss → 全量重发 → 再 miss）。
+	// 原实现直接返回，net/http 会替我们补一个「200 + 空 body」，调用方只能
+	// 看到「空返回」——2026-11-16 上游端口配成 down 槽时，全部请求都变成
+	// 这个现象，连错误原因都传不出去。
+	finalizeNoHead(w, stream)
+
 	rec.MsWire = time.Since(wireStart).Milliseconds()
 	rec.Transport = string(h.dialer.LastKind())
 	// 握手耗时：只有本次请求真的新建了连接才有值。复用时恒为 0，
@@ -808,8 +818,32 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	h.col.Observe(rec)
 }
 
-// isDownstreamGone 判断错误是否来自「写下游失败」（客户端已断开）
+// finalizeNoHead 在「一个响应头都没收到就结束」时给下游补一个真实 5xx。
 //
+// 返回 true 表示它写了响应。两种失败会走到这里：服务端在头产生前就发来
+// FrameError（上游不可达、超时），或者幂等键连续两次未命中。若什么都不写，
+// net/http 会在 Handler 返回时自动补 200 + 空 body —— 调用方只能看到
+// 「空返回」，真实原因全部丢失。
+func finalizeNoHead(w http.ResponseWriter, s *clientstream.Session) bool {
+	if s.HeadDone || s.Completed {
+		return false
+	}
+	msg := "隧道没有返回响应头（上游不可达或幂等键未命中）"
+	switch {
+	case s.Err != nil:
+		msg = s.Err.Error()
+	case s.ResumeMiss:
+		msg = "服务端连续两次未命中幂等键（全量重发也未成功），未收到响应头"
+	}
+	http.Error(w, msg, http.StatusBadGateway)
+	s.Status = http.StatusBadGateway
+	if s.Err == nil {
+		s.Err = errors.New(msg)
+	}
+	return true
+}
+
+// isDownstreamGone 判断错误是否来自「写下游失败」（客户端已断开）。
 // 这类错误不应触发续传：下游没人接收，重连只会白等上游。
 // 条目会由服务端在 Detach 后保留在幂等区，供客户端**重新发起请求**时复用。
 func isDownstreamGone(err error) bool {

@@ -115,8 +115,15 @@ type Entry struct {
 	createdAt   time.Time
 	lastAccess  time.Time
 
-	// events SSE 事件边界索引（offset → event id），用于按 event id 续传
-	events []EventMark
+	// events SSE 事件边界索引（offset → event id），用于按 event id 续传。
+	//
+	// 索引重建分两种时机：活跃条目在写入时顺手就建好了（eventsReady=true）；
+	// 重启恢复的条目只在「真的收到按 event id 的续传」时才扫一遍（惰性）。
+	// 启动时全量扫是灾难：2GB idem 区要顺序读 2.1GB 并解压，实测端口
+	// 90 秒才起来（2026-11-16），而绝大多数恢复条目永远不会被续传。
+	events      []EventMark
+	eventsOnce  sync.Once
+	eventsReady bool
 
 	// gen 单调递增的「内容版本号」，WaitMore 用它判断是否有新数据
 	gen uint64
@@ -817,6 +824,7 @@ func (e *Entry) SetHead(status int, headers []byte) {
 
 // EventsFrom 返回 offset 之后的第一个事件标记（用于验证 event id 续传）
 func (e *Entry) EventsFrom(offset int64) []EventMark {
+	e.ensureEventsIndex()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for i, m := range e.events {
@@ -829,6 +837,7 @@ func (e *Entry) EventsFrom(offset int64) []EventMark {
 
 // EventOffset 按 event id 找续传偏移；找不到返回 -1
 func (e *Entry) EventOffset(id string) int64 {
+	e.ensureEventsIndex()
 	e.mu.Lock()
 	defer e.mu.Unlock()
 	for i := len(e.events) - 1; i >= 0; i-- {
@@ -837,6 +846,19 @@ func (e *Entry) EventOffset(id string) int64 {
 		}
 	}
 	return -1
+}
+
+// ensureEventsIndex 惰性重建事件索引（仅对重启恢复的条目真的会扫盘）。
+// 用 sync.Once 保证并发续传最多扫一次。
+func (e *Entry) ensureEventsIndex() {
+	e.eventsOnce.Do(func() {
+		e.mu.Lock()
+		ready := e.eventsReady
+		e.mu.Unlock()
+		if !ready {
+			e.scanEventsLockedFile()
+		}
+	})
 }
 
 // Close 关闭文件句柄
@@ -982,7 +1004,6 @@ func (m *Manager) restoreIdem() {
 		if e.written == 0 && !e.compressed {
 			e.written = st.Size()
 		}
-		e.scanEventsLockedFile() // 重建 SSE 事件索引，续传才能按 event id 定位
 		m.entries[key] = e
 		e.elem = m.idemLRU.PushFront(e)
 	}
@@ -1059,6 +1080,7 @@ func (m *Manager) Acquire(key [32]byte) (*Entry, bool, error) {
 		Key: key, mgr: m, path: path, file: f,
 		state: StateActive, notify: make(chan struct{}),
 		createdAt: time.Now(), lastAccess: time.Now(),
+		eventsReady: true, // 活跃条目的索引是边写边建的，不需要扫盘
 	}
 	m.entries[key] = e
 	e.elem = m.tmpLRU.PushFront(e)

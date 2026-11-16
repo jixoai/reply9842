@@ -37,7 +37,7 @@ services:
       - "-spool-dir"
       - "/var/lib/reply9842/spool"
       - "-upstream"
-      - "${UPSTREAM:-http://127.0.0.1:3431}"
+      - "${UPSTREAM:-http://127.0.0.1:3425}"
       - "-uphost"
       - "${UPHOST:-magpie.aiweb.xin}"
     # spool 持久化：重启后幂等区可复用

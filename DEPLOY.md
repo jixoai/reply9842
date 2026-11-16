@@ -39,7 +39,7 @@ docker compose -f docker-compose.server.yml up -d
 |---|---|---|
 | `TUNNEL_PORT` | 8443 | 宿主机隧道端口 |
 | `HEALTH_PORT` | 8080 | 宿主机健康检查端口（只绑回环） |
-| `UPSTREAM` | `http://127.0.0.1:3431` | 上游网关地址 |
+| `UPSTREAM` | `http://127.0.0.1:3425` | 上游网关地址 |
 | `UPHOST` | `magpie.aiweb.xin` | 转发时覆盖的 Host 头 |
 
 ### 3. 验证
@@ -54,10 +54,10 @@ docker inspect reply9842-server --format '{{.State.Health.Status}}'
 
 ### 上游在同机怎么办
 
-`UPSTREAM` 默认是 `127.0.0.1:3431`，但容器内的 `127.0.0.1` 是容器自己。
+`UPSTREAM` 默认是 `127.0.0.1:3425`，但容器内的 `127.0.0.1` 是容器自己。
 两种情况：
 
-**上游也是容器**（推荐）：放进同一个 compose 网络，`UPSTREAM=http://magpie:3431`。
+**上游也是容器**（推荐）：放进同一个 compose 网络，`UPSTREAM=http://magpie:3425`。
 
 **上游是宿主机服务**：
 
@@ -66,7 +66,7 @@ docker inspect reply9842-server --format '{{.State.Health.Status}}'
       - "host.docker.internal:host-gateway"
 ```
 
-然后 `UPSTREAM=http://host.docker.internal:3431`。
+然后 `UPSTREAM=http://host.docker.internal:3425`。
 
 ## 二、二进制 + systemd
 
@@ -89,7 +89,7 @@ ExecStart=/opt/reply9842/reply9842-server \
   -cert /opt/reply9842/certs/fullchain.pem \
   -key /opt/reply9842/certs/privkey.pem \
   -spool-dir /var/lib/reply9842/spool \
-  -upstream http://127.0.0.1:3431
+  -upstream http://127.0.0.1:3425
 Restart=always
 RestartSec=5
 
@@ -114,7 +114,7 @@ npm 包只含启动器，首次运行自动下载对应平台的二进制（见 
 | 参数 | 默认 | 说明 |
 |---|---|---|
 | `-listen` | `0.0.0.0:28443` | 隧道监听（QUIC 与 TCP/TLS 同端口） |
-| `-upstream` | `http://127.0.0.1:3431` | 上游网关地址 |
+| `-upstream` | `http://127.0.0.1:3425,http://127.0.0.1:3426` | 上游网关地址；逗号分隔多个候选，按序拨号（蓝绿双槽） |
 | `-uphost` | `magpie.aiweb.xin` | 转发时覆盖的 Host 头 |
 | `-cert` / `-key` | 必填 | TLS 证书与私钥 |
 | `-spool-dir` | `/var/lib/reply9842/spool` | 流式 spool 根目录 |

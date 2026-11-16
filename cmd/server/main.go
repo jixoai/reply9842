@@ -2,7 +2,7 @@
 //
 // 职责（2026-11-13 kzf 需求整合）：
 //  1. 接受 QUIC/TCP 隧道连接，解帧、解 dcz/zstd、校验 ResultHash
-//  2. 转发上游（默认 127.0.0.1:3431，同机回环，不出网卡）
+//  2. 转发上游（默认为同机回环的 magpie 蓝绿双槽 3425/3426，不出网卡）
 //  3. 流式 spool 双写：上游 chunk 边收边落盘，客户端从文件按偏移拉取
 //  4. 断线提升：客户端断开 → tmp→idem rename，上游继续接收
 //  5. 重连续传：客户端带 IdemKey + ResumeFrom/EventID 重连 → 重放 + 挂末尾
@@ -15,6 +15,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -41,6 +42,7 @@ import (
 type cfg struct {
 	listen         string
 	upstream       string
+	upURLs         *upstreamSet
 	upHost         string
 	headers        headerList // -header 可重复：转发到上游时附加/覆盖的请求头
 	cert           string
@@ -60,7 +62,11 @@ type cfg struct {
 func main() {
 	c := cfg{}
 	flag.StringVar(&c.listen, "listen", "0.0.0.0:28443", "隧道监听（QUIC 与 TCP 同端口）")
-	flag.StringVar(&c.upstream, "upstream", "http://127.0.0.1:3431", "上游 base URL（同机回环最优）")
+	flag.StringVar(&c.upstream, "upstream",
+		"http://127.0.0.1:3425,http://127.0.0.1:3426",
+		"上游 base URL，可逗号分隔多个候选（按序拨号，第一个连通的生效）。\n"+
+			"默认是 magpie 蓝绿双槽的网关端口：rolling-update 会翻转 a/b，\n"+
+			"写死单个端口的话每次轮转后 relay 都会整体失联")
 	flag.StringVar(&c.upHost, "uphost", "magpie.aiweb.xin",
 		"转发时覆盖的 Host 头（等价于 -header 'Host: ...'，保留兼容）")
 	flag.Var(&c.headers, "header",
@@ -83,6 +89,14 @@ func main() {
 	flag.StringVar(&c.logPath, "log", "", "逐请求日志")
 	flag.StringVar(&c.statsPath, "stats", "", "汇总统计")
 	flag.Parse()
+
+	// 上游候选列表在启动时校验：配错了就该立刻退出，而不是等到第一个请求
+	// 才在运行期把错误写成「上游失败」的 502（2026-11-16 的 3431 事故）。
+	ups, uerr := parseUpstreams(c.upstream)
+	if uerr != nil {
+		log.Fatalf("%v", uerr)
+	}
+	c.upURLs = ups
 
 	// 探针模式：容器内无 curl，用二进制自身做 HEALTHCHECK
 	if c.healthProbe {
@@ -162,6 +176,9 @@ func main() {
 				MaxIdleConnsPerHost: 50,
 				IdleConnTimeout:     90 * time.Second,
 				DisableCompression:  true,
+				// 拨号期故障转移：连接池仍按首选上游记账，真正建连时才
+				// 依次试候选（蓝绿槽哪个活着用哪个）。
+				DialContext: c.upURLs.dial,
 			},
 		},
 	}
@@ -428,7 +445,11 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 			if err := e.Err(); err != nil {
 				msg = err.Error()
 			}
-			s.fail(conn, msg)
+			// 头都没产生就失败：必须给下游一个真实的 5xx 响应。
+			// 只发 FrameError 的话，客户端 handler 根本没写过状态码，
+			// net/http 会自动补一个空的 200 —— 用户看到的就是「空返回」
+			// （2026-11-16 上游端口配错，全部请求都变成了这个现象）。
+			s.failWithStatus(conn, 502, msg)
 			return 502
 		}
 		// 头部等待必须有个上限：WaitMore(nil, ...) 在「条目存在但没有任何
@@ -436,7 +457,7 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 		// 服务端既没有 pump 也没有数据，请求就挂在那里——用户看到的是
 		// 「请求像卡住了」）。到点回 504，让客户端自己重试，比静默挂死好。
 		if time.Since(start) > noHeadTimeout {
-			s.fail(conn, "上游 120 秒未返回响应头（上游过载或请求已失效，请重试）")
+			s.failWithStatus(conn, 504, "上游 120 秒未返回响应头（上游过载或请求已失效，请重试）")
 			return 504
 		}
 		if !e.WaitMore(nil, e.Gen()) {
@@ -601,7 +622,7 @@ func (s *server) startPump(e *spool.Entry, h *meta.RequestHead, hdrRaw, body []b
 	go func() {
 		defer cancel()
 
-		u := strings.TrimSuffix(s.c.upstream, "/") + h.Path
+		u := s.c.upURLs.URL(h.Path)
 		req, err := http.NewRequestWithContext(ctx, h.Method, u, bytes.NewReader(body))
 		if err != nil {
 			e.Finish(err)
@@ -797,6 +818,46 @@ func (s *server) decodeBody(h *meta.RequestHead, wire []byte) (body []byte, encN
 func (s *server) fail(c *transport.Conn, msg string) {
 	if f, err := meta.WrapFrame(meta.FrameError, []byte(msg)); err == nil {
 		transport.WriteFrame(c, f)
+	}
+}
+
+// failWithStatus 在「响应头还没产生」时给下游一个真实的 HTTP 状态。
+//
+// 只发 FrameError 是帧级信号：客户端 handler 没写过状态码，net/http 在
+// Handler 返回时自动补 200，下游拿到的是「200 + 空 body」。大多数 SDK 会
+// 把它当空响应/解析错误，用户看不到真实原因——2026-11-16 的「空返回」
+// 就是这样：上游端口配成了 down 槽，每个请求都 connection refused，却
+// 全都显示成 200。
+//
+// 这里改发一个完整的响应：Response 头（identity 编码）+ JSON 错误体 +
+// Done。这样任何版本的客户端都能如实显示 5xx 与原因。
+func (s *server) failWithStatus(c *transport.Conn, status int, msg string) {
+	hdrs := meta.EncodeHeaders(http.Header{
+		"Content-Type": []string{"application/json; charset=utf-8"},
+	})
+	if out, err := meta.EncodeResponse(&meta.ResponseHead{
+		Status: status, Encoding: meta.EncIdentity,
+		BodyLen: -1, HeaderLen: int32(len(hdrs)),
+	}, hdrs, nil); err == nil {
+		if f, e := meta.WrapFrame(meta.FrameResponse, out); e == nil {
+			_ = transport.WriteFrame(c, f)
+		}
+	}
+	body, _ := json.Marshal(map[string]any{
+		"error": map[string]any{
+			"type":    "upstream_error",
+			"message": msg,
+		},
+	})
+	if out, err := meta.EncodeResponse(&meta.ResponseHead{
+		Status: 0, Encoding: meta.EncIdentity, BodyLen: int64(len(body)),
+	}, nil, body); err == nil {
+		if f, e := meta.WrapFrame(meta.FrameResponse, out); e == nil {
+			_ = transport.WriteFrame(c, f)
+		}
+	}
+	if f, err := meta.WrapFrame(meta.FrameDone, nil); err == nil {
+		_ = transport.WriteFrame(c, f)
 	}
 }
 

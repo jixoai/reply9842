@@ -54,16 +54,16 @@
 ### Requirement: 上游同机的两种接法
 
 文档 SHALL 给出两种上游接法：上游也是容器时放进同一 compose 网络（
-`UPSTREAM=http://magpie:3431`）；上游是宿主机服务时用
+`UPSTREAM=http://magpie:3425`）；上游是宿主机服务时用
 `extra_hosts: ["host.docker.internal:host-gateway"]` 并指向
-`http://host.docker.internal:3431`。
+`http://host.docker.internal:3425`。
 
 落地证据：`DEPLOY.md` 的「上游在同机怎么办」章节、
 `docker-compose.server.yml` 的 `UPSTREAM` 环境变量与注释。
 
 #### Scenario: 容器内 127.0.0.1 不是宿主机
 
-- **WHEN** 直接用默认 `UPSTREAM=http://127.0.0.1:3431` 而上游在宿主机
+- **WHEN** 直接用默认 `UPSTREAM=http://127.0.0.1:3425` 而上游在宿主机
 - **THEN** 连不通；文档给出 `host.docker.internal` 的解法
 
 ### Requirement: 二进制部署必须校验 sha256
