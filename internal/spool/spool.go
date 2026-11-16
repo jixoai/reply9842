@@ -25,6 +25,7 @@ package spool
 import (
 	"bytes"
 	"container/list"
+	"context"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -32,6 +33,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -80,6 +82,10 @@ type Entry struct {
 	mgr  *Manager
 	path string
 	file *os.File
+	// closed 与 file==nil 的语义分开：file==nil 也可能是「还没打开」。
+	// 重启后水合的条目默认不持有 fd（28k 条目 = 28k 个句柄，还会撞 ulimit），
+	// 第一次真正读取时才按 path 打开。
+	closed bool
 
 	mu       sync.Mutex
 	state    State
@@ -141,6 +147,27 @@ type EventMark struct {
 	ID     string
 }
 
+// ensureFileLocked 返回数据文件句柄。水合条目（重启后按 key 恢复）第一次
+// 真正读/写时才打开文件——启动阶段绝不 open 2 万个 fd。
+// 调用方必须持有 e.mu。
+func (e *Entry) ensureFileLocked() (*os.File, error) {
+	if e.closed {
+		return nil, errors.New("spool: entry closed")
+	}
+	if e.file != nil {
+		return e.file, nil
+	}
+	if e.path == "" {
+		return nil, errors.New("spool: entry has no path")
+	}
+	f, err := os.OpenFile(e.path, os.O_RDWR, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	e.file = f
+	return f, nil
+}
+
 // ReadFrom 从 offset 开始读取已落盘的 body 字节，最多 n 字节。
 // 返回实际读取的字节数；若 offset 已到末尾返回 (0, nil)。
 //
@@ -150,10 +177,11 @@ type EventMark struct {
 func (e *Entry) ReadFrom(offset int64, n int) ([]byte, error) {
 	if !e.Compressed() {
 		e.mu.Lock()
-		written, f := e.written, e.file
+		written := e.written
+		f, ferr := e.ensureFileLocked()
 		e.mu.Unlock()
-		if f == nil {
-			return nil, errors.New("spool: entry closed")
+		if ferr != nil {
+			return nil, ferr
 		}
 		if offset >= written {
 			return nil, nil
@@ -249,11 +277,11 @@ func (e *Entry) seek(from int64) error {
 		e.cur = nil
 	}
 	e.mu.Lock()
-	if e.file == nil {
-		e.mu.Unlock()
-		return errors.New("spool: entry closed")
-	}
+	_, ferr := e.ensureFileLocked()
 	e.mu.Unlock()
+	if ferr != nil {
+		return ferr
+	}
 
 	// decoder 会立刻起后台 goroutine 读 src，而 src 的 Read 要取 e.mu，
 	// 所以必须在创建 decoder 之前放锁（否则自锁）。
@@ -295,7 +323,7 @@ func (e *Entry) seek(from int64) error {
 func (e *Entry) FlushDown() bool {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	if e.cmpr == nil || e.file == nil {
+	if e.cmpr == nil || e.closed {
 		return false
 	}
 	before := e.readableLocked()
@@ -435,10 +463,11 @@ type sinkWriter struct{ e *Entry }
 
 func (s sinkWriter) Write(p []byte) (int, error) {
 	e := s.e
-	if e.file == nil {
-		return 0, errors.New("spool: entry closed")
+	f, ferr := e.ensureFileLocked()
+	if ferr != nil {
+		return 0, ferr
 	}
-	n, err := e.file.WriteAt(p, e.wire)
+	n, err := f.WriteAt(p, e.wire)
 	e.wire += int64(n)
 	return n, err
 }
@@ -458,10 +487,11 @@ func (s *wireSource) Read(p []byte) (int, error) {
 			return 0, nil
 		}
 		s.e.mu.Lock()
-		f, wire, complete := s.e.file, s.e.wire, s.e.complete
-		if f == nil {
+		f, ferr := s.e.ensureFileLocked()
+		wire, complete := s.e.wire, s.e.complete
+		if ferr != nil {
 			s.e.mu.Unlock()
-			return 0, errors.New("spool: entry closed")
+			return 0, ferr
 		}
 		if s.off < wire {
 			if int64(len(p)) > wire-s.off {
@@ -618,9 +648,9 @@ func (e *Entry) Append(p []byte) error {
 		return nil
 	}
 	e.mu.Lock()
-	if e.file == nil {
+	if _, ferr := e.ensureFileLocked(); ferr != nil {
 		e.mu.Unlock()
-		return errors.New("spool: entry closed")
+		return ferr
 	}
 
 	// 尚未拍板：先攒在 pending，攒够门槛再一次性决定。
@@ -672,7 +702,11 @@ func (e *Entry) Append(p []byte) error {
 
 // writePlainLocked 把明文直接写到 .dat 尾部（未压缩路径）。调用方持有 e.mu。
 func (e *Entry) writePlainLocked(p []byte) error {
-	if _, err := e.file.WriteAt(p, e.wire); err != nil {
+	f, ferr := e.ensureFileLocked()
+	if ferr != nil {
+		return ferr
+	}
+	if _, err := f.WriteAt(p, e.wire); err != nil {
 		return err
 	}
 	e.wire += int64(len(p))
@@ -866,6 +900,7 @@ func (e *Entry) Close() error {
 	e.closeCursor()
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	e.closed = true
 	if e.file != nil {
 		err := e.file.Close()
 		e.file = nil
@@ -918,15 +953,19 @@ func New(opt Options) (*Manager, error) {
 		entries: make(map[[32]byte]*Entry),
 		tmpLRU:  list.New(), idemLRU: list.New(),
 	}
-	// 恢复幂等区：进程重启后，之前 Detach/Complete 的条目必须可复用。
-	m.restoreIdem()
+	// 启动阶段不碰幂等区（2026-11-16 重写）。
+	//
+	// 旧实现逐条读 sidecar + open .dat + stat，28k 条目 / 11.8MB sidecar 实测
+	// 9.5 秒才把端口拉起来，还常驻 28,503 个 fd。这些元信息写的时候就已知，
+	// 启动时重算一遍纯属浪费；而且「可用」根本不需要它们：
+	//   - 续传按 key 找条目 → 路径可推导（Acquire 冷查，O(1)）；
+	//   - 字节预算收敛 → 纯后台策略，晚几秒无害。
+	// 目录维护（填充热表、清孤儿、预算收敛）交给 Hydrate，在监听就绪后跑。
+	//
 	// tmp/ 是「活跃请求」区，活跃请求不会跨进程存活——上一个进程留下的
 	// 文件必然是孤儿（客户端连接早已断、上游 pump 已死）。不清理会永久
 	// 占用磁盘且永不被引用。这是设计语义，不是数据丢失。
 	m.resetTmp()
-	m.mu.Lock()
-	m.evictLocked() // 恢复后立刻按预算收敛（旧进程可能留下超额文件）
-	m.mu.Unlock()
 	return m, nil
 }
 
@@ -945,81 +984,131 @@ func (m *Manager) resetTmp() {
 	}
 }
 
-// restoreIdem 扫描 idem/ 目录，按 sidecar 恢复完整 key 与响应头。
+// Hydrate 后台补水：把 idem/ 里「上个进程留下的成品」逐步装进内存表。
 //
-// 没有 sidecar 的 .dat 是旧版本遗留（只有 key 前 16 字节），既无法还原出
-// 正确 key（尾部补零后永远 miss）也无法还原响应头，属于不可用残骸：删除，
-// 避免永久占用预算。
-func (m *Manager) restoreIdem() {
-	dir := filepath.Join(m.dir, "idem")
-	des, err := os.ReadDir(dir)
-	if err != nil {
-		return
+// 启动可用性不依赖它（续传按 key 冷查就够），它做三件只能异步做的事：
+// 填充热表（让重复续传零 syscall）、清理孤儿、按预算收敛。
+//
+// 速率限制不是为了省 CPU，而是不与请求抢磁盘 IO：每 batch 条让路 pause。
+// ctx 取消（进程退出）即停止，已装表的条目继续有效。
+//
+// 不 open 数据文件：Entry.file 保持 nil，第一次真正读时才打开。旧实现为
+// 每条 open 一个 fd（28k 条目 = 28,503 个常驻句柄，还会撞 ulimit）。
+func (m *Manager) Hydrate(ctx context.Context, batch int, pause time.Duration) int {
+	if batch <= 0 {
+		batch = 200
 	}
-	for _, de := range des {
+	des, err := os.ReadDir(filepath.Join(m.dir, "idem"))
+	if err != nil {
+		return 0
+	}
+
+	type cand struct {
+		e   *Entry
+		mod time.Time
+	}
+	cands := make([]cand, 0, len(des))
+	for i, de := range des {
+		if ctx.Err() != nil {
+			return len(cands)
+		}
 		if de.IsDir() || filepath.Ext(de.Name()) != ".dat" {
 			continue
 		}
-		path := filepath.Join(dir, de.Name())
-		metaPath := strings.TrimSuffix(path, ".dat") + ".meta"
-
-		var sc sidecar
-		raw, rerr := os.ReadFile(metaPath)
-		if rerr != nil || json.Unmarshal(raw, &sc) != nil {
-			os.Remove(path)
-			os.Remove(metaPath)
-			continue
+		if e, ok := m.hydrateOne(de.Name()); ok {
+			cands = append(cands, cand{e: e, mod: e.lastAccess})
 		}
-		rawKey, kerr := hex.DecodeString(sc.Key)
-		if kerr != nil || len(rawKey) != 32 {
-			os.Remove(path)
-			os.Remove(metaPath)
-			continue
+		if pause > 0 && (i+1)%batch == 0 {
+			select {
+			case <-ctx.Done():
+				return len(cands)
+			case <-time.After(pause):
+			}
 		}
-
-		f, err := os.OpenFile(path, os.O_RDWR, 0o600)
-		if err != nil {
-			continue
-		}
-		st, err := f.Stat()
-		if err != nil {
-			f.Close()
-			continue
-		}
-
-		var key [32]byte
-		copy(key[:], rawKey)
-
-		e := &Entry{
-			Key: key, mgr: m, path: path, file: f,
-			state: StateComplete, inIdem: true, // 重启后不知上游状态，保守标记为 Complete
-			written: sc.Written, complete: true,
-			compressed: sc.Compressed, wire: st.Size(),
-			headStatus: sc.Status, headHeaders: sc.Headers, headSet: true,
-			notify:    make(chan struct{}),
-			createdAt: st.ModTime(), lastAccess: st.ModTime(),
-		}
-		// 老 sidecar 没有 Written 字段（旧版本写入 0）：退回文件大小。
-		// 压缩条目不能这么退——文件大小是 wire 字节，当明文长度会让续传多读。
-		if e.written == 0 && !e.compressed {
-			e.written = st.Size()
-		}
-		m.entries[key] = e
-		e.elem = m.idemLRU.PushFront(e)
 	}
+
+	// 按 mtime 从新到旧装表：LRU 尾部就是最久没被访问的，预算收敛先淘汰它们。
+	sort.Slice(cands, func(i, j int) bool { return cands[i].mod.After(cands[j].mod) })
+	m.mu.Lock()
+	for _, c := range cands {
+		if m.closed {
+			break
+		}
+		if _, ok := m.entries[c.e.Key]; ok {
+			continue // 补水期间请求路径已水合（或新建了同名 tmp），不覆盖
+		}
+		m.entries[c.e.Key] = c.e
+		c.e.elem = m.idemLRU.PushFront(c.e)
+	}
+	m.evictLocked()
+	m.mu.Unlock()
+	return len(cands)
+}
+
+// hydrateOne 读一条 sidecar + stat 数据文件，构造「未打开 fd」的条目。
+// 不持 m.mu（I/O 在锁外），插入由调用方统一做。
+func (m *Manager) hydrateOne(name string) (*Entry, bool) {
+	path := filepath.Join(m.dir, "idem", name)
+	metaPath := strings.TrimSuffix(path, ".dat") + ".meta"
+
+	var sc sidecar
+	raw, rerr := os.ReadFile(metaPath)
+	if rerr != nil || json.Unmarshal(raw, &sc) != nil {
+		// 没有 sidecar 的 .dat 是旧版本遗留（只有 key 前 16 字节），既还原不出
+		// 正确 key 也没有响应头，属于不可用残骸：删除，别永久占预算。
+		os.Remove(path)
+		os.Remove(metaPath)
+		return nil, false
+	}
+	rawKey, kerr := hex.DecodeString(sc.Key)
+	if kerr != nil || len(rawKey) != 32 {
+		os.Remove(path)
+		os.Remove(metaPath)
+		return nil, false
+	}
+	st, serr := os.Stat(path) // stat 而不是 open：不占 fd
+	if serr != nil {
+		return nil, false
+	}
+
+	var key [32]byte
+	copy(key[:], rawKey)
+	e := &Entry{
+		Key: key, mgr: m, path: path,
+		state: StateComplete, inIdem: true, // 重启后不知上游状态，保守标记 Complete
+		written: sc.Written, complete: true,
+		compressed: sc.Compressed, wire: st.Size(),
+		headStatus: sc.Status, headHeaders: sc.Headers, headSet: true,
+		notify:    make(chan struct{}),
+		createdAt: st.ModTime(), lastAccess: st.ModTime(),
+	}
+	// 老 sidecar 没有 Written 字段（旧版本写入 0）：退回文件大小。
+	// 压缩条目不能这么退——文件大小是 wire 字节，当明文长度会让续传多读。
+	if e.written == 0 && !e.compressed {
+		e.written = st.Size()
+	}
+	return e, true
 }
 
 // scanEventsLockedFile 从文件内容重建 SSE 事件索引（仅恢复路径使用）。
 func (e *Entry) scanEventsLockedFile() {
-	if e.file == nil || e.written <= 0 {
+	e.mu.Lock()
+	if e.written <= 0 {
+		e.mu.Unlock()
+		return
+	}
+	f, ferr := e.ensureFileLocked()
+	compressed, wire, written := e.compressed, e.wire, e.written
+	e.mu.Unlock()
+	if ferr != nil {
 		return
 	}
 	var plain []byte
-	if e.compressed {
+	if compressed {
 		// 读 wire 字节并解压；不够解满 written 时按实际解出的部分建索引，
 		// 大不了少几个事件标记（续传会退回按字节偏移，仍有正确性）。
-		raw := make([]byte, e.wire)
-		n, err := e.file.ReadAt(raw, 0)
+		raw := make([]byte, wire)
+		n, err := f.ReadAt(raw, 0)
 		if err != nil && err != io.EOF {
 			return
 		}
@@ -1034,8 +1123,8 @@ func (e *Entry) scanEventsLockedFile() {
 			return
 		}
 	} else {
-		plain = make([]byte, e.written)
-		n, err := e.file.ReadAt(plain, 0)
+		plain = make([]byte, written)
+		n, err := f.ReadAt(plain, 0)
 		if err != nil && err != io.EOF {
 			return
 		}
@@ -1050,25 +1139,48 @@ func (e *Entry) scanEventsLockedFile() {
 //
 // existing=true 表示该 key 已有条目（可能已 complete，也可能仍在接收），
 // 调用方应走「重放 + 挂载」路径；existing=false 表示新建，调用方需启动上游 pump。
+//
+// 重启后内存表是空的：这里先按 key 到幂等区**冷查**（文件名可推导，O(1)），
+// 命中就水合成 Entry。只有冷查也落空才新建 tmp 条目——启动时不再需要把
+// 两万多个条目全扫进内存（见 New 的注释）。
 func (m *Manager) Acquire(key [32]byte) (*Entry, bool, error) {
+	m.mu.Lock()
+	if m.closed {
+		m.mu.Unlock()
+		return nil, false, errors.New("spool: manager closed")
+	}
+	if e, ok := m.hitLocked(key); ok {
+		m.mu.Unlock()
+		return e, true, nil
+	}
+	m.mu.Unlock()
+
+	// 冷查要读 sidecar + stat 数据文件，不持 m.mu（否则会串行化所有并发 Acquire）。
+	if e, ok := m.loadIdemByKey(key); ok {
+		m.mu.Lock()
+		if m.closed {
+			m.mu.Unlock()
+			e.Close()
+			return nil, false, errors.New("spool: manager closed")
+		}
+		if cur, ok := m.hitLocked(key); ok { // 冷查期间别人已水合
+			m.mu.Unlock()
+			e.Close()
+			return cur, true, nil
+		}
+		m.entries[key] = e
+		e.elem = m.idemLRU.PushFront(e)
+		m.mu.Unlock()
+		return e, true, nil
+	}
+
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.closed {
 		return nil, false, errors.New("spool: manager closed")
 	}
-	if e, ok := m.entries[key]; ok {
-		e.mu.Lock()
-		e.lastAccess = time.Now()
-		e.mu.Unlock()
-		// 提升到 LRU 前端
-		if e.elem != nil {
-			if e.inIdem {
-				m.idemLRU.MoveToFront(e.elem)
-			} else {
-				m.tmpLRU.MoveToFront(e.elem)
-			}
-		}
-		return e, true, nil
+	if cur, ok := m.hitLocked(key); ok { // 冷查期间别人刚建
+		return cur, true, nil
 	}
 
 	path := filepath.Join(m.dir, "tmp", fmt.Sprintf("%x.dat", key[:16]))
@@ -1085,6 +1197,71 @@ func (m *Manager) Acquire(key [32]byte) (*Entry, bool, error) {
 	m.entries[key] = e
 	e.elem = m.tmpLRU.PushFront(e)
 	return e, false, nil
+}
+
+// hitLocked 命中内存表并刷新 LRU。调用方持有 m.mu。
+func (m *Manager) hitLocked(key [32]byte) (*Entry, bool) {
+	e, ok := m.entries[key]
+	if !ok {
+		return nil, false
+	}
+	e.mu.Lock()
+	e.lastAccess = time.Now()
+	e.mu.Unlock()
+	if e.elem != nil {
+		if e.inIdem {
+			m.idemLRU.MoveToFront(e.elem)
+		} else {
+			m.tmpLRU.MoveToFront(e.elem)
+		}
+	}
+	return e, true
+}
+
+// loadIdemByKey 按 key 直接定位幂等区里的成品（不依赖内存表、不持锁）。
+//
+// promote 只做同名 rename，所以路径是可推导的：`idem/<key[:16]>.dat`。
+// 成本 = 一次 sidecar 读 + 一次 stat，且只为「真的被引用」的 key 付费。
+// sidecar 里的 key 必须与请求 key 完全一致：不一致说明是哈希前缀碰撞或残骸，
+// 宁可当 miss（客户端重发），也不能把别人的响应喂给这个请求。
+func (m *Manager) loadIdemByKey(key [32]byte) (*Entry, bool) {
+	base := fmt.Sprintf("%x", key[:16])
+	path := filepath.Join(m.dir, "idem", base+".dat")
+	metaPath := filepath.Join(m.dir, "idem", base+".meta")
+
+	raw, err := os.ReadFile(metaPath)
+	if err != nil {
+		return nil, false
+	}
+	var sc sidecar
+	if json.Unmarshal(raw, &sc) != nil {
+		return nil, false
+	}
+	rawKey, kerr := hex.DecodeString(sc.Key)
+	if kerr != nil || len(rawKey) != 32 || !bytes.Equal(rawKey, key[:]) {
+		return nil, false
+	}
+	st, serr := os.Stat(path)
+	if serr != nil {
+		return nil, false
+	}
+
+	e := &Entry{
+		Key: key, mgr: m, path: path,
+		state: StateComplete, inIdem: true,
+		written: sc.Written, complete: true,
+		compressed: sc.Compressed, wire: st.Size(),
+		headStatus: sc.Status, headHeaders: sc.Headers, headSet: true,
+		notify:    make(chan struct{}),
+		createdAt: st.ModTime(), lastAccess: st.ModTime(),
+		// eventsReady=false：按 event id 续传时才扫盘建索引（sync.Once）
+	}
+	// 老 sidecar 没有 Written 字段（旧版本写入 0）：退回文件大小。
+	// 压缩条目不能这么退——文件大小是 wire 字节，当明文长度会让续传多读。
+	if e.written == 0 && !e.compressed {
+		e.written = st.Size()
+	}
+	return e, true
 }
 
 // Detach 客户端断开：状态转 Detached，并把文件从 tmp/ 移到 idem/。
@@ -1117,7 +1294,7 @@ func (m *Manager) promote(e *Entry, to State) error {
 	}
 	already := e.inIdem
 	oldPath := e.path
-	closed := e.file == nil
+	closed := e.closed
 	e.mu.Unlock()
 
 	if closed {
@@ -1211,6 +1388,7 @@ func (m *Manager) removeLocked(e *Entry) {
 	f := e.file
 	inIdem := e.inIdem
 	e.file = nil
+	e.closed = true
 	e.mu.Unlock()
 
 	// 压缩条目的解码游标持有后台 goroutine（zstd 流解码器），
@@ -1346,6 +1524,7 @@ func (m *Manager) Close() error {
 	m.closed = true
 	for _, e := range m.entries {
 		e.mu.Lock()
+		e.closed = true
 		if e.file != nil {
 			e.file.Close()
 			e.file = nil

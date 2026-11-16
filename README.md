@@ -193,6 +193,8 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 | `-spool-dir` | `/var/lib/reply9842/spool` | 流式响应 spool 根目录 |
 | `-tmp-mb` | `512` | 活跃区字节预算 |
 | `-idem-mb` | `2048` | 幂等区字节预算 |
+| `-spool-hydrate` | `true` | 监听就绪后后台补水幂等区（填充热表/清孤儿/预算收敛）；启动可用性不依赖它 |
+| `-spool-hydrate-batch` | `200` | 后台补水每批条数（批间让路 10ms，避免抢请求磁盘 IO） |
 | `-upstream-timeout` | `10m` | 上游请求超时（不随客户端断开取消）|
 | `-health-addr` | 空 | 健康检查监听（如 `127.0.0.1:8080`）；留空不启用 |
 | `-health-probe` | `false` | 探针模式：GET 自己的 `/healthz`，成功 exit 0。给 scratch 镜像的 HEALTHCHECK 用（容器内无 curl）|

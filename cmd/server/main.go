@@ -57,6 +57,8 @@ type cfg struct {
 	healthProbe    bool
 	logPath        string
 	statsPath      string
+	hydrate        bool
+	hydrateBatch   int
 }
 
 func main() {
@@ -88,6 +90,11 @@ func main() {
 			"给容器编排用：scratch 镜像无 shell，不能做 exec 型探活")
 	flag.StringVar(&c.logPath, "log", "", "逐请求日志")
 	flag.StringVar(&c.statsPath, "stats", "", "汇总统计")
+	flag.BoolVar(&c.hydrate, "spool-hydrate", true,
+		"监听就绪后在后台补水幂等区（填充热表/清孤儿/预算收敛）。\n"+
+			"启动可用性不依赖它；关掉只影响后续续传的命中速度与磁盘回收")
+	flag.IntVar(&c.hydrateBatch, "spool-hydrate-batch", 200,
+		"后台补水每批条数（每批之间让路 10ms，避免抢请求的磁盘 IO）")
 	flag.Parse()
 
 	// 上游候选列表在启动时校验：配错了就该立刻退出，而不是等到第一个请求
@@ -227,6 +234,16 @@ func main() {
 	}
 
 	log.Printf("就绪")
+
+	// 后台补水：端口已经在监听了，幂等区的目录维护（填充热表、清理孤儿、
+	// 按预算收敛）放在这里，启动可用性不再取决于它有多少条目。
+	if c.hydrate {
+		go func() {
+			t0 := time.Now()
+			n := sp.Hydrate(ctx, c.hydrateBatch, 10*time.Millisecond)
+			log.Printf("幂等区补水完成：%d 条目，用时 %s", n, time.Since(t0).Round(time.Millisecond))
+		}()
+	}
 
 	for a := range accepts {
 		go s.serve(a)

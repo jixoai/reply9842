@@ -2,6 +2,7 @@ package spool
 
 import (
 	"bytes"
+	"context"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -366,6 +367,9 @@ func TestRestoreDropsLegacyOrphanDat(t *testing.T) {
 
 	m2, _ := New(Options{Dir: dir, TmpBudget: 1 << 20, IdemBudget: 1 << 20})
 	defer m2.Close()
+
+	// 孤儿清理搬到后台补水（启动不再扫 idem/），这里显式跑一遍。
+	m2.Hydrate(context.Background(), 100, 0)
 
 	if _, existing, _ := m2.Acquire(k); existing {
 		t.Error("孤儿 .dat 不应被恢复成可用条目")
