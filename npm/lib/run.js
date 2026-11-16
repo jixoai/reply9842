@@ -215,6 +215,25 @@ function resolveKind(argv, argv1 = process.argv[1]) {
   return { kind: "cli", args: argv };
 }
 
+/**
+ * 确认缓存的二进制真的有执行位；没有就补一次 chmod。
+ *
+ * 下载路径（lib/download.js）是 rename 成功后才 chmod，所以「文件存在但不可执行」
+ * 是可达状态。这里返回 false 表示补权限也失败，调用方应当退回重新下载——
+ * 比 spawn EACCES 卡死要好。
+ */
+async function ensureExecutable(file) {
+  if (process.platform === "win32") return true;
+  try {
+    const st = await fs.promises.stat(file);
+    if (st.mode & 0o111) return true;
+    await fs.promises.chmod(file, 0o755);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 async function ensureBinary(kind, version) {
   const name = artifactName(kind);
   if (!name) {
@@ -230,7 +249,10 @@ async function ensureBinary(kind, version) {
   const dest = binaryPath(kind, version);
   try {
     const st = await fs.promises.stat(dest);
-    if (st.size > 0) return dest; // 已缓存，零网络开销
+    // 不能只看大小：下载器是「rename 之后才 chmod」，中间被杀、或被
+    // cp/解压/备份搬到别处丢了 mode，都会留下「大小非 0 但没有执行位」的
+    // 文件。只按 size 判定命中的话，spawn 永远 EACCES 且不会自愈。
+    if (st.size > 0 && (await ensureExecutable(dest))) return dest; // 已缓存，零网络开销
   } catch {
     /* 未缓存，继续下载 */
   }
@@ -287,7 +309,19 @@ async function main(argv = process.argv.slice(2)) {
   // 版本跟随 npm 包版本：包升级即视为「想要新版本二进制」，缓存按版本隔离。
   const bin = await ensureBinary(kind, PKG.version);
 
-  const child = spawn(bin, args, { stdio: "inherit" });
+  let child = spawn(bin, args, { stdio: "inherit" });
+  let spawnErr = await waitSpawn(child);
+  if (spawnErr && spawnErr.code === "EACCES" && process.platform !== "win32") {
+    // 缓存命中的文件可能在「rename 之后、chmod 之前」被中断，或被外部工具
+    // 搬走执行位。补一次权限再启，不让用户看到永久 EACCES。
+    await fs.promises.chmod(bin, 0o755).catch(() => {});
+    child = spawn(bin, args, { stdio: "inherit" });
+    spawnErr = await waitSpawn(child);
+  }
+  if (spawnErr) {
+    process.stderr.write(`reply9842: 启动失败：${spawnErr.message}\n`);
+    process.exit(1);
+  }
 
   for (const sig of ["SIGINT", "SIGTERM", "SIGHUP"]) {
     process.on(sig, () => {
@@ -306,6 +340,14 @@ async function main(argv = process.argv.slice(2)) {
       process.exit(128 + n);
     }
     process.exit(code == null ? 1 : code);
+  });
+}
+
+/** 等 spawn 有结论：成功 resolve(null)，失败 resolve(error)（不 reject，方便重试） */
+function waitSpawn(child) {
+  return new Promise((resolve) => {
+    child.once("spawn", () => resolve(null));
+    child.once("error", (err) => resolve(err));
   });
 }
 
@@ -332,6 +374,7 @@ module.exports = {
   binaryPath,
   cacheRoot,
   ensureBinary,
+  ensureExecutable,
   goarch,
   goos,
   main,
