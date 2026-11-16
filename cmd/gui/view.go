@@ -809,19 +809,20 @@ func hasLatencySample(b stats.Bucket) bool {
 // 若隐若现的虚影；2 加上圆头，稀疏点也读得出来。
 const latencyLineWidth float32 = 2
 
-// minTrafficBarPx 非零流量桶的最小总高度。
+// minBarPx 非零柱的最小总高度（两张图共用：体积柱与流量柱）。
 //
-// 只对「有实质流量」的桶生效（见 minTrafficBarFrac）：真实数据的单桶流量是
+// 只对「有实质流量」的桶生效（见 minBarFrac）：真实数据的单桶流量是
 // 重尾分布，峰值旁边常跟着 1% 量级的桶，按比例只剩 1-2px，抬到 3px 才读得
 // 出「这里有过流量」。低于 1% 的桶按真实比例画（可能不足 1px），否则空置的
 // 右半幅会被一排 3px 绿点填满。
-const minTrafficBarPx float32 = 3
+const minBarPx float32 = 3
 
-// minTrafficBarFrac 「有实质流量」的下限：占本窗口单桶峰值的 1%。
+// minBarFrac 「有实质流量」的下限：占本窗口单桶峰值的 1%。
 //
 // 1% 的依据：峰值 3.9 MB 时它就是 39 KB，已是「一次正常请求」的量级；
 // 更小的桶（0.08%）在任何柱宽下都读不出量级，只会在基线上留下碎屑。
-const minTrafficBarFrac float32 = 0.01
+// 体积柱（上行体积图）与流量柱共用这条：两图对小桶的存在性标准不能双标。
+const minBarFrac float32 = 0.01
 
 // trafficBarHeight 一个桶的柱高（像素）。
 //
@@ -834,8 +835,8 @@ func trafficBarHeight(total, maxBytes int64, plotH float32) float32 {
 	}
 	frac := float32(total) / float32(maxBytes)
 	h := frac * plotH
-	if frac >= minTrafficBarFrac && h < minTrafficBarPx {
-		h = minTrafficBarPx
+	if frac >= minBarFrac && h < minBarPx {
+		h = minBarPx
 	}
 	return h
 }
@@ -938,39 +939,104 @@ func (a *app) latencyHasGaps() bool {
 //
 // 压缩 99.9% 时蓝段按比例不足 0.2px，抗锯齿后会完全消失，整根柱子读成纯绿——
 // 那会丢失「仍然发了东西」这个事实。1px 是能稳定画出来的最小高度，只表达
-// 存在性；量级读数在柱高与图下文字里（都是精确的）。
+// 存在性；量级读数在柱高与图下文字里（都是精确的）。它只在柱高本身 ≥1px 时
+// 生效（见 volumeBarSegments）：亚像素柱上抬蓝段会把绿段挤成 0。
 const minWirePx float32 = 1
 
-// hasSeries 是否有可画的数据（有一秒带流量即可）
-func (a *app) hasSeries() bool {
-	for _, b := range a.agg.Series {
-		if b.UpRaw > 0 {
-			return true
+// volumeBarSegments 一根体积堆叠柱的两段高度（像素）：蓝段（实发）与绿段
+// （省下）。存在性口径与流量图的 trafficBarHeight 完全一致：
+//
+//	barH   = plotH × raw/maxRaw；占峰值 ≥ minBarFrac 的桶总高至少 minBarPx，
+//	         更小的桶按真实比例（可能亚像素、不可见）
+//	wireH  = barH × wire/raw；**只有 barH ≥ 1px 时**才把不足 1px 的蓝段抬到 1px
+//	savedH = barH - wireH（恒 ≥ 0）
+//
+// 为什么蓝段最小高度要以 barH ≥ 1px 为前提：柱高不足 1px 时，把蓝段抬到
+// 柱高上限会把绿段挤成 0——整根柱子读成「一点没省」，而图例承诺绿=省下。
+// 亚像素桶宁可整根不可见（与流量图 <1% 的桶同一条标准），也不伪造「纯蓝」。
+func volumeBarSegments(raw, wire, maxRaw int64, plotH float32) (barH, wireH, savedH float32) {
+	if raw <= 0 || maxRaw <= 0 || plotH <= 0 {
+		return 0, 0, 0
+	}
+	frac := float32(raw) / float32(maxRaw)
+	barH = frac * plotH
+	if frac >= minBarFrac && barH < minBarPx {
+		barH = minBarPx
+	}
+	if wire > 0 {
+		wireH = barH * float32(wire) / float32(raw)
+		if barH >= minWirePx && wireH < minWirePx {
+			wireH = minWirePx
 		}
 	}
-	return false
+	if wireH > barH {
+		wireH = barH
+	}
+	savedH = barH - wireH
+	return barH, wireH, savedH
 }
 
-// emptyChartNote 空态在图上说什么。
+// windowTotals 窗口内（Agg.Series）的请求数与上行明文体积合计。
 //
-// 三种情况必须分开说，因为它们对用户的下一步完全不同：
+// 空态判据必须用**窗口内**的 Series，不能用 Agg.Requests（保留期）：保留期
+// 有 42 个请求、窗口内一个都没有时，图卡说「最近 30 分钟没有请求」是对的；
+// 但窗口内若只有 GET/HEAD 这类无请求体的请求（UpRaw=0、Count>0），再说
+// 「没有请求」就会和同一张卡片里「近 24 小时 42 请求」的保留期总览自相矛盾。
+func (a *app) windowTotals() (requests, upRaw int64) {
+	for _, b := range a.agg.Series {
+		requests += b.Count
+		upRaw += b.UpRaw
+	}
+	return requests, upRaw
+}
+
+// hasSeries 是否有可画的柱子（窗口内有上行明文体积）
+func (a *app) hasSeries() bool {
+	_, upRaw := a.windowTotals()
+	return upRaw > 0
+}
+
+// emptyChartNote 空态在图上说什么（判据是窗口内的数据，不是保留期总量）。
 //
-//	没启动              → 启动代理
-//	启动了、历史也没有   → 去用 Agent（这才是第一次）
-//	启动了、历史有数据   → 这段时间没流量（不是统计丢了）
+// 四种情况分开说，因为它们对用户的下一步完全不同：
 //
-// 第三种是 2026-11-13 加小窗口（1 分钟）后暴露的：统计从磁盘恢复，历史里有
-// 上千条请求，但「最近 1 分钟」为空完全正常。此时说「等待第一个请求」会让
+//	没启动                      → 启动代理
+//	窗口内零记录、保留期也没有   → 等待第一个请求（这才是第一次）
+//	窗口内零记录、保留期有历史   → 这段时间没请求（不是统计丢了）
+//	窗口内有请求但没有上行体积   → 只有 GET/HEAD 等无请求体的请求，
+//	                              上行体积图为空（请求确实发生了）
+//
+// 第四种是本轮修的自相矛盾：判据若只看 Agg.Requests>0，GET-only 的窗口会
+// 同时显示「最近 30 分钟没有请求」和「近 24 小时 42 请求」两句话。
+// 第三种是 2026-11-13 加小窗口（1 分钟）后暴露的：统计从磁盘恢复，历史里
+// 有上千条请求，但「最近 1 分钟」为空完全正常——说「等待第一个请求」会让
 // 用户以为历史数据没了。
 func (a *app) emptyChartNote() string {
 	if !a.running() {
 		return "启动代理后，这里显示上行体积与压缩效果"
 	}
-	if a.agg.Requests > 0 {
-		return fmt.Sprintf("最近 %s没有请求（调大显示区间可看更早的数据）",
-			humanWindow(int(a.agg.WindowSec)))
+	span := int(a.agg.WindowSec)
+	if span <= 0 {
+		span = int(stats.DefaultWindow / time.Second)
 	}
-	return "等待第一个请求经过本地代理"
+	requests, upRaw := a.windowTotals()
+	switch {
+	case requests == 0:
+		if a.agg.Requests > 0 {
+			// 保留期有历史、窗口内为空：统计没丢，只是这段时间安静。
+			return fmt.Sprintf("最近 %s没有请求（调大显示区间可看更早的数据）",
+				humanWindow(span))
+		}
+		return "等待第一个请求经过本地代理"
+	case upRaw == 0:
+		// 窗口内有请求，但没有一个带请求体：图上是空的，但「没有请求」是
+		// 假话。只描述上行体积图为什么没柱子，别和保留期总览打架。
+		return "窗口内只有无请求体的请求（GET 等），上行体积图为空"
+	default:
+		// 有上行体积却没有可画的柱：目前 hasSeries 与这里同一判据，走不到；
+		// 留一句如实的描述，而不是误报「没有请求」。
+		return fmt.Sprintf("最近 %s有上行流量，但没有可画的时间桶", humanWindow(span))
+	}
 }
 
 // legend 图例。单列分层必须说明哪段是什么，否则两根不同颜色的段无从解释。
@@ -1082,21 +1148,13 @@ func (a *app) chartPlot(c *ui.Context, p *glass.Palette) {
 					continue // 空桶不画：基线上的空白就是「这一桶没流量」
 				}
 
-				// 柱高 = 这一桶的原始体积 / 满量程。峰值桶精确到轴顶。
-				barH := s.height(float32(b.UpRaw) / float32(maxRaw))
-				wireH := float32(0)
-				if b.UpWire > 0 {
-					wireH = barH * float32(b.UpWire) / float32(b.UpRaw)
-					// 压缩 99.9% 时按比例不足 1px，抗锯齿后会消失，
-					// 整根柱读成纯绿——至少 1px 保住「确实发了东西」。
-					if wireH < minWirePx {
-						wireH = minWirePx
-					}
+				// 柱高 = 这一桶的原始体积 / 满量程（峰值桶精确到轴顶）；
+				// 蓝/绿两段的切分与存在性标准全在 volumeBarSegments 里，
+				// 与下方流量图共用同一套小桶口径（≥1% 峰值 → 总高至少 3px）。
+				barH, wireH, savedH := volumeBarSegments(b.UpRaw, b.UpWire, maxRaw, s.base-s.top)
+				if barH <= 0 {
+					continue
 				}
-				if wireH > barH {
-					wireH = barH // 极小桶：蓝段以柱高为限，不许溢出柱顶
-				}
-				savedH := barH - wireH
 
 				x := area.X + float32(i)*slot + (slot-bw)/2
 				top := s.base - barH
@@ -1210,26 +1268,6 @@ func clampF(v, lo, hi float64) float64 {
 		return hi
 	}
 	return v
-}
-
-// heroNote 图中无数据时的一句话（也用于托盘与旧调用点）。
-//
-// 空态说「怎么开始」，运行态说「每 1,000 字节实际发多少」——空态要有下一步
-// 动作，而不是一句「无数据」。
-func (a *app) heroNote(g stats.Agg, running bool) string {
-	if !running {
-		return "启动代理后开始统计上行体积"
-	}
-	if g.UpRaw == 0 {
-		return "等待第一个请求经过本地代理"
-	}
-	// 几乎没压缩时说清事实，而不是把 "节省 0.0%" 摆出来当成绩：
-	// 小请求低于 delta 门槛是正常设计（省不了还白付隧道开销）。
-	if g.UpRatio > 0.98 {
-		return "本次流量未压缩（小于 delta 门槛的请求直接透传）"
-	}
-	return fmt.Sprintf("节省 %.1f%% · 每 1KB 只发 %dB",
-		(1-g.UpRatio)*100, rawBytesPerKilo(g.UpRatio))
 }
 
 // actionButton 一个套了 solid-glass 边光的按钮。
@@ -1647,10 +1685,10 @@ func (a *app) footer(c *ui.Context, p *glass.Palette) {
 	state := "未运行"
 	if a.running() {
 		state = "运行中"
-		// 时长只在有真实启动时刻时追加：测试/截图里 StartedAt 是零值，
+		// 时长只在有真实启动时刻（或测试注入）时追加：两者都没有时
 		// time.Since(零值) 会算出「2562047 小时」这种荒唐数字。
-		if up := a.runner.StartedAt(); !up.IsZero() {
-			state += " " + humanDuration(time.Since(up))
+		if d := a.uptime(); d > 0 {
+			state += " " + humanDuration(d)
 		}
 	}
 	// 单栏：状态 · 传输 · 实时带宽 ……… 版本号

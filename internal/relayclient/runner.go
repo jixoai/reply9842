@@ -613,6 +613,9 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	encName := "identity"
 	var payload []byte
 	var baseHash codec.Hash
+	// baseBody 记录本次 delta 实际使用的基线：重发到「另一个协议版本」
+	// 的连接时要按新连接重编（dcz2 ↔ 私有 dcz），不能原样重发旧帧。
+	var baseBody []byte
 	// dcz2 = 这条连接协商到了 ALPNv2（双方都支持 RFC 9842 §5 的 dcz2）。
 	// v1 连接上继续用私有 dcz —— 线上老服务端只认它。
 	dcz2 := conn.SupportsDcz2()
@@ -633,7 +636,7 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	default:
 		// 大请求：尝试 delta
-		bh, baseBody := h.finder.Pick(body)
+		bh, bb := h.finder.Pick(body)
 		if !bh.IsZero() {
 			lvl := codec.PickLevel(len(body))
 			var (
@@ -642,12 +645,12 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			)
 			if dcz2 {
 				// RFC 9842 §5：40 字节头里放 SHA-256(基线)，zstd 帧不写字典 ID
-				z, derr = codec.EncodeDcz2(body, lvl, baseBody)
+				z, derr = codec.EncodeDcz2(body, lvl, bb)
 			} else {
-				z, derr = codec.EncodeDcz(body, bh, lvl, baseBody)
+				z, derr = codec.EncodeDcz(body, bh, lvl, bb)
 			}
 			if derr == nil {
-				payload, baseHash, enc = z, bh, meta.EncDcz
+				payload, baseHash, baseBody, enc = z, bh, bb, meta.EncDcz
 				encName = fmt.Sprintf("dcz(L%d)", lvl)
 				if dcz2 {
 					enc, encName = meta.EncDcz2, fmt.Sprintf("dcz2(L%d)", lvl)
@@ -718,12 +721,48 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		h.pool.Drop(conn)
 		// 池里的连接可能在「探活之后、写之前」的窗口里死掉（这个窗口在
 		// 按连接 ALPN 选编码之后变宽了一个编码耗时，见 dcz2 协商）：换一条
-		// 新连接重发一次。帧已完整物化，且服务端按幂等键去重，重发不会让
-		// 上游被请求两次——半截帧只会让旧连接报错关闭，不影响新连接。
+		// 新连接重发一次。服务端按幂等键去重，重发不会让上游被请求两次。
+		//
+		// 关键：dcz2 与私有 dcz **绑定连接版本**，新连接的 ALPN 未必与旧
+		// 连接相同（-dcz2=false 回滚窗口、同地址混版本后端）。原样重发会把
+		// dcz2 发给只认私有 dcz 的服务端，得到 502 unknown encoding —— 而
+		// 这正是重发本该救回的那次请求（2026-11-17 复核实证 5/5 必现）。
+		// 所以版本不一致时必须按新连接重编帧。
 		retried := false
 		if conn.Reused() {
 			if c2, e := h.pool.Get(r.Context()); e == nil {
-				if e2 := transport.WriteFrame(c2, frame); e2 == nil {
+				f2 := frame
+				if (enc == meta.EncDcz) != c2.SupportsDcz2() && baseBody != nil {
+					wantDcz2 := c2.SupportsDcz2()
+					lvl := codec.PickLevel(len(body))
+					var (
+						z2   []byte
+						derr error
+					)
+					if wantDcz2 {
+						z2, derr = codec.EncodeDcz2(body, lvl, baseBody)
+					} else {
+						z2, derr = codec.EncodeDcz(body, baseHash, lvl, baseBody)
+					}
+					if derr == nil {
+						reqHead.Encoding = meta.EncDcz
+						if wantDcz2 {
+							reqHead.Encoding = meta.EncDcz2
+						}
+						reqHead.BodyLen = int64(len(z2))
+						if pl, e1 := meta.EncodeRequest(reqHead, headers, z2); e1 == nil {
+							if f3, e2 := meta.WrapFrame(meta.FrameRequest, pl); e2 == nil {
+								f2, payload = f3, z2
+								rec.Encoding = fmt.Sprintf("dcz2(L%d)", lvl)
+								if !wantDcz2 {
+									rec.Encoding = fmt.Sprintf("dcz(L%d)", lvl)
+								}
+								rec.UpWire = int64(len(z2))
+							}
+						}
+					}
+				}
+				if e2 := transport.WriteFrame(c2, f2); e2 == nil {
 					conn, retried = c2, true
 				} else {
 					h.pool.Drop(c2)

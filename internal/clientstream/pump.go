@@ -348,6 +348,24 @@ func (r *rawSink) writeDict(w http.ResponseWriter, enc meta.Encoding, p []byte) 
 		r.broken = true
 		return fmt.Errorf("downlink: %v 需要字典 %x，本地没有（拒绝按明文处理）", enc, declared[:8])
 	}
+	// 字典提供者给的内容必须与头里声明的哈希一致：错字典解出的「可解码但
+	// 内容错乱」是这一族里最坏的静默损坏，宁可直接失败让上层重发。
+	switch enc {
+	case meta.EncDcz:
+		var want codec.Hash
+		copy(want[:], declared[:])
+		if codec.Sum(dict) != want {
+			r.broken = true
+			return fmt.Errorf("downlink: dcz 字典与头声明哈希不符（提供者给错内容）")
+		}
+	case meta.EncDcz2:
+		var want codec.SHA256
+		copy(want[:], declared[:])
+		if codec.SumSHA256(dict) != want {
+			r.broken = true
+			return fmt.Errorf("downlink: dcz2 字典与头声明哈希不符（提供者给错内容）")
+		}
+	}
 	if err := r.start(w, enc, dict); err != nil {
 		r.broken = true
 		return err

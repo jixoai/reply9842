@@ -158,7 +158,15 @@ func decompressDcz2(payload []byte, dict []byte) ([]byte, error) {
 		return nil, err
 	}
 	defer d.Close()
-	return d.DecodeAll(payload, nil)
+	// 报错时不得返回部分输出：DecodeAll 在 CRC 校验失败时会先吐出已解出的
+	// 字节再返回错误（实测 len=16427 + "CRC check failed"）。调用方按
+	// 「err==nil 才用 out」写，但把不变量落在实现里更稳——下游若有人漏判
+	// err，错误明文就已经流到用户手里了。
+	out, err := d.DecodeAll(payload, nil)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
 }
 
 // ---- 流式解码（下行响应体） ----

@@ -154,3 +154,37 @@ func lastServerRecord(t *testing.T, path string) map[string]any {
 	}
 	return rec
 }
+
+// 头已发出之后的失败必须在逐请求日志里留痕。
+//
+// 曾经的洞：serveOne 改为「只在 rec.Status==0 时用返回值兜底」（修上游 400
+// 被记成 200 时引入）之后，头之后才发生的失败（上游 body 中途断掉、压缩器
+// 出错）不再覆盖状态码——这是对的（头已经发给下游了），但错误也没留痕，
+// 截断响应以 status:200 + 空 err 的样子沉底，排障失去依据。
+func TestPostHeadFailureIsRecordedWithErr(t *testing.T) {
+	g := newTestRig(t)
+	g.setReply(func(w http.ResponseWriter, _ *http.Request) {
+		hj, ok := w.(http.Hijacker)
+		if !ok {
+			t.Error("上游不支持 Hijack，测试无法构造截断响应")
+			return
+		}
+		c, buf, err := hj.Hijack()
+		if err != nil {
+			t.Errorf("hijack: %v", err)
+			return
+		}
+		// 声明 64KB、只写 10 字节就断连：下游收到 200 + 截断 body
+		_, _ = buf.WriteString("HTTP/1.1 200 OK\r\nContent-Length: 65536\r\n" +
+			"Content-Type: application/octet-stream\r\n\r\npartial-data\n")
+		_ = buf.Flush()
+		_ = c.Close()
+	})
+
+	_, _, _ = g.post("/v1/messages", fakeDczBody(2<<10, "truncated"), nil)
+
+	rec := lastServerRecord(t, g.serverLog)
+	if errStr, _ := rec["err"].(string); errStr == "" {
+		t.Fatalf("上游 body 截断后必须留 err（否则排障看不到这次响应是截断的），record=%v", rec)
+	}
+}

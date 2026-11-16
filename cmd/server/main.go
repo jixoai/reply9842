@@ -451,6 +451,15 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 	// 会按 identity 解析 zstd 流（实测把线上响应变成了二进制垃圾）。
 	var enc meta.Encoding
 
+	// noteErr 记录失败原因。respondNoHead 之后（头已经发给下游）的失败
+	// 改不了状态码，但错误必须在逐请求日志里留痕——否则「上游 body 中途
+	// 断掉」这类截断响应会以 status:200 且无 err 的样子沉底（复核实证）。
+	noteErr := func(msg string) {
+		if rec.Err == "" {
+			rec.Err = msg
+		}
+	}
+
 	// 等响应头就绪
 	for {
 		if st, hdrs, ok := e.Head(); ok {
@@ -463,6 +472,7 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 			}
 			out, err := meta.EncodeResponse(rh, hdrs, nil)
 			if err != nil {
+				noteErr("encode head: " + err.Error())
 				s.fail(conn, "encode head: "+err.Error())
 				return 500
 			}
@@ -481,6 +491,7 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 			if err := e.Err(); err != nil {
 				msg = err.Error()
 			}
+			noteErr(msg)
 			// 头都没产生就失败：必须给下游一个真实的 5xx 响应。
 			// 只发 FrameError 的话，客户端 handler 根本没写过状态码，
 			// net/http 会自动补一个空的 200 —— 用户看到的就是「空返回」
@@ -493,7 +504,9 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 		// 服务端既没有 pump 也没有数据，请求就挂在那里——用户看到的是
 		// 「请求像卡住了」）。到点回 504，让客户端自己重试，比静默挂死好。
 		if time.Since(start) > noHeadTimeout {
-			s.failWithStatus(conn, 504, "上游 120 秒未返回响应头（上游过载或请求已失效，请重试）")
+			const slow = "上游 120 秒未返回响应头（上游过载或请求已失效，请重试）"
+			noteErr(slow)
+			s.failWithStatus(conn, 504, slow)
 			return 504
 		}
 		if !e.WaitMore(nil, e.Gen()) {
@@ -508,6 +521,7 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 		var err error
 		cw, err = downlink.New(fw)
 		if err != nil {
+			noteErr("compressor: " + err.Error())
 			s.fail(conn, "compressor: "+err.Error())
 			return 500
 		}
@@ -555,6 +569,7 @@ func (s *server) streamToClient(conn *transport.Conn, e *spool.Entry, from int64
 		}
 		if e.IsComplete() {
 			if err := e.Err(); err != nil {
+				noteErr("upstream: " + err.Error())
 				s.fail(conn, "upstream: "+err.Error())
 				return 502
 			}

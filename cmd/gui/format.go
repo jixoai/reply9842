@@ -189,15 +189,6 @@ func ratioFactor(ratio float64) (string, bool) {
 	}
 }
 
-// rawBytesPerKilo 每 1,000 字节明文实际发出的字节数（hero-note 的说明口径）
-func rawBytesPerKilo(ratio float64) int {
-	n := int(ratio*1000 + 0.5)
-	if n < 1 {
-		return 0
-	}
-	return n
-}
-
 // Error 前缀可能叠三层（`listen 127.0.0.1:19008: listen tcp 127.0.0.1:19008: bind: ...`）。
 // 界面只该说一句人话，所以这里按已知形态做一次归一。
 var (

@@ -136,6 +136,10 @@ type app struct {
 	// 生产路径永远不设这两个字段，所以它们不影响真实行为。
 	fakeRun *bool
 	fakeErr error
+	// fakeUptime 给测试注入「已经跑了多久」（nil 时用 Runner 的真实启动时刻）。
+	// 底栏在出货构建里同时有版本号与运行时长；测试默认两者都没有，
+	// 布局最坏情况就测不到（见 TestFooterFitsNarrowWindow）。
+	fakeUptime *time.Duration
 
 	// 两个时间跨度偏好（持久化在 settings.json，重启后保持）。
 	//
@@ -589,15 +593,21 @@ const rateSampleMaxGap = 5 * time.Second
 //   - 计数变小：保留期改小、日志被压实、统计源换了——差值无意义，重置基线
 //   - 采样间隔不足 rateSampleMinGap：连读数都不更新，沿用上一次
 //   - 采样间隔超过 rateSampleMaxGap：那是中断期间的平均值，不能冒充实时速率
+//   - 时钟回拨（基线时刻在未来）：丢掉基线重建，否则这个采样器会永久静默
 func (a *app) sampleStats() stats.Agg {
 	g := a.snapshot()
 	now := time.Now()
+	dt := now.Sub(a.ratePrevAt)
 	switch {
 	case a.ratePrevAt.IsZero():
 		// 第一次采样：建基线，读数从下一个间隔开始才有意义。
 		a.ratePrevAt, a.ratePrevUp, a.ratePrevDown = now, g.UpWire, g.DownWire
-	case now.Sub(a.ratePrevAt) >= rateSampleMinGap:
-		dt := now.Sub(a.ratePrevAt)
+	case dt <= 0:
+		// 时钟回拨 / 基线来自未来：差值（now-prev）永远 < minGap，不重置的话
+		// 读数会永久停在旧值上（将来若把基线持久化，这就是「永远静止的实时
+		// 带宽」）。丢掉基线，下一次采样重建。
+		a.resetRate()
+	case dt >= rateSampleMinGap:
 		du, dd := g.UpWire-a.ratePrevUp, g.DownWire-a.ratePrevDown
 		switch {
 		case du < 0 || dd < 0:
@@ -639,6 +649,21 @@ func (a *app) lastErr() error {
 		return a.fakeErr
 	}
 	return a.runner.Err()
+}
+
+// uptime 已运行时长（0 = 未运行 / 没有真实启动时刻）。
+//
+// 测试与自动化截图可以注入（fakeUptime）：底栏在出货构建里同时有版本号与
+// 运行时长，测试默认两者都没有，不加注入就测不到最宽的底栏组合。
+func (a *app) uptime() time.Duration {
+	if a.fakeUptime != nil {
+		return *a.fakeUptime
+	}
+	up := a.runner.StartedAt()
+	if up.IsZero() {
+		return 0
+	}
+	return time.Since(up)
 }
 
 // ---- 窗口 ----
