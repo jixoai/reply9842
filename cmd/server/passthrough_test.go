@@ -366,6 +366,15 @@ func (g *testRig) readClientLog() []clientLogRec {
 	if err != nil {
 		return nil
 	}
+	// 末行可能正在写入（尚无换行结尾）：先丢掉半行，轮询下一轮再读。
+	// 与 lastServerRecord 同属「响应完成 → 日志落盘」的窗口竞态。
+	if len(raw) > 0 && raw[len(raw)-1] != '\n' {
+		if i := bytes.LastIndexByte(raw, '\n'); i >= 0 {
+			raw = raw[:i]
+		} else {
+			return nil
+		}
+	}
 	var out []clientLogRec
 	for _, line := range bytes.Split(raw, []byte{'\n'}) {
 		if len(bytes.TrimSpace(line)) == 0 {

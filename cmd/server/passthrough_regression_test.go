@@ -26,10 +26,12 @@ import (
 	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"os"
 	"slices"
 	"testing"
+	"time"
 )
 
 // TestMultiValueHeaderPreserved_Request 请求方向：
@@ -140,19 +142,34 @@ func TestUpstreamErrorRecordedWithRealStatus(t *testing.T) {
 
 func lastServerRecord(t *testing.T, path string) map[string]any {
 	t.Helper()
-	raw, err := os.ReadFile(path)
-	if err != nil {
-		t.Fatalf("读服务端日志: %v", err)
+	// 响应写给下游与逐请求日志落盘之间有极短窗口（Linux runner 上实测会输掉
+	// 这场竞态：读到空文件或半行 JSON）。轮询到「最后一行完整且可解析」为止。
+	deadline := time.Now().Add(5 * time.Second)
+	var lastErr error
+	for {
+		raw, err := os.ReadFile(path)
+		if err == nil {
+			raw = bytes.TrimSpace(raw)
+			if len(raw) > 0 {
+				lines := bytes.Split(raw, []byte("\n"))
+				last := lines[len(lines)-1]
+				var rec map[string]any
+				if err := json.Unmarshal(last, &rec); err == nil {
+					return rec
+				} else {
+					lastErr = fmt.Errorf("解析最后一行: %w\n%s", err, last)
+				}
+			} else {
+				lastErr = fmt.Errorf("日志文件为空")
+			}
+		} else {
+			lastErr = err
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("等待服务端日志超时: %v（%s）", lastErr, path)
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
-	lines := bytes.Split(bytes.TrimSpace(raw), []byte("\n"))
-	if len(lines) == 0 {
-		t.Fatal("服务端日志为空")
-	}
-	var rec map[string]any
-	if err := json.Unmarshal(lines[len(lines)-1], &rec); err != nil {
-		t.Fatalf("解析最后一行: %v\n%s", err, lines[len(lines)-1])
-	}
-	return rec
 }
 
 // 头已发出之后的失败必须在逐请求日志里留痕。
