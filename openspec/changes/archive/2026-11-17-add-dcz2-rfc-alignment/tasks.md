@@ -25,4 +25,7 @@
 ## 4. 文档与回滚
 
 - [x] 4.1 README 补 dcz2/ALPN/flag 说明
-- [ ] 4.2 发布后：生产 `-dcz2=false` 演练一次回滚路径（仅验证开关语义，随后恢复 true）
+- [x] 4.2 `-dcz2=false` 回滚路径演练（Owner 裁决：不污染线上）。用 v0.3.11 release 二进制在独立端口
+      （server 28444 / cli 18082）+ 本地 echo 上游，分别以默认与 `-dcz2=false` 跑同一 32KB 请求两次：
+      默认 → 第二次 `enc=dcz2`、`base_hit=true`；关闭 → 自动降级 `enc=dcz`、`base_hit=true`；两轮 HTTP 均 200、
+      上游收到的 body 长度一致（32479）。进程与端口已回收。
