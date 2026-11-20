@@ -374,6 +374,9 @@ func main() {
 			a.detectedIP, a.detectedIface = ip, iface
 		}
 	}
+	// 老配置可能保存过「代理 + QUIC」这个非法组合：启动即纠正，避免第一次
+	// 启动就撞上一个必然失败的组合（代理承载不了 UDP）。
+	a.transport = transportForNetwork(a.netMode, a.transport)
 
 	a.runner = relayclient.New(cfg)
 	a.runner.SetLogger(logger)

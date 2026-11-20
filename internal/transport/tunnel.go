@@ -214,6 +214,12 @@ type connectResult struct {
 
 // Dial 建立连接。Mode=auto 时按 prefer → quic → tcp 顺序尝试。
 func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
+	// 代理只承载 TCP（HTTP CONNECT / SOCKS5 都是 TCP 隧道），显式指定 QUIC
+	// 时不能去拨——否则会白等一个 QUIC 握手超时，最终给用户一句误导性的
+	// "quic dial: context deadline exceeded"。这里直接给出可操作的错误。
+	if d.Proxy != "" && d.Mode == KindQUIC {
+		return nil, errors.New("transport: 代理模式不支持 QUIC（HTTP/SOCKS 代理只承载 TCP），请改用 tcp 或 auto")
+	}
 	// 不要写回 d.QuicProbe：Dial 会被多个请求 goroutine 并发调用，写共享字段
 	// 是数据竞争（-race 实测抓到过）。用局部值，语义完全一样。
 	probe := d.QuicProbe
@@ -230,10 +236,11 @@ func (d *Dialer) Dial(ctx context.Context) (*Conn, error) {
 	default: // auto
 		order = []Kind{KindQUIC, KindTCP}
 		if d.Proxy != "" {
-			// 代理只承载 TCP：先探 QUIC 只会白等一个探测超时。
+			// 代理只承载 TCP：永不尝试 QUIC。注意这里必须与下面的 prefer
+			// 分支互斥——否则「上次 QUIC 失败过」会把刚设好的 [TCP] 又改回
+			// [TCP, QUIC]，在代理链路里重新等一次 QUIC 超时。
 			order = []Kind{KindTCP}
-		}
-		if p, ok := d.prefer.Load().(Kind); ok && p == KindTCP {
+		} else if p, ok := d.prefer.Load().(Kind); ok && p == KindTCP {
 			// 上次 QUIC 失败过，先试 TCP（但仍会给 QUIC 一次机会在下次连接）
 			order = []Kind{KindTCP, KindQUIC}
 		}

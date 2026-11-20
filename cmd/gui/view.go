@@ -1557,6 +1557,12 @@ func (a *app) networkRow(c *ui.Context, p *glass.Palette, disabled bool) {
 				a.detectedIP, a.detectedIface = ip, iface
 			}
 		}
+		// 代理只承载 TCP：QUIC 在这里不是一个「稍后才会失败」的选项，而是
+		// 必然失败的组合。切到代理时自动纠正，免得用户以为选了它就能用。
+		if fixed := transportForNetwork(a.netMode, a.transport); fixed != a.transport {
+			a.transport = fixed
+			a.setNotice("代理模式不支持 QUIC，传输方式已改为「自动」（走 TCP）", false)
+		}
 	}
 
 	// 一行说明：三选一各自的含义不同，光看标签猜不出来。
@@ -1584,9 +1590,28 @@ func (a *app) networkRow(c *ui.Context, p *glass.Palette, disabled bool) {
 	}
 }
 
+// transportChoices 按网络出口返回可选的传输方式。
+//
+// 代理只承载 TCP（HTTP CONNECT / SOCKS5 都是 TCP 隧道），所以代理模式下
+// 不提供 QUIC 选项——否则用户选了也只会白等一个握手超时，报错还指向服务端。
+func transportChoices(netMode string) (options, labels []string) {
+	if netMode == relayclient.NetworkProxy {
+		return []string{"auto", "tcp"}, []string{"自动", "TCP"}
+	}
+	return []string{"auto", "quic", "tcp"}, []string{"自动", "QUIC", "TCP"}
+}
+
+// transportForNetwork 把「网络模式 + 传输方式」纠正成合法组合。
+// 唯一需要纠正的是 代理 + QUIC：代理承载不了 UDP，QUIC 必然失败。
+func transportForNetwork(netMode, transport string) string {
+	if netMode == relayclient.NetworkProxy && transport == "quic" {
+		return "auto"
+	}
+	return transport
+}
+
 func (a *app) transportRow(c *ui.Context, p *glass.Palette, disabled bool) {
-	options := []string{"auto", "quic", "tcp"}
-	labels := []string{"自动", "QUIC", "TCP"}
+	options, labels := transportChoices(a.netMode)
 	idx := 0
 	for i, o := range options {
 		if o == a.transport {

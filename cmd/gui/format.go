@@ -224,6 +224,19 @@ func humanError(err error) string {
 	if strings.Contains(msg, "unknown transport") || strings.Contains(msg, "未知传输方式") {
 		return "传输方式不可用（可选 自动 / QUIC / TCP）"
 	}
+	// 代理 + QUIC 是必然失败的组合：transport 层已改为立即报错，这里把它
+	// 翻译成用户能直接照做的动作，而不是让「dial: ...」占着失败行。
+	if strings.Contains(msg, "代理模式不支持 QUIC") {
+		return "代理模式不支持 QUIC：请把传输方式改为「自动」或「TCP」"
+	}
+	// tcp tls: EOF 的典型成因不是服务端崩了，而是代理 TUN 把到 28443 的连接
+	// 劫走、在 TLS 握手中间切断（见 transport.Dialer.LocalAddr 的注释）。
+	if strings.Contains(msg, "tls: EOF") {
+		return "TLS 被中间网络切断（疑似代理 TUN 劫持）：把「网络」切到「直连」或「代理」后重新启动"
+	}
+	if strings.Contains(msg, "quic dial") && strings.Contains(msg, "context deadline exceeded") {
+		return "QUIC 无响应（UDP 可能被代理/防火墙拦截）：传输方式改用「自动」或「TCP」"
+	}
 	// 已经是一句人话（没有三层嵌套的 "x: y: z"）时原样给出
 	if strings.Count(msg, ": ") <= 1 {
 		return msg
