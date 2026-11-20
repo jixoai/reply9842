@@ -121,12 +121,25 @@ func (u *Updater) Mirrors() ([]string, error) {
 // Kind 返回产品形态。
 func (u *Updater) Kind() Kind { return u.opts.Kind }
 
-// token 优先用显式配置，其次环境变量。
+// token 返回 GitHub API token，优先级：
+//
+//	Options.Token → GH_TOKEN → GITHUB_TOKEN → 本机 gh CLI 登录态
+//
+// 前三者允许调用方/CI 显式控制；最后的 gh CLI 是给普通开发者机器的兜底：
+// 未认证 API 只有 60 次/小时/IP，而 gh 登录用户的 token 有 5000 次/小时。
+// 读取 gh 仅在本机 spawn 一次命令，token 只用于 api.github.com，不落盘、
+// 不写日志、不发给镜像。
 func (u *Updater) token() string {
 	if t := strings.TrimSpace(u.opts.Token); t != "" {
 		return t
 	}
-	return strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
+	if t := strings.TrimSpace(os.Getenv("GH_TOKEN")); t != "" {
+		return t
+	}
+	if t := strings.TrimSpace(os.Getenv("GITHUB_TOKEN")); t != "" {
+		return t
+	}
+	return localGHToken()
 }
 
 // apiBase 返回 GitHub API 根地址（测试可覆盖）。

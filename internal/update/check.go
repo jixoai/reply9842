@@ -161,9 +161,82 @@ func (u *Updater) Check(ctx context.Context) (Info, error) {
 	return info, nil
 }
 
-// fetchLatest 拉取 release 元数据，并把 HTTP 层的失败翻译成可分支的错误。
+// fetchLatest 拉取 release 元数据：直连（可带 token）失败后，再试配置的
+// 镜像前缀（永不携带 token）。
+//
+// 为什么要镜像兜底：GitHub API 未认证配额是 60 次/小时/IP，共享出口（公司
+// NAT、机场节点）很容易打满。实测 gh-proxy.com 能转发 api.github.com 的
+// JSON，且请求从镜像自己的出口发出，可绕开本机 IP 的配额；ghfast.top /
+// ghproxy.net 实测不支持 API 路径，会自然落到下一候选。
+//
+// 安全边界：Authorization 只发给直连的 api.github.com，绝不发给镜像——
+// token 交给第三方等于泄露账号凭据。
 func (u *Updater) fetchLatest(ctx context.Context) (release, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.apiBase()+"/repos/"+Repo+"/releases/latest", nil)
+	base := u.apiBase()
+	path := "/repos/" + Repo + "/releases/latest"
+	token := u.token()
+
+	type candidate struct {
+		url           string
+		authoritative bool
+		timeout       time.Duration
+	}
+	cands := []candidate{{
+		url:           base + path,
+		authoritative: true,
+	}}
+	for _, m := range u.mirrors {
+		if m == DirectMirror {
+			continue
+		}
+		// 镜像链是第三方服务，单次给更短的超时，避免一个挂死的镜像吃光
+		// 整个检查窗口。
+		cands = append(cands, candidate{
+			url:     m + base + path,
+			timeout: 6 * time.Second,
+		})
+	}
+
+	var firstErr, lastErr, rateErr error
+	for i, c := range cands {
+		reqCtx, cancel := ctx, func() {}
+		if c.timeout > 0 {
+			reqCtx, cancel = context.WithTimeout(ctx, c.timeout)
+		}
+		rel, err := u.fetchLatestURL(reqCtx, c.url, token, c.authoritative)
+		cancel()
+		if err == nil {
+			return rel, nil
+		}
+		// 直连 404 是权威结论（仓库没有 release），不值得再问镜像。
+		if errors.Is(err, ErrNoRelease) {
+			return release{}, err
+		}
+		if errors.Is(err, ErrRateLimited) {
+			rateErr = err
+		}
+		if i == 0 {
+			firstErr = err
+		}
+		lastErr = err
+	}
+	if rateErr != nil {
+		return release{}, rateErr
+	}
+	if firstErr != nil {
+		// 优先报直连的失败原因；镜像的失败通常只是「该镜像不支持 API」。
+		return release{}, firstErr
+	}
+	if lastErr != nil {
+		return release{}, lastErr
+	}
+	return release{}, errors.New("update: 没有可用的检查端点")
+}
+
+// fetchLatestURL 请求单个端点并解析。authoritative 为真表示这是 GitHub 直连
+// （404 可解释为「没有 release」）；镜像的 404 只当作该镜像不可用。
+func (u *Updater) fetchLatestURL(ctx context.Context, url, token string, authoritative bool) (release, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, url, nil)
 	if err != nil {
 		return release{}, fmt.Errorf("update: 构造请求: %w", err)
 	}
@@ -171,8 +244,9 @@ func (u *Updater) fetchLatest(ctx context.Context) (release, error) {
 	// 上游的字段改名影响（本项目只用 tag_name/body，但原则不变）。
 	req.Header.Set("Accept", "application/vnd.github+json")
 	req.Header.Set("User-Agent", "reply9842-update")
-	if token := u.token(); token != "" {
+	if authoritative && token != "" {
 		// 认证只影响限额（60 → 5000/小时），不改变响应结构。
+		// 镜像请求绝不能带上这个头（见 fetchLatest 的安全边界说明）。
 		req.Header.Set("Authorization", "Bearer "+token)
 	}
 
@@ -185,7 +259,10 @@ func (u *Updater) fetchLatest(ctx context.Context) (release, error) {
 	// 404 有两种语义：仓库不存在（配置错了）或还没有 release（正常）。本包的
 	// Repo 是常量，所以只能是后者——但错误信息仍要说明白，避免用户以为是网络问题。
 	if resp.StatusCode == http.StatusNotFound {
-		return release{}, ErrNoRelease
+		if authoritative {
+			return release{}, ErrNoRelease
+		}
+		return release{}, fmt.Errorf("update: 镜像不支持 release API（404）")
 	}
 	if limited, retry := isRateLimited(resp); limited {
 		if !retry.IsZero() {
