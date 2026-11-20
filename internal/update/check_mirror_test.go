@@ -44,8 +44,10 @@ func TestCheckFallsBackToAPIMirror(t *testing.T) {
 	}))
 	defer mirror.Close()
 
+	// 用 CLI 产物：GUI 在 Linux runner 上没有可下载产物，Check 会在请求前
+	// 就因 CurrentArtifact 失败；本测试只验证 API 候选链，与产品形态无关。
 	u, err := New(Options{
-		Kind:           KindGUI,
+		Kind:           KindCLI,
 		CurrentVersion: "v0.1.0",
 		Token:          "secret",
 		Mirrors:        []string{mirror.URL + "/"},
@@ -88,7 +90,7 @@ func TestCheckDirect404DoesNotTryMirror(t *testing.T) {
 	defer mirror.Close()
 
 	u, err := New(Options{
-		Kind:           KindGUI,
+		Kind:           KindCLI,
 		CurrentVersion: "v0.1.0",
 		Mirrors:        []string{mirror.URL + "/"},
 		apiBase:        direct.URL,
