@@ -235,6 +235,22 @@ func (c *Config) normalizeRoutes() {
 		if rs[i].Transport == "" {
 			rs[i].Transport = c.Transport
 		}
+		// 源地址同样继承（缺它是真实踩到的可用性缺陷）：
+		// 用户用 -routes-file 描述多条线路时，`-local-addr` 这个**全局**
+		// 开关（绕开代理 TUN 劫持）对每条 direct 线路都该生效。早期实现
+		// 只在「Routes 为空、由单值字段合成」的路径里带上它，于是
+		// `-routes-file + -local-addr` 组合会连不上（实测 502/EOF）。
+		//
+		// 只在 direct 线路且用户没逐条指定时补——relay 线路不该绑源地址
+		// （它的语义就是「不依赖本机网络」，Validate 也会拒绝）。
+		if rs[i].LocalAddr == "" && c.LocalAddr != "" && rs[i].Kind == route.KindDirect {
+			rs[i].LocalAddr = c.LocalAddr
+		}
+		// 代理地址同理：全局 -proxy 对「未指定代理的 proxy 线路」生效。
+		// 反过来 direct 线路绝不能继承 proxy（那会静默走代理，Validate 会拒）。
+		if rs[i].Proxy == "" && c.Proxy != "" && rs[i].Kind == route.KindProxy {
+			rs[i].Proxy = c.Proxy
+		}
 	}
 	c.Routes = route.Set(rs).Normalize()
 }

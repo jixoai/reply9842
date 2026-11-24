@@ -252,3 +252,64 @@ func TestAllRoutesDisabledRejected(t *testing.T) {
 		t.Fatal("全部线路禁用时应当报错")
 	}
 }
+
+// 全局 -local-addr 必须继承到每条 direct 线路（用 -routes-file 时的真实缺陷）。
+//
+// 实测：`-routes-file + -local-addr` 组合曾连不上（502/EOF），根因是
+// normalizeRoutes 在 Routes 非空的分支里只继承 Server/Transport，漏了 LocalAddr。
+func TestGlobalLocalAddrInheritedByRoutes(t *testing.T) {
+	c := Config{
+		LocalAddr: "192.168.1.106",
+		Routes: route.Set{
+			{ID: "A", Kind: route.KindDirect, Server: "h:28443"},
+			{ID: "B", Kind: route.KindRelay, Server: "h2:28443"},
+		},
+	}
+	c.Normalize()
+
+	if c.Routes[0].LocalAddr != "192.168.1.106" {
+		t.Fatalf("direct 线路应继承全局源地址，实际 %q", c.Routes[0].LocalAddr)
+	}
+	// relay 不该被强塞源地址（Validate 会拒绝 relay+localAddr）
+	if c.Routes[1].LocalAddr != "" {
+		t.Fatalf("relay 线路不该继承源地址，实际 %q", c.Routes[1].LocalAddr)
+	}
+	if err := c.Routes.Validate(); err != nil {
+		t.Fatalf("继承后应合法：%v", err)
+	}
+}
+
+// 用户逐条指定的源地址优先于全局
+func TestPerRouteLocalAddrWins(t *testing.T) {
+	c := Config{
+		LocalAddr: "10.0.0.1",
+		Routes: route.Set{
+			{ID: "A", Kind: route.KindDirect, Server: "h:28443", LocalAddr: "10.0.0.2"},
+		},
+	}
+	c.Normalize()
+	if c.Routes[0].LocalAddr != "10.0.0.2" {
+		t.Fatalf("逐条指定的地址被全局覆盖了：%q", c.Routes[0].LocalAddr)
+	}
+}
+
+// 全局 -proxy 只继承到 proxy 线路，不会被 direct 吃掉（否则静默走代理）
+func TestGlobalProxyOnlyInheritedByProxyRoutes(t *testing.T) {
+	c := Config{
+		Proxy: "socks5://p:1080",
+		Routes: route.Set{
+			{ID: "P", Kind: route.KindProxy, Server: "h:28443"},
+			{ID: "D", Kind: route.KindDirect, Server: "h:28443"},
+		},
+	}
+	c.Normalize()
+	if c.Routes[0].Proxy != "socks5://p:1080" {
+		t.Fatalf("proxy 线路应继承全局代理，实际 %q", c.Routes[0].Proxy)
+	}
+	if c.Routes[1].Proxy != "" {
+		t.Fatalf("direct 线路不该继承代理，实际 %q", c.Routes[1].Proxy)
+	}
+	if err := c.Routes.Validate(); err != nil {
+		t.Fatalf("应合法：%v", err)
+	}
+}
