@@ -98,6 +98,14 @@ type Bucket struct {
 	MsSum   int64 `json:"ms_sum"`
 	TTFbSum int64 `json:"ttfb_sum"`
 
+	// ByRoute 本桶内按线路拆分的流量（多线路面板要回答「这一分钟是谁在搬」）。
+	//
+	// 用 map 而不是固定字段：线路数量由用户配置决定（1..N）。只在**真的有
+	// 线路标识**的请求上填（旧日志没有 route 字段，那些请求只进上面的合计，
+	// 不进这里）——这样「合计 = 各行之和」在纯新日志下成立，纯旧日志下
+	// 也成立（map 为空）。
+	ByRoute map[string]*RouteBucket `json:"by_route,omitempty"`
+
 	// 握手耗时。连接复用后大多数请求不再新建连接，所以它经常是 0——
 	// 这不是缺数据，而是「这一桶里一个握手都没发生」的可视证据。
 	HsSum   int64 `json:"hs_sum"`
@@ -195,6 +203,18 @@ type RouteStat struct {
 	UpWire    int64 `json:"up_wire"`
 	DownWire  int64 `json:"down_wire"`
 	MsWireSum int64 `json:"ms_wire_sum"`
+}
+
+// RouteBucket 单个时间桶内、单条线路的流量。
+//
+// 与 RouteStat 的区别：RouteStat 是**保留期累计**（用于「这条线路历史用了多少」），
+// 这里是**窗口内分桶**（用于图表与「最近这半小时谁在搬」）。两者口径不同，
+// 不能互相替代——把累计值画到图表上会让横轴说谎。
+type RouteBucket struct {
+	UpWire   int64 `json:"up_wire"`
+	DownWire int64 `json:"down_wire"`
+	Count    int64 `json:"count"`
+	MsSum    int64 `json:"ms_sum"`
 }
 
 // Options 采集器选项
@@ -522,6 +542,24 @@ func (c *Collector) bucketLocked(t time.Time, r *Record) {
 	slot.Count++
 	slot.MsSum += r.MsTotal
 	slot.TTFbSum += r.MsUpstrm
+	// 按线路拆分（只对带线路标识的记录）。旧日志没有 route 字段，
+	// 它们的流量只进上面的合计——不做「未知线路」桶，避免图表上
+	// 凭空多出一条叫「」的线。
+	if r.Route != "" {
+		if slot.ByRoute == nil {
+			slot.ByRoute = make(map[string]*RouteBucket, 4)
+		}
+		rb := slot.ByRoute[r.Route]
+		if rb == nil {
+			rb = &RouteBucket{}
+			slot.ByRoute[r.Route] = rb
+		}
+		rb.UpWire += r.UpWire
+		rb.DownWire += r.DownWire
+		rb.Count++
+		rb.MsSum += r.MsTotal
+	}
+
 	// 只有真的发生过握手才累加（MsHandshake 由传输层在新建连接时填）。
 	// 复用命中时该值为 0，HsCount 不增——图上看得出「这一桶没握手」。
 	if r.MsHandshake > 0 {
@@ -544,9 +582,30 @@ func (c *Collector) seriesLocked(now time.Time) []Bucket {
 		b := c.series[int(at.Unix()/bsec)%SeriesBuckets]
 		if b.At.Equal(at) {
 			out[i] = b
+			// ByRoute 是 map：值拷贝只复制了 header，底层仍与桶共享。
+			// 快照返回后 GUI 在**另一个 goroutine** 读它，而采集器可能正往
+			// 同一个桶（同一 at）继续累加 → 并发读写同一个 map，`-race`
+			// 必然报。必须深拷贝。
+			out[i].ByRoute = cloneRouteBuckets(b.ByRoute)
 		} else {
 			out[i] = Bucket{At: at}
 		}
+	}
+	return out
+}
+
+// cloneRouteBuckets 深拷贝线路分桶（nil 进 nil 出，保持「没有线路数据」的语义）。
+func cloneRouteBuckets(in map[string]*RouteBucket) map[string]*RouteBucket {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]*RouteBucket, len(in))
+	for k, v := range in {
+		if v == nil {
+			continue
+		}
+		cp := *v
+		out[k] = &cp
 	}
 	return out
 }

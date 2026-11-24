@@ -2461,3 +2461,73 @@ func TestCertNameOnlyForIPTarget(t *testing.T) {
 		})
 	}
 }
+
+// 面板的线路分布：只在多线路且有流量时出现，按上行降序，占比基于窗口内。
+func TestRouteMixAggregation(t *testing.T) {
+	a := &app{}
+	a.agg = stats.Agg{Series: []stats.Bucket{
+		{ByRoute: map[string]*stats.RouteBucket{
+			"香港": {UpWire: 600, Count: 6},
+			"上海": {UpWire: 300, Count: 3},
+			"备用": {UpWire: 100, Count: 1},
+		}},
+		{ByRoute: map[string]*stats.RouteBucket{
+			"香港": {UpWire: 300, Count: 2},
+			"上海": {UpWire: 0, Count: 1},
+		}},
+	}}
+	rows, total := a.routeMix()
+	// 600+300+100（桶 1）+ 300+0（桶 2）= 1300
+	if total != 1300 {
+		t.Fatalf("总上行应为 1300，实际 %d", total)
+	}
+	if len(rows) != 3 {
+		t.Fatalf("应有 3 条线路，实际 %d", len(rows))
+	}
+	// 降序：香港 900 → 上海 300 → 备用 100
+	if rows[0].ID != "香港" || rows[0].Bytes != 900 || rows[0].Count != 8 {
+		t.Fatalf("第一条应为香港 900/8，实际 %+v", rows[0])
+	}
+	if rows[1].ID != "上海" || rows[1].Bytes != 300 {
+		t.Fatalf("第二条应为上海 300，实际 %+v", rows[1])
+	}
+	if rows[2].ID != "备用" {
+		t.Fatalf("第三条应为备用，实际 %+v", rows[2])
+	}
+}
+
+// 单线路时不显示分布条（没有「区分」的需求，一条 100% 的条是噪音）。
+func TestRouteMixStripHiddenForSingleRoute(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.tab = tabPanel
+	// 必须走 a.snap：view() 每帧用 sampleStats() 覆盖 a.agg，
+	// 直接赋 a.agg 会被冲掉（拿到的永远是 runner 的空快照）。
+	single := stats.Agg{Requests: 10, Series: []stats.Bucket{
+		{ByRoute: map[string]*stats.RouteBucket{"香港": {UpWire: 100, Count: 1}}},
+	}}
+	a.snap = func() stats.Agg { return single }
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if tt.HasText("上行分布") {
+		t.Fatalf("单线路时不该出现「线路分布」：%q", tt.Texts())
+	}
+
+	// 两条线路时出现，并带上各自占比
+	b := newTestApp(t)
+	setRunning(b, true)
+	b.tab = tabPanel
+	multi := stats.Agg{Requests: 10, Series: []stats.Bucket{
+		{ByRoute: map[string]*stats.RouteBucket{
+			"香港": {UpWire: 750, Count: 3},
+			"上海": {UpWire: 250, Count: 1},
+		}},
+	}}
+	b.snap = func() stats.Agg { return multi }
+	tt2 := ui.NewTester(b.view, defaultWinWidth, defaultWinHeight)
+	if !tt2.HasText("上行分布") {
+		t.Fatalf("多线路时应出现「线路分布」：%q", tt2.Texts())
+	}
+	if !tt2.HasText("香港 75%") || !tt2.HasText("上海 25%") {
+		t.Fatalf("占比不对：%q", tt2.Texts())
+	}
+}

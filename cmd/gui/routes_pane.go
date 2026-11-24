@@ -64,14 +64,26 @@ func (a *app) routesSection(c *ui.Context, p *glass.Palette, running bool) {
 	ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(6).Children(func() {
 		ui.Text(c, "线路").FontSize(11).TextColor(p.MutedForeground).Width(40).Shrink(0)
 		ui.Text(c, summary).FontSize(11).TextColor(p.Tertiary).Grow(1).SingleLine()
-		// 用「折叠」而不是「收起」：行内的编辑按钮在编辑态也叫「收起」，
-		// 两者作用域完全不同（这个收整段分区、那个收编辑区），同名会误点。
-		// 三个动作三个词：折叠（分区）/ 收起（编辑区）/ 完成（编辑区底部）。
-		label := "展开"
+		// 展开/折叠：雪佛龙图标 + 旋转语义（朝下=可展开，朝上=可折叠）。
+		//
+		// 这个动作只出现一处，本可以留文字；但它是**纯方向**语义，图标比
+		// 「展开/折叠」两个词更省视线，而且它在列表右上角、与三个行内图标
+		// 同一视觉族。可访问名仍然给全（「展开线路列表」）。
+		label := "展开线路列表"
 		if a.routesExpanded {
-			label = "折叠"
+			label = "折叠线路列表"
 		}
-		if a.actionButton(c, p, "routes-toggle", label, false, false).Clicked() {
+		tint := p.MutedForeground
+		if a.routesExpanded {
+			tint = p.Foreground
+		}
+		// iconChevron 画的是「朝下」；展开时用 Scale 翻转成朝上，
+		// 而不是再维护一个 iconChevronUp（两个 SVG 容易画得不对称）。
+		e := a.iconButton(c, p, "routes-toggle", iconChevron, tint, label, false)
+		if a.routesExpanded {
+			e = e.Scale(1, -1)
+		}
+		if e.Clicked() {
 			a.routesExpanded = !a.routesExpanded
 			a.invalidate()
 		}
@@ -207,6 +219,9 @@ func (a *app) routeRow(c *ui.Context, p *glass.Palette, idx int, running bool) {
 		muteColor = p.Tertiary
 	}
 
+	// Gap(6)：三个图标按钮之间的间隙与应用其它按钮组保持一致（视觉实测
+	// 行内只有 4px，比下方「＋直连/＋代理/＋中继」的 6px 紧，低精度指针
+	// 下易误触）。
 	ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(6).Children(func() {
 		// 状态点：9px 圆点，绿=启用 / 灰=停用
 		ui.Box(c).Width(9).Height(9).Shrink(0).Background(dotColor).Radius(5)
@@ -222,49 +237,66 @@ func (a *app) routeRow(c *ui.Context, p *glass.Palette, idx int, running bool) {
 		ui.Text(c, a.routeSummaryText(r)).FontSize(9.5).TextColor(p.Tertiary).
 			Grow(1).SingleLine()
 
-		// 启停：标签随状态切换（这是页面上唯一表达「可操作方向」的文字）
-		btnLabel := "停用"
-		if !on {
-			btnLabel = "启用"
-		}
-		if a.actionButton(c, p, key+"-on", btnLabel, false, false).Clicked() {
-			a.routesDraft[idx] = a.routesDraft[idx].SetEnabled(!on)
-			if err := a.saveSettings(); err != nil {
-				a.setNotice(humanError(err), true)
+		// 三个动作图标成一小组：内层 Gap(8) 让**可见**间隙达到 6px
+		// （图标按钮的 1px 描边各吃掉 1px，外层 Gap(6) 实测只剩 4px，
+		// 比应用其它按钮组的可见 6px 紧）。外层 Row 的 Gap 不动，
+		// 免得连带拉开状态点/名称/质量列的间距。
+		ui.Row(c).AlignItems(ui.Center).Gap(8).Shrink(0).Children(func() {
+			// 启停：电源图标，**颜色即状态**。
+			//
+			// 为什么必须带状态样式（owner 2026-11-25：「线路的启用和停用，图标是
+			// 完全一样的，这虽然没问题，但是不是应该带状态样式呢」）：原先两态只差
+			// #a4a4a4 → #949494，在 1x 下几乎不可辨——那等于按钮不反映状态，
+			// 用户要靠行首那个 9px 圆点去判断，还得先知道圆点的颜色含义。
+			//
+			// 用绿/灰而不是换形状（电源 vs 播放）：形状混用会让人拿不准「这个
+			// 按钮当前是开还是关」；颜色是 toggle 类按钮最通用的状态约定，
+			// 并且与行首状态点同色（绿=在跑），两处说法一致。
+			// 图标表达「当前状态」，可访问名表达「点击后会发生什么」——两者
+			// 各司其职，不冲突。
+			onTint := p.Success
+			if !on {
+				onTint = p.Tertiary
 			}
-			a.invalidate()
-		}
-		// 编辑：展开/收起这条线路的字段编辑区。
-		//
-		// 为什么必须有它（自查发现的死路）：线路的可配置字段里，中继线路的
-		// 「证书域名」与「源地址」都是**必填**——不填就 x509 失败或 TUN 下
-		// tls: EOF，实测两条都踩过。而此前 GUI 只提供增删启停，用户新增一条
-		// 中继线路后没有任何地方能填这两项，等于「加了就废」。
-		editLabel := "编辑"
-		if a.editingRoute() == idx {
-			editLabel = "收起"
-		}
-		if a.actionButton(c, p, key+"-edit", editLabel, false, false).Clicked() {
+			onLabel := "停用这条线路"
+			if !on {
+				onLabel = "启用这条线路"
+			}
+			if a.iconButton(c, p, key+"-on", iconPower, onTint, onLabel, false).Clicked() {
+				a.routesDraft[idx] = a.routesDraft[idx].SetEnabled(!on)
+				if err := a.saveSettings(); err != nil {
+					a.setNotice(humanError(err), true)
+				}
+				a.invalidate()
+			}
+			// 编辑：展开/收起这条线路的字段编辑区。
+			//
+			// 为什么必须有它（自查发现的死路）：线路的可配置字段里，中继线路的
+			// 「证书域名」与「源地址」都是**必填**——不填就 x509 失败或 TUN 下
+			// tls: EOF，实测两条都踩过。而此前 GUI 只提供增删启停，用户新增一条
+			// 中继线路后没有任何地方能填这两项，等于「加了就废」。
+			editLabel := "编辑这条线路的字段"
+			editTint := p.MutedForeground
 			if a.editingRoute() == idx {
-				a.setEditingRoute(-1)
-			} else {
-				a.setEditingRoute(idx)
+				editLabel = "收起字段编辑区"
+				// 正在编辑时点亮：图标不能换文字，就用颜色表达「已打开」。
+				editTint = p.Foreground
 			}
-			a.invalidate()
-		}
-		// 删除：用危险色文字区分「破坏性操作」与「启停」。
-		//
-		// 视觉复核指出：两者曾完全同构（同宽、同填充、同描边），页脚那条
-		// 橙色警告反而是全页唯一的危险色信号。破坏性动作不该靠位置猜。
-		if ui.Button(c.Key(key+"-del"), "删除").
-			FontSize(11.5).FontWeight(520).Padding(0, 12).Height(28).
-			Radius(glass.RadiusControl).TextColor(p.DangerText).
-			InsetShadow(0, 1, 0, 0, p.ControlRim).
-			InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.045)).
-			Shadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.055)).
-			Clicked() {
-			a.removeRoute(idx)
-		}
+			if a.iconButton(c, p, key+"-edit", iconEdit, editTint, editLabel, false).Clicked() {
+				if a.editingRoute() == idx {
+					a.setEditingRoute(-1)
+				} else {
+					a.setEditingRoute(idx)
+				}
+				a.invalidate()
+			}
+			// 删除：图标 + 危险色。危险色不能省——垃圾桶的通用性足够表达
+			// 「破坏性」，但同色系的中性图标会和左边两个混成一片，红色是这一行里
+			// 唯一的「手别抖」信号（视觉复核曾指出破坏性动作不该靠位置猜）。
+			if a.iconButton(c, p, key+"-del", iconTrash, p.DangerText, "删除这条线路", false).Clicked() {
+				a.removeRoute(idx)
+			}
+		})
 	})
 }
 
@@ -806,6 +838,30 @@ func (a *app) applyRoutes() {
 	})
 }
 
+// revertRoutes 放弃未应用的改动，回到 Runner 正在跑的那份配置。
+//
+// 为什么需要（owner 2026-11-25：「立即应用旁边是不是应该给一个取消呢」）：
+// 「有改动未生效」是个需要收尾的状态，而收尾有两个方向——接受或放弃。
+// 只给「立即应用」的话，想反悔的用户只能手动把每个字段改回去，或者去翻
+// settings.json；那是把「撤销」的成本推给了人。
+//
+// 命名用「放弃改动」而不是「取消」：草稿流程里已经有一个「取消」
+// （取消新建），同页两个「取消」会让人分不清是在撤销什么。
+func (a *app) revertRoutes() {
+	if len(a.appliedRoutes) == 0 {
+		return
+	}
+	// 深拷贝：直接赋值会让两个切片共享底层数组，之后编辑 routesDraft
+	// 会静默改到 appliedRoutes，dirty 判断从此永远为假。
+	a.routesDraft = append(route.Set(nil), a.appliedRoutes...)
+	a.setEditingRoute(-1)
+	if err := a.saveSettings(); err != nil {
+		a.setNotice(humanError(err), true)
+	}
+	a.applyErr = nil
+	a.invalidate()
+}
+
 // routesApplyRow 「有改动未生效」提示 + 一键应用按钮。
 //
 // 只在真的 dirty 时出现：常驻一行「没有改动」既占高度又没有信息量
@@ -834,6 +890,13 @@ func (a *app) routesApplyRow(c *ui.Context, p *glass.Palette) {
 			// 指出的归属歧义）。草稿是尚未添加的东西，不该被算进「未生效」。
 			ui.Text(c, "上面这些线路有改动，尚未生效").FontSize(10).
 				TextColor(p.Warning).Grow(1).SingleLine()
+		}
+		// 放弃入口用次级描边：它有破坏性（丢掉用户刚做的修改），
+		// 但不像「删除线路」那样不可逆（配置还在，改回去就行），
+		// 所以不套危险色，只用比「立即应用」低一档的权重。
+		if !a.applying &&
+			a.actionButton(c, p, "routes-revert", "放弃改动", false, false).Clicked() {
+			a.revertRoutes()
 		}
 		label := "立即应用"
 		if a.applying {

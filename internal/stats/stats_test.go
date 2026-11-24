@@ -92,3 +92,66 @@ func TestErrorsCountedByStatusAndErr(t *testing.T) {
 		t.Fatalf("Errors=%d, want 2", c.agg.Errors)
 	}
 }
+
+// 窗口内分桶必须能按线路拆分，且快照与内部状态隔离。
+//
+// owner 2026-11-25：「面板这边的线条，是不是应该基于线路做区分呢」——
+// 多线路后，聚合图看不清「这一分钟是谁在搬」。ByRoute 就是为此加的。
+func TestSeriesByRoute(t *testing.T) {
+	dir := t.TempDir()
+	c, err := Open(Options{
+		LogPath:   dir + "/c.jsonl",
+		StatsPath: dir + "/s.json",
+		Retain:    time.Hour,
+		Window:    30 * time.Minute,
+	})
+	if err != nil {
+		t.Fatalf("Open: %v", err)
+	}
+	defer c.Close()
+	c.Observe(&Record{Status: 200, Route: "香港", UpWire: 100, DownWire: 10, MsTotal: 40})
+	c.Observe(&Record{Status: 200, Route: "香港", UpWire: 50, DownWire: 5, MsTotal: 20})
+	c.Observe(&Record{Status: 200, Route: "上海", UpWire: 30, DownWire: 3, MsTotal: 300})
+	// 无线路标识的记录：只进合计，不进 ByRoute
+	c.Observe(&Record{Status: 200, UpWire: 7, DownWire: 1, MsTotal: 9})
+
+	agg := c.Snapshot()
+	var last *Bucket
+	for i := range agg.Series {
+		if agg.Series[i].Count > 0 {
+			last = &agg.Series[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("没有非空桶")
+	}
+	if last.UpWire != 100+50+30+7 {
+		t.Fatalf("合计 UpWire = %d，期望 187", last.UpWire)
+	}
+	if got := len(last.ByRoute); got != 2 {
+		t.Fatalf("应有 2 条线路的分桶，实际 %d：%+v", got, last.ByRoute)
+	}
+	hk := last.ByRoute["香港"]
+	if hk == nil || hk.UpWire != 150 || hk.Count != 2 || hk.MsSum != 60 {
+		t.Fatalf("香港 分桶不对：%+v", hk)
+	}
+	sh := last.ByRoute["上海"]
+	if sh == nil || sh.UpWire != 30 || sh.Count != 1 {
+		t.Fatalf("上海 分桶不对：%+v", sh)
+	}
+	if _, ok := last.ByRoute[""]; ok {
+		t.Fatal("不该为「无线路」造一个空 key 的桶")
+	}
+
+	// 快照隔离：改快照里的值不得影响采集器内部状态
+	hk.UpWire = 999999
+	agg2 := c.Snapshot()
+	for i := range agg2.Series {
+		if agg2.Series[i].Count > 0 {
+			if agg2.Series[i].ByRoute["香港"].UpWire != 150 {
+				t.Fatalf("快照与内部状态共享了 map，被外部改动污染了")
+			}
+			break
+		}
+	}
+}

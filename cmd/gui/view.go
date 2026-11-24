@@ -19,6 +19,7 @@ package main
 
 import (
 	"fmt"
+	"sort"
 	"strings"
 	"time"
 
@@ -317,6 +318,15 @@ var (
 	iconStop  = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24"><rect x="6.5" y="6.5" width="11" height="11" rx="2.6" fill="currentColor"/></svg>`))
 	iconCopy  = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><rect width="13" height="13" x="9" y="9" rx="2.5"/><path d="M5 15.5A2.5 2.5 0 0 1 2.5 13V5A2.5 2.5 0 0 1 5 2.5h8A2.5 2.5 0 0 1 15.5 5"/></svg>`))
 	iconCheck = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"><path d="M20 6.5 9.5 17 4 11.5"/></svg>`))
+
+	// 下面四个只用在**重复出现且语义通用**的场合（owner 2026-11-25：
+	// 「icon 的好处是减少视觉疲劳，但仅限于重复的按钮、容易理解的按钮」）。
+	// 业务语义强的动作（测试连接 / 立即应用 / 添加 / 完成）保持文字——
+	// 图标画不出「测什么」「应用到哪」。
+	iconEdit    = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4z"/></svg>`))
+	iconTrash   = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 6h18"/><path d="M8 6V4.5A1.5 1.5 0 0 1 9.5 3h5A1.5 1.5 0 0 1 16 4.5V6"/><path d="M19 6l-1 13.5A1.5 1.5 0 0 1 16.5 21h-9A1.5 1.5 0 0 1 6 19.5L5 6"/></svg>`))
+	iconPower   = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v9"/><path d="M6.4 6.4a8 8 0 1 0 11.2 0"/></svg>`))
+	iconChevron = ui.MustParseSVG([]byte(`<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9l6 6 6-6"/></svg>`))
 )
 
 // ---- 面板 tab ----
@@ -327,6 +337,9 @@ var (
 // 「效果如何」——图占满剩余高度，失败时在上面补一句原因。
 func (a *app) panelPane(c *ui.Context, p *glass.Palette) {
 	a.failureLine(c, p)
+	// 线路分布放在两张图之前：先回答「谁在搬」，再看「省了多少 / 顺不顺」。
+	// 单线路时它不渲染（见 routeMixStrip）。
+	a.routeMixStrip(c, p)
 	// 两张图的分工（owner 2026-11-13 要求）：
 	//   上：上行体积与压缩——体量（柱高）+ 省下/实发（分层），本产品的卖点
 	//   下：流量与延迟——「现在顺不顺」，第一张图完全看不见的维度
@@ -1331,6 +1344,32 @@ func (a *app) actionButton(c *ui.Context, p *glass.Palette, key, label string,
 		Shadow(0, 1, 2, 0, ui.RGBA(0, 0, 0, 0.25))
 }
 
+// iconButton 纯图标按钮（28×28，几何与文字次级按钮同高）。
+//
+// 什么时候用（owner 2026-11-25）：「icon 的好处是减少视觉疲劳，但仅限于
+// 重复的按钮、容易理解的按钮」。所以只有**每行重复出现**且**有通用约定**
+// 的动作用图标：编辑（铅笔）/ 删除（垃圾桶）/ 启停（电源）/ 展开折叠（雪佛龙）。
+// 「测试连接 / 立即应用 / 添加 / 完成」这类业务语义强的动作保留文字——
+// 图标画不出「测什么」「应用到哪」。
+//
+// label 参数不是装饰：纯图标对读屏软件和第一次用的用户都是黑箱，
+// 必须给可访问名（mygo 的 Label 会同时用于辅助技术朗读与 hover 提示）。
+func (a *app) iconButton(c *ui.Context, p *glass.Palette, key string,
+	icon *ui.SVG, tint ui.Color, label string, disabled bool) ui.Element {
+	return ui.ButtonBase(c.Key(key)).Label(label).
+		Size(28, 28).Radius(glass.RadiusControl).Disabled(disabled).
+		InsetShadow(0, 1, 0, 0, p.ControlRim).
+		InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.045)).
+		Shadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.055)).
+		Shadow(0, 1, 2, 0, ui.RGBA(0, 0, 0, 0.25)).
+		Children(func() {
+			ui.Row(c).Grow(1).AlignItems(ui.Center).Justify(ui.Center).
+				Children(func() {
+					ui.Icon(c, icon).Size(13, 13).Shrink(0).TextColor(tint)
+				})
+		})
+}
+
 // noticeLine 一次性操作反馈（设置保存失败、复制失败）。
 //
 // 只在失败时出现：成功都有别的、更靠近源头的地方在说（复制→徽标变对勾、
@@ -1700,4 +1739,102 @@ func (a *app) rateLabel() string {
 		return "↑ — · ↓ —"
 	}
 	return fmt.Sprintf("↑ %s · ↓ %s", humanRate(a.upRate), humanRate(a.downRate))
+}
+
+// routeMix 窗口内按线路汇总的上行流量（降序）。
+//
+// 为什么用窗口而不是保留期累计（见 stats.RouteBucket 的注释）：它要和上面
+// 两张图说同一段时间的事。把 24 小时的累计占比标在 30 分钟的图旁边，
+// 读者会以为那是「刚才这一分钟谁在搬」。
+type routeMixRow struct {
+	ID    string
+	Bytes int64
+	Count int64
+}
+
+func (a *app) routeMix() (rows []routeMixRow, total int64) {
+	byID := map[string]*routeMixRow{}
+	for _, b := range a.agg.Series {
+		for id, rb := range b.ByRoute {
+			if rb == nil {
+				continue
+			}
+			r := byID[id]
+			if r == nil {
+				r = &routeMixRow{ID: id}
+				byID[id] = r
+			}
+			r.Bytes += rb.UpWire
+			r.Count += rb.Count
+			total += rb.UpWire
+		}
+	}
+	for _, r := range byID {
+		rows = append(rows, *r)
+	}
+	// 降序：占比最大的排最前。同字节数时按名称稳定排序，避免每帧抖动
+	// （map 迭代顺序随机，不排序的话这一行的顺序会一秒一变）。
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Bytes != rows[j].Bytes {
+			return rows[i].Bytes > rows[j].Bytes
+		}
+		return rows[i].ID < rows[j].ID
+	})
+	return rows, total
+}
+
+// routeMixColors 线路色点用的色板（8px 圆点，只需相互可辨，不承载文字对比度）。
+//
+// 刻意避开图表已用的三色（上行蓝 / 下行绿 / 延迟琥珀）：同屏出现相近的绿
+// 会被读成「同一条线」。色相在这个序上拉开：紫 / 青 / 粉 / 砖红 / 蓝灰。
+var routeMixColors = []string{"#a78bfa", "#22d3ee", "#f472b6", "#e0855a", "#8fa3bf"}
+
+// routeMixStrip 「窗口内按线路分布」一行。
+//
+// owner 2026-11-25：「面板这边的线条，是不是应该基于线路做区分呢」。
+//
+// 为什么是「一行文字 + 色点」而不是把两个图表改成多序列：
+//   - 图表已用蓝/绿/琥珀三色承载「上行/下行/延迟」三个量纲，再叠 3-5 条线路的
+//     颜色会变成一锅粥，且每条线只有 1-2px 粗，多序列在 580px 宽下读不出来；
+//   - 用户真正想回答的是「刚才谁在搬、各占多少」，这是一句话就够的信息，
+//     不需要第二条时间序列。
+//
+// 单线路时**不显示**：没有「区分」的需求，一条 100% 的条只是噪音。
+func (a *app) routeMixStrip(c *ui.Context, p *glass.Palette) {
+	rows, total := a.routeMix()
+	if len(rows) < 2 || total <= 0 {
+		return
+	}
+	ui.Row(c).Padding(2, 2).AlignItems(ui.Center).Gap(10).Children(func() {
+		// 「上行分布」而不是「线路分布」：这里统计的是 **UpWire**（隧道上行
+		// 实际发出量）。只写「线路分布」会被读成请求数占比或上下行合计
+		// （视觉验收指出缺单位）。
+		ui.Text(c, "上行分布").FontSize(10).TextColor(p.Tertiary).Shrink(0)
+		shown := rows
+		var restBytes int64
+		var restCount int
+		if len(shown) > 4 {
+			restBytes = 0
+			for _, r := range shown[4:] {
+				restBytes += r.Bytes
+				restCount++
+			}
+			shown = shown[:4]
+		}
+		for i, r := range shown {
+			r := r
+			ui.Row(c).AlignItems(ui.Center).Gap(5).Shrink(0).Children(func() {
+				ui.Box(c).Size(7, 7).Radius(4).Shrink(0).
+					Background(ui.Hex(routeMixColors[i%len(routeMixColors)]))
+				ui.Text(c, fmt.Sprintf("%s %.0f%%", r.ID,
+					float64(r.Bytes)*100/float64(total))).
+					FontSize(10).TextColor(p.MutedForeground).SingleLine().Shrink(0)
+			})
+		}
+		if restCount > 0 {
+			ui.Text(c, fmt.Sprintf("其他 %d 条 %.0f%%", restCount,
+				float64(restBytes)*100/float64(total))).
+				FontSize(10).TextColor(p.Tertiary).SingleLine().Shrink(0)
+		}
+	})
 }

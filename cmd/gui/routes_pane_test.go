@@ -500,6 +500,11 @@ func TestDraftModeListToggleConsistent(t *testing.T) {
 		}
 	}
 
+	// 注意：按钮 2026-11-25 已图标化（雪佛龙），HasText 命中的是它的
+	// **可访问名**（「展开线路列表」/「折叠线路列表」），不是可见文字。
+	// 这是有意的——纯图标对读屏是黑箱，必须带 label；测试顺着这个语义
+	// 断言「状态与按钮语义一致」仍然成立。
+
 	// 用户主动展开：摘要不再说「已收起」，按钮变「折叠」
 	b := mk()
 	b.beginAddRoute(route.KindProxy)
@@ -534,5 +539,36 @@ func TestPendingRouteMissingNamesField(t *testing.T) {
 	relay := route.Route{ID: "中继1", Kind: route.KindRelay, Server: "47.117.152.3:28443"}
 	if got := pendingRouteMissing(relay); !strings.Contains(got, "证书域名") {
 		t.Fatalf("IP 中继缺 SNI 时应点名证书域名，实际 %q", got)
+	}
+}
+
+// 放弃改动必须真的回到「已应用」那份，且不能与它共享底层数组。
+//
+// owner 2026-11-25：「立即应用旁边是不是应该给一个取消呢」——有接受就要有
+// 放弃，否则想反悔的用户只能手改回去或去翻 JSON。
+func TestRevertRoutesRestoresApplied(t *testing.T) {
+	applied := route.Set{
+		{ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",
+			ServerName: "magpie.aiweb.xin", LocalAddr: "192.168.1.106"},
+	}.Normalize()
+
+	a := &app{settingsPath: t.TempDir() + "/s.json"}
+	a.appliedRoutes = applied
+	// 用户改了一些东西（还加了一条）
+	a.routesDraft = route.Set{
+		{ID: "香港", Kind: route.KindDirect, Server: "changed.example:28443"},
+		{ID: "新增", Kind: route.KindDirect, Server: "other.example:28443"},
+	}
+	a.revertRoutes()
+
+	if !a.routesDraft.Normalize().Equal(applied) {
+		t.Fatalf("放弃后应回到已应用的配置，实际 %+v", a.routesDraft)
+	}
+
+	// 关键：不能共享底层数组——否则之后编辑 routesDraft 会改到 appliedRoutes，
+	// 「有没有未应用改动」从此永远判定为否。
+	a.routesDraft[0].Server = "mutated:28443"
+	if a.appliedRoutes[0].Server == "mutated:28443" {
+		t.Fatal("revert 之后两份切片共享底层数组，改一份会污染另一份")
 	}
 }
