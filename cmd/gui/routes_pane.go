@@ -89,6 +89,13 @@ func (a *app) routesSection(c *ui.Context, p *glass.Palette, running bool) {
 			for i := range a.routesDraft {
 				a.routeRow(c, p, i, running)
 				a.configRule(c, p)
+				// 编辑区紧跟在被编辑的那行下面（而不是弹窗/单独一块）：
+				// 用户点「编辑」时的注意力就在那一行，编辑区贴着它才不需要
+				// 再找「我在改哪条」。
+				if a.editingRoute() == i {
+					a.routeEditor(c, p, i, running)
+					a.configRule(c, p)
+				}
 			}
 		})
 	})
@@ -164,6 +171,24 @@ func (a *app) routeRow(c *ui.Context, p *glass.Palette, idx int, running bool) {
 			a.routesDraft[idx] = a.routesDraft[idx].SetEnabled(!on)
 			if err := a.saveSettings(); err != nil {
 				a.setNotice(humanError(err), true)
+			}
+			a.invalidate()
+		}
+		// 编辑：展开/收起这条线路的字段编辑区。
+		//
+		// 为什么必须有它（自查发现的死路）：线路的可配置字段里，中继线路的
+		// 「证书域名」与「源地址」都是**必填**——不填就 x509 失败或 TUN 下
+		// tls: EOF，实测两条都踩过。而此前 GUI 只提供增删启停，用户新增一条
+		// 中继线路后没有任何地方能填这两项，等于「加了就废」。
+		editLabel := "编辑"
+		if a.editingRoute() == idx {
+			editLabel = "收起"
+		}
+		if a.actionButton(c, p, key+"-edit", editLabel, running).Clicked() {
+			if a.editingRoute() == idx {
+				a.setEditingRoute(-1)
+			} else {
+				a.setEditingRoute(idx)
 			}
 			a.invalidate()
 		}
@@ -303,6 +328,14 @@ func (a *app) removeRoute(idx int) {
 		return
 	}
 	a.routesDraft = append(a.routesDraft[:idx], a.routesDraft[idx+1:]...)
+	// 编辑态跟着移动：删的正是被编辑那条 → 收起；删的是它前面的 → 下标左移。
+	// 不做这一步，用户删掉上一条后编辑区会突然变成另一条线路的字段。
+	switch cur := a.editingRoute(); {
+	case cur == idx:
+		a.setEditingRoute(-1)
+	case cur > idx:
+		a.setEditingRoute(cur - 1)
+	}
 	if err := a.saveSettings(); err != nil {
 		a.setNotice(humanError(err), true)
 	}
@@ -379,3 +412,123 @@ func (a *app) fastestRouteID() string {
 	}
 	return best
 }
+
+// routeEditor 一条线路的字段编辑区（展开在它自己那行的正下方）。
+//
+// 字段按 kind 显示，不做「全部字段always列出 + 灰掉不适用」：
+// 灰掉的字段会让用户以为「只是暂时不能改」，而事实上 direct 线路填了代理
+// 地址会被 route.Validate 直接判非法——相关却不可用的选项比不出现更糟。
+//
+// 每个输入框都挂 OnChange 立即落盘（与「更新镜像」同一个模式）：线路配置
+// 是低频改动，没有「保存」按钮，走开就等于丢了。
+func (a *app) routeEditor(c *ui.Context, p *glass.Palette, idx int, running bool) {
+	r := &a.routesDraft[idx]
+
+	// 保存并刷新：OnChange 在绑定值变化后、重绘前触发。
+	save := func() {
+		if err := a.saveSettings(); err != nil {
+			a.setNotice(humanError(err), true)
+		}
+		a.invalidate()
+	}
+
+	bg := ui.Column(c).Padding(8, 10).Gap(2)
+	bg.Background(p.Control).Radius(glass.RadiusControl)
+
+	ui.Column(c).Padding(2, 12, 6).Gap(4).Children(func() {
+		// 名称：允许改（用户可能想改成「香港直连」「上海备用」这种看得懂的名字）。
+		// 重名会被 route.Validate 拦住（ID 是线路身份，不允许重复）。
+		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Box(c).Width(64).Shrink(0).Children(func() {
+				ui.Text(c, "名称").FontSize(10.5).TextColor(p.MutedForeground).SingleLine()
+			})
+			ui.Box(c).Grow(1).Children(func() {
+				ui.TextInput(c, &r.ID).Placeholder("如 香港 / 上海").
+					FontSize(10.5).Height(24).Radius(7).Disabled(running).
+					OnChange(save)
+			})
+		})
+
+		// 服务器：所有类型都要（中继尤其——它指向另一台机器）。
+		ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+			ui.Box(c).Width(64).Shrink(0).Children(func() {
+				ui.Text(c, "服务器").FontSize(10.5).TextColor(p.MutedForeground).SingleLine()
+			})
+			ui.Box(c).Grow(1).Children(func() {
+				ui.TextInput(c, &r.Server).Placeholder("host:port").
+					FontSize(10.5).Height(24).Radius(7).Disabled(running).
+					OnChange(save)
+			})
+		})
+
+		// 证书域名：中继指向另一台 IP 时的**必填项**。
+		//
+		// 只在 relay 或目标是 IP 时出现：域名目标下 SNI 就是域名本身，
+		// 多一个字段只会让人疑惑。
+		if r.Kind == route.KindRelay || relayclient.SNINeeded(r.Server) {
+			ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+				ui.Box(c).Width(64).Shrink(0).Children(func() {
+					ui.Text(c, "证书域名").FontSize(10.5).TextColor(p.MutedForeground).SingleLine()
+				})
+				ui.Box(c).Grow(1).Children(func() {
+					ui.TextInput(c, &r.ServerName).
+						Placeholder("证书上的域名，如 " + relayclient.DefaultServerName).
+						FontSize(10.5).Height(24).Radius(7).Disabled(running).
+						OnChange(save)
+				})
+			})
+			if r.Kind == route.KindRelay && r.ServerName == "" && !relayclient.SNINeeded(r.Server) {
+				// 指向 IP 却留空 SNI：这是「能用但一定失败」的组合，提前说清。
+				ui.Row(c).Children(func() {
+					ui.Text(c, "指向 IP 的中继必须填证书域名，否则证书校验必失败").
+						FontSize(9.5).TextColor(p.Warning).MaxLines(2).Grow(1)
+				})
+			}
+		}
+
+		// 代理地址：仅 proxy 类型。
+		if r.Kind == route.KindProxy {
+			ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+				ui.Box(c).Width(64).Shrink(0).Children(func() {
+					ui.Text(c, "代理地址").FontSize(10.5).TextColor(p.MutedForeground).SingleLine()
+				})
+				ui.Box(c).Grow(1).Children(func() {
+					ui.TextInput(c, &r.Proxy).Placeholder("http://127.0.0.1:7890").
+						FontSize(10.5).Height(24).Radius(7).Disabled(running).
+						OnChange(save)
+				})
+			})
+		}
+
+		// 源地址：direct 与 relay 都适用（中继的第一跳仍是本机外连），
+		// proxy 不适用（CONNECT 由代理进程发起）。
+		if r.Kind != route.KindProxy {
+			ui.Row(c).AlignItems(ui.Center).Gap(8).Children(func() {
+				ui.Box(c).Width(64).Shrink(0).Children(func() {
+					ui.Text(c, "源地址").FontSize(10.5).TextColor(p.MutedForeground).SingleLine()
+				})
+				ui.Box(c).Grow(1).Children(func() {
+					ui.TextInput(c, &r.LocalAddr).
+						Placeholder("留空＝系统路由；TUN 环境填物理网卡 IP").
+						FontSize(10.5).Height(24).Radius(7).Disabled(running).
+						OnChange(save)
+				})
+			})
+		}
+
+		// 这一行只说明「改哪类字段」，不重复右上角的停止开关：
+		// 运行中这些框是灰的，用户需要知道的是「为什么灰」。
+		if running {
+			ui.Row(c).Children(func() {
+				ui.Text(c, "运行中不可编辑，停止后可改").
+					FontSize(9.5).TextColor(p.Tertiary).Grow(1)
+			})
+		}
+	})
+}
+
+// editingRoute 返回正在编辑的线路下标（-1 表示没有）。
+func (a *app) editingRoute() int { return a.editRouteIdx - 1 }
+
+// setEditingRoute 设置编辑态；传 -1 表示收起。
+func (a *app) setEditingRoute(idx int) { a.editRouteIdx = idx + 1 }

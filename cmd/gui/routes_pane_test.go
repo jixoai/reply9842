@@ -249,3 +249,120 @@ func TestFillRuntimeFieldsCoversRelay(t *testing.T) {
 		t.Fatalf("proxy 未补代理地址: %+v", rs3[1])
 	}
 }
+
+// 线路编辑态的零值安全：&app{} 构造出来必须「没有线路在编辑」。
+// （这条守的是 +1 编码的意义——用下标语义时零值会误展开第一条。）
+func TestEditingRouteZeroValueMeansNone(t *testing.T) {
+	var a app
+	if got := a.editingRoute(); got != -1 {
+		t.Fatalf("零值应表示「无」，实际 %d", got)
+	}
+	a.setEditingRoute(2)
+	if got := a.editingRoute(); got != 2 {
+		t.Fatalf("设置后应读回 2，实际 %d", got)
+	}
+	a.setEditingRoute(-1)
+	if got := a.editingRoute(); got != -1 {
+		t.Fatalf("清除后应为 -1，实际 %d", got)
+	}
+}
+
+// 删除线路时编辑态必须跟着修正：否则用户删掉上一条后，
+// 编辑区会突然变成另一条线路的字段（改 A 实际改到 B）。
+func TestRemoveRouteKeepsEditTarget(t *testing.T) {
+	mk := func() *app {
+		x := &app{routesDraft: route.Set{
+			{ID: "A", Kind: route.KindDirect, Server: "h:28443"},
+			{ID: "B", Kind: route.KindDirect, Server: "h:28443"},
+			{ID: "C", Kind: route.KindDirect, Server: "h:28443"},
+		}}
+		x.settingsPath = t.TempDir() + "/s.json"
+		return x
+	}
+
+	// 删被编辑的那条 → 收起
+	a := mk()
+	a.setEditingRoute(1)
+	a.removeRoute(1)
+	if a.editingRoute() != -1 {
+		t.Fatalf("删掉正在编辑的线路后应收起，实际 %d", a.editingRoute())
+	}
+
+	// 删前面的 → 下标左移，仍指向同一条（原本 index 2 = C）
+	a = mk()
+	a.setEditingRoute(2)
+	a.removeRoute(0)
+	if got := a.editingRoute(); got != 1 {
+		t.Fatalf("删前面后应指向 1，实际 %d", got)
+	}
+	if a.routesDraft[1].ID != "C" {
+		t.Fatalf("编辑目标应仍是 C，实际 %s", a.routesDraft[1].ID)
+	}
+
+	// 删后面的 → 不动
+	a = mk()
+	a.setEditingRoute(0)
+	a.removeRoute(2)
+	if got := a.editingRoute(); got != 0 {
+		t.Fatalf("删后面不该影响编辑态，实际 %d", got)
+	}
+}
+
+// 关键回归：新增中继 → 只靠 GUI 能填的字段 → 必须能通过校验。
+//
+// 这是「加了就废」的防线：中继指向 IP 时 server_name 与 local_addr 都是
+// 必填（缺了 x509 失败 / TUN 下 EOF），而此前 GUI 一个输入框都没有，
+// 用户没有任何途径填它们。
+func TestRelayRouteConfigurableThroughGUI(t *testing.T) {
+	a := &app{server: "magpie.aiweb.xin", settingsPath: t.TempDir() + "/s.json"}
+	a.addRoute(route.KindRelay)
+
+	// 刚加出来是禁用的「请填另一台服务器」状态：必须校验失败（诚实）
+	if err := a.routesDraft.Normalize().Validate(); err == nil {
+		t.Fatal("新加的中继缺 server，校验应当失败以提示用户填写")
+	}
+
+	// 模拟用户在编辑区里逐格填入（即编辑区提供的四个字段）
+	a.routesDraft[0].Server = "47.117.152.3:28443"
+	a.routesDraft[0].ServerName = "magpie.aiweb.xin"
+	a.routesDraft[0].LocalAddr = "192.168.1.106"
+	a.routesDraft[0].Transport = "tcp"
+
+	rs := a.routesDraft.Normalize()
+	if err := rs.Validate(); err != nil {
+		t.Fatalf("编辑区能填出的配置必须合法，实际: %v", err)
+	}
+	// 填进去的值不能在任何一步被清掉（Normalize 不得抹掉显式 SNI/源地址）
+	if rs[0].ServerName != "magpie.aiweb.xin" || rs[0].LocalAddr != "192.168.1.106" {
+		t.Fatalf("显式字段被改写: %+v", rs[0])
+	}
+}
+
+// 编辑区改完 → 保存 → 重新加载，四个字段必须一字不差地回来。
+//
+// 这条守的是「改了等于没改」：Settings.Equal 曾漏比 ServerName，
+// 那种缺口在 GUI 里的表现就是用户改完、界面接受、重启后值没了。
+func TestRouteEditorFieldsSurviveSaveReload(t *testing.T) {
+	dir := t.TempDir()
+	a := &app{server: "magpie.aiweb.xin", settingsPath: dir + "/s.json"}
+	a.addRoute(route.KindRelay)
+	a.routesDraft[0].ID = "上海"
+	a.routesDraft[0].Server = "47.117.152.3:28443"
+	a.routesDraft[0].ServerName = "magpie.aiweb.xin"
+	a.routesDraft[0].LocalAddr = "192.168.1.106"
+	a.routesDraft[0].Transport = "tcp"
+	if err := a.saveSettings(); err != nil {
+		t.Fatalf("保存失败: %v", err)
+	}
+
+	got := relayclient.LoadSettings(a.settingsPath)
+	if len(got.Routes) != 1 {
+		t.Fatalf("读回线路数 %d", len(got.Routes))
+	}
+	r := got.Routes[0]
+	if r.ID != "上海" || r.Server != "47.117.152.3:28443" ||
+		r.ServerName != "magpie.aiweb.xin" ||
+		r.LocalAddr != "192.168.1.106" || r.Transport != "tcp" {
+		t.Fatalf("字段在往返中丢失: %+v", r)
+	}
+}
