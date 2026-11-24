@@ -76,6 +76,16 @@ type Route struct {
 
 	Kind Kind `json:"kind"`
 
+	// ServerName 该线路的 TLS SNI（证书上签的域名）。
+	//
+	// 为什么需要它（实测抓出的缺口）：中继线路常指向**另一台 IP**，但复用
+	// 同一张证书（证书 SAN 只有域名）。此时若不显式给 SNI，transport 会按
+	// Addr 的 host 推导 → 用 IP 去校验 → 必然
+	// `x509: cannot validate certificate for <ip> ... no IP SANs`。
+	//
+	// 留空时由 specsFor 按既有规则推导（同主机继承全局、异主机按 Addr）。
+	ServerName string `json:"server_name,omitempty"`
+
 	// Server 该线路连到哪台 relay-server。
 	//
 	// 允许省略端口（"magpie.aiweb.xin"）：Normalize 会补 DefaultServerPort。
@@ -114,6 +124,7 @@ func (r Route) SetEnabled(on bool) Route {
 func (r Route) Normalize() Route {
 	r.ID = strings.TrimSpace(r.ID)
 	r.Server = strings.TrimSpace(r.Server)
+	r.ServerName = strings.TrimSpace(r.ServerName)
 	r.Proxy = strings.TrimSpace(r.Proxy)
 	r.LocalAddr = strings.TrimSpace(r.LocalAddr)
 	r.Transport = strings.ToLower(strings.TrimSpace(r.Transport))
@@ -177,6 +188,11 @@ func (r Route) Validate() error {
 	if _, _, err := net.SplitHostPort(r.Server); err != nil {
 		return fmt.Errorf("route: 线路 %q 的 server %q 不是 host:port: %w", r.ID, r.Server, err)
 	}
+	// SNI 若显式给出，必须是域名而不是 IP——用 IP 当 SNI 等于没给
+	// （证书校验按 SNI 匹配，IP 只会让 x509 校验必然失败）。
+	if r.ServerName != "" && net.ParseIP(strings.Trim(r.ServerName, "[]")) != nil {
+		return fmt.Errorf("route: 线路 %q 的 server_name %q 是 IP，应填证书上的域名", r.ID, r.ServerName)
+	}
 	if r.Kind == KindProxy {
 		if r.Proxy == "" {
 			return fmt.Errorf("route: 线路 %q 是代理类型，但没填代理地址", r.ID)
@@ -205,12 +221,12 @@ func (r Route) Validate() error {
 			return fmt.Errorf("route: 线路 %q 是直连类型，但填了代理地址 %q（改类型为 proxy，或清空它）", r.ID, r.Proxy)
 		}
 	case KindRelay:
-		// relay 的语义是「不依赖本机网络」：它既不经代理，也不绑源地址。
+		// 中继不额外套代理（要「代理到中继」请直接用 proxy 类型把 server 指过去，
+		// 不必叠两层语义）。但**源地址照填**：中继只是服务端再转发一跳，本机到
+		// 中继这一跳仍是本机发起的外连，TUN 全局模式照样劫持——曾因这条错误
+		// 限制，中继线路永远拿不到源地址绑定，实测全程 tls: EOF。
 		if r.Proxy != "" {
-			return fmt.Errorf("route: 线路 %q 是中继类型，不该填代理地址 %q（中继直连自有服务器）", r.ID, r.Proxy)
-		}
-		if r.LocalAddr != "" {
-			return fmt.Errorf("route: 线路 %q 是中继类型，不该填源地址 %q（中继不依赖本机网络）", r.ID, r.LocalAddr)
+			return fmt.Errorf("route: 线路 %q 是中继类型，不该填代理地址 %q（要经代理到中继请改用 proxy 类型）", r.ID, r.Proxy)
 		}
 	}
 	return nil

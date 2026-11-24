@@ -313,3 +313,48 @@ func TestGlobalProxyOnlyInheritedByProxyRoutes(t *testing.T) {
 		t.Fatalf("应合法：%v", err)
 	}
 }
+
+// 中继指向另一台 IP 时必须能用线路自带的 server_name 校验证书。
+// 实测缺口：不加这个字段，transport 拿 IP 去校验 SAN 只有域名的证书，
+// 报 x509: cannot validate certificate for 47.117.152.3 ...，该线路永不
+// 可用（10/10 请求全被打回直连）。
+func TestRelayRouteUsesExplicitServerName(t *testing.T) {
+	c := Config{
+		Server: "magpie.aiweb.xin", ServerName: "magpie.aiweb.xin",
+		Transport: "tcp",
+		Routes: route.Set{
+			{ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443"},
+			{ID: "上海", Kind: route.KindRelay, Server: "47.117.152.3:28443",
+				ServerName: "magpie.aiweb.xin"},
+		},
+	}
+	c.Normalize()
+	sf, err := specsFor(c)
+	if err != nil {
+		t.Fatalf("specsFor: %v", err)
+	}
+	for _, s := range sf {
+		if s.ID == "上海" && s.ServerName != "magpie.aiweb.xin" {
+			t.Fatalf("中继的显式 server_name 被丢弃，实际 %q", s.ServerName)
+		}
+		// 同主机的直连仍然继承全局值
+		if s.ID == "香港" && s.ServerName != "magpie.aiweb.xin" {
+			t.Fatalf("直连的 SNI 异常: %q", s.ServerName)
+		}
+	}
+
+	// 未填 server_name 的异主机中继必须留空（交给 transport 推导），
+	// 不能错误继承全局 SNI（那是给另一台机器签的名字）。
+	c2 := Config{
+		Server: "magpie.aiweb.xin", ServerName: "magpie.aiweb.xin", Transport: "tcp",
+		Routes: route.Set{{ID: "别家", Kind: route.KindRelay, Server: "other.example:28443"}},
+	}
+	c2.Normalize()
+	sf2, err := specsFor(c2)
+	if err != nil {
+		t.Fatalf("specsFor: %v", err)
+	}
+	if sf2[0].ServerName != "" {
+		t.Fatalf("异主机中继不该继承全局 SNI，实际 %q", sf2[0].ServerName)
+	}
+}

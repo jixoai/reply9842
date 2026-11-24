@@ -399,13 +399,20 @@ func specsFor(c Config) ([]transport.DialerSpec, error) {
 			return nil, fmt.Errorf("线路 %q 的传输方式 %q 非法（可选 auto|quic|tcp）", rt.ID, rt.Transport)
 		}
 
-		// SNI 继承：线路自己没给时用全局的（「所有线路都指向同一台 server」
-		// 这种常规用法不必逐条重复填 SNI）。
-		sni := c.ServerName
-		if rt.Kind == route.KindRelay && rt.Server != c.Server {
-			// 中继指向**不同主机**时不能沿用原 SNI：那是给另一台机器的证书
-			// 校验的，用错会 x509 失败。留空让 transport 按 Addr 推导。
-			sni = ""
+		// SNI 优先级（实测抓出的缺口：中继复用同一张证书时必然 x509 失败）：
+		//
+		//	1. 线路自己的 server_name（**最高优先**）——中继指向另一台 IP
+		//	   但复用同一张证书（SAN 只有域名）时，必须靠它才能通过校验
+		//	2. 同 server 的线路继承全局 ServerName
+		//	3. 异主机的中继不继承（那是给另一台机器签的名字），留空让
+		//	   transport 按 Addr 推导（域名目标下成立，IP 目标则需第 1 项）
+		sni := rt.ServerName
+		if sni == "" {
+			if rt.Kind == route.KindRelay && rt.Server != c.Server {
+				sni = ""
+			} else {
+				sni = c.ServerName
+			}
 		}
 
 		specs = append(specs, transport.DialerSpec{

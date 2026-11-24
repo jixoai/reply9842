@@ -1,6 +1,7 @@
 package route
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -734,10 +735,19 @@ func TestKindFieldCrossValidation(t *testing.T) {
 	}{
 		{"direct 填 proxy", Route{ID: "x", Kind: KindDirect, Server: "h:28443", Proxy: "socks5://p:1080"}, "直连类型"},
 		{"relay 填 proxy", Route{ID: "x", Kind: KindRelay, Server: "h:28443", Proxy: "socks5://p:1080"}, "中继类型"},
-		{"relay 填 localAddr", Route{ID: "x", Kind: KindRelay, Server: "h:28443", LocalAddr: "10.0.0.5"}, "中继类型"},
+		{"中继仍禁止填源地址", Route{ID: "x", Kind: KindRelay, Server: "h:28443", LocalAddr: "10.0.0.5"}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			err := tc.r.Normalize().Validate()
+			if tc.want == "" {
+				// 中继线路**允许**填源地址：中继只是服务端再转发一跳，本机到
+				// 中继这一跳仍是本机外连，TUN 全局模式照样劫持。曾经禁止它，
+				// 导致中继线路拿不到源地址绑定，实测全程 tls: EOF。
+				if err != nil {
+					t.Fatalf("%s 不该报错: %v", tc.name, err)
+				}
+				return
+			}
 			if err == nil {
 				t.Fatalf("%s 应当报错", tc.name)
 			}
@@ -768,5 +778,43 @@ func TestRelayMissingServerRejected(t *testing.T) {
 	if err := n.Validate(); err == nil {
 		t.Fatalf("中继线路缺 server 必须报错（否则它会静默指向同一台主服务器）；"+
 			"Normalize 后 Server=%q Transport=%q", n.Server, n.Transport)
+	}
+}
+
+// ServerName 是「中继指向另一台 IP、但复用同一张证书」这条唯一路径的
+// 全部依据。缺了它，transport 会拿 IP 去校验 SAN 只有域名的证书而必败
+// （实测输出：x509: cannot validate certificate for 47.117.152.3 ...）。
+func TestServerNameTrimAndValidate(t *testing.T) {
+	got := Set{{ID: "上海", Kind: KindRelay, Server: "47.117.152.3:28443",
+		ServerName: "  magpie.aiweb.xin  "}}.Normalize()
+	if got[0].ServerName != "magpie.aiweb.xin" {
+		t.Fatalf("ServerName 未裁空白: %q", got[0].ServerName)
+	}
+	if err := got.Validate(); err != nil {
+		t.Fatalf("合法 server_name 被拒: %v", err)
+	}
+	for _, bad := range []string{"47.117.152.3", "[::1]"} {
+		got := Set{{ID: "坏", Kind: KindRelay, Server: "47.117.152.3:28443",
+			ServerName: bad}}.Normalize()
+		if err := got.Validate(); err == nil {
+			t.Fatalf("server_name=%q 应被拒", bad)
+		}
+	}
+}
+
+// JSON 往返必须保留 ServerName，否则重新加载设置就退化成 IP 校验。
+func TestServerNameSurvivesRoundTrip(t *testing.T) {
+	in := Set{{ID: "上海", Kind: KindRelay, Server: "47.117.152.3:28443",
+		ServerName: "magpie.aiweb.xin", Transport: "tcp"}}.Normalize()
+	raw, err := json.Marshal(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var back Set
+	if err := json.Unmarshal(raw, &back); err != nil {
+		t.Fatal(err)
+	}
+	if back[0].ServerName != "magpie.aiweb.xin" {
+		t.Fatalf("server_name 未往返: %s", raw)
 	}
 }
