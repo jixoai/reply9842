@@ -422,10 +422,11 @@ func (a *app) beginAddRoute(k route.Kind) {
 	}
 
 	a.pendingRoute = r
-	a.pendingProbe = nil
-	a.pendingProbeErr = nil
-	a.pendingTesting = false
-	a.pendingProbeGen++ // 作废可能仍在飞的上一次探测
+	// routeProbe.reset 作废可能仍在飞的上一次探测（gen 递增让回调丢弃结果）
+	a.pendingProbe = routeProbe{gen: a.pendingProbe.gen + 1}
+	// 新建时顺手作废编辑区的探测：进草稿会收起编辑区，那份结果已经没有
+	// 展示位了，留着只会在下次进编辑区时冒出一个过期结论。
+	a.editProbe = routeProbe{gen: a.editProbe.gen + 1}
 	// 新建时收起其它线路的编辑区，避免同屏两套输入框。
 	a.setEditingRoute(-1)
 	// 收起列表**一次**（不是强制锁定）：草稿表单约 200px，与展开的列表
@@ -464,19 +465,14 @@ func (a *app) commitPendingRoute() {
 		a.setNotice(humanError(err), true)
 	}
 	a.pendingRoute = route.Route{}
-	a.pendingProbe = nil
-	a.pendingProbeErr = nil
-	a.pendingProbeGen++
+	a.pendingProbe = routeProbe{gen: a.pendingProbe.gen + 1}
 	a.invalidate()
 }
 
 // cancelPendingRoute 放弃草稿（不落盘）。
 func (a *app) cancelPendingRoute() {
 	a.pendingRoute = route.Route{}
-	a.pendingProbe = nil
-	a.pendingProbeErr = nil
-	a.pendingTesting = false
-	a.pendingProbeGen++
+	a.pendingProbe = routeProbe{gen: a.pendingProbe.gen + 1}
 	a.invalidate()
 }
 
@@ -486,7 +482,7 @@ func (a *app) cancelPendingRoute() {
 // 整个窗口卡死。复用 update.go 的 runAsync/runMain 模式，并用世代号丢弃
 // 过期结果（用户可能连点、或测到一半就取消了）。
 func (a *app) testPendingRoute() {
-	if a.pendingTesting || a.pendingRoute.ID == "" {
+	if a.pendingProbe.testing || a.pendingRoute.ID == "" {
 		return
 	}
 	r := a.pendingRoute.Normalize()
@@ -494,11 +490,39 @@ func (a *app) testPendingRoute() {
 		a.setNotice("先把这个填对再测："+err.Error(), true)
 		return
 	}
-	a.pendingTesting = true
-	a.pendingProbe = nil
-	a.pendingProbeErr = nil
-	a.pendingProbeGen++
-	gen := a.pendingProbeGen
+	a.probeAsync(&a.pendingProbe, r)
+}
+
+// testEditingRoute 用编辑区里的当前字段（可能还没应用）真实拨号一次。
+//
+// owner 2026-11-25：「修改线路的时候，不能测试线路」。改已有线路比新建更该
+// 能测——改坏了影响的是正在用的那条，而新建最坏只是多一条坏线路。
+//
+// 测的是**界面上这份**（routesDraft[idx]，含尚未应用的改动），不是 Runner
+// 正在跑的那份：用户想知道的正是「我这样改之后通不通」。
+// ProbeRoute 会新建独立连接，不会干扰正在服务的连接。
+func (a *app) testEditingRoute() {
+	idx := a.editingRoute()
+	if idx < 0 || idx >= len(a.routesDraft) {
+		return
+	}
+	if a.editProbe.testing {
+		return
+	}
+	r := a.routesDraft[idx].Normalize()
+	if err := r.Validate(); err != nil {
+		a.setNotice("先把这个填对再测："+err.Error(), true)
+		return
+	}
+	a.probeAsync(&a.editProbe, r)
+}
+
+// probeAsync 探测一条线路并回填状态（草稿与编辑区共用）。
+//
+// p 是指针：回调必须写回**发起时那个**状态槽。若中途用户切到另一处
+// （改草稿 / 收起草稿），对应槽位的 gen 已经递增，回调比对失败后丢弃结果。
+func (a *app) probeAsync(p *routeProbe, r route.Route) {
+	gen := p.start()
 	insecure := a.insecure
 	a.invalidate()
 
@@ -507,14 +531,14 @@ func (a *app) testPendingRoute() {
 		defer cancel()
 		res, err := relayclient.ProbeRoute(ctx, r, insecure)
 		a.runMain(func() {
-			if gen != a.pendingProbeGen {
-				return // 过期：草稿已改/已取消/又点了一次
+			if gen != p.gen {
+				return // 过期：字段已改 / 已取消 / 又点了一次
 			}
-			a.pendingTesting = false
+			p.testing = false
 			if err != nil {
-				a.pendingProbeErr = err
+				p.err = err
 			} else {
-				a.pendingProbe = &res
+				p.result = &res
 			}
 			a.invalidate()
 		})
@@ -599,6 +623,9 @@ func (a *app) routeEditor(c *ui.Context, p *glass.Palette, idx int, running bool
 		if err := a.saveSettings(); err != nil {
 			a.setNotice(humanError(err), true)
 		}
+		// 字段一改，上一次的「测通了」就不再成立（那是对改之前那份配置的
+		// 结论）。作废它，否则用户会以为新字段也验证过了。
+		a.editProbe.reset()
 		a.invalidate()
 	}
 
@@ -614,6 +641,12 @@ func (a *app) routeEditor(c *ui.Context, p *glass.Palette, idx int, running bool
 	// 始终可编辑（owner 2026-11-24：「我不觉得线路必须停止才能编辑」）。
 	// 运行中改的是「待应用」配置，点上面的「立即应用」才交给 Runner。
 	a.routeFields(c, p, r, false, save)
+
+	// 测试连接（owner 2026-11-25：「修改线路的时候，不能测试线路」）。
+	// 测的是界面上这份（含尚未应用的改动）——用户要知道的是「这样改之后
+	// 通不通」。ProbeRoute 新建独立连接，不干扰正在服务的连接。
+	a.probeRow(c, p, "route-edit-test", &a.editProbe, *r,
+		a.testEditingRoute, "建议先测一次再应用")
 
 	if running {
 		ui.Row(c).Padding(6, 0).Children(func() {
@@ -682,9 +715,7 @@ func (a *app) pendingRouteEditor(c *ui.Context, p *glass.Palette, running bool) 
 	// 草稿的每次字段改动都要作废上一次探测结果：
 	// 「测通了」是针对**改之前**那份配置的结论，改了地址还显示通过会误导。
 	onEdit := func() {
-		a.pendingProbe = nil
-		a.pendingProbeErr = nil
-		a.pendingProbeGen++
+		a.pendingProbe.reset()
 		a.invalidate()
 	}
 
@@ -701,46 +732,12 @@ func (a *app) pendingRouteEditor(c *ui.Context, p *glass.Palette, running bool) 
 
 	a.routeFields(c, p, r, false, onEdit)
 
-	// 测试连接 + 结果。
+	// 测试连接 + 结果（与编辑区共用同一套渲染，见 probeRow）。
 	//
 	// 只有「测过」才允许添加吗？不强制——用户可能在别处已验证过，或只是想
 	// 先把配置存下来。强制测试会把「添加」变成有副作用的动作（要联网）。
-	// 校验不过时「测试连接」也置灰：字段都没填全，拨号必然失败，
-	// 让它可点只会白等一个超时（视觉复验的建议项）。
-	canProbe := r.Normalize().Validate() == nil
-	ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(8).Children(func() {
-		label := "测试连接"
-		if a.pendingTesting {
-			label = "测试中…"
-		}
-		if a.actionButton(c, p, "route-pending-test", label, false,
-			a.pendingTesting || !canProbe).Clicked() {
-			a.testPendingRoute()
-		}
-		switch {
-		case a.pendingTesting:
-			ui.Text(c, "正在拨号…").FontSize(10).TextColor(p.Tertiary).Grow(1).SingleLine()
-		case a.pendingProbeErr != nil:
-			ui.Text(c, a.pendingProbeErr.Error()).FontSize(10).
-				TextColor(p.DangerText).MaxLines(3).Grow(1)
-		case a.pendingProbe != nil:
-			pr := a.pendingProbe
-			txt := fmt.Sprintf("通了 · 握手 %d ms · 往返 %d ms · %s",
-				pr.HandshakeMS, pr.RTTMS, strings.ToUpper(pr.Transport))
-			if pr.Dcz2 {
-				txt += " · dcz2"
-			}
-			ui.Text(c, txt).FontSize(10).TextColor(p.Success).Grow(1).SingleLine()
-		case !canProbe:
-			// 测试按钮此时是禁用的，再写「建议先测一次」就是在提示一个
-			// 当前做不到的动作（视觉终验指出）。改成说清前置条件。
-			ui.Text(c, "填完必填项后可测试").FontSize(10).
-				TextColor(p.Tertiary).Grow(1).SingleLine()
-		default:
-			ui.Text(c, "建议先测一次再添加").FontSize(10).
-				TextColor(p.Tertiary).Grow(1).SingleLine()
-		}
-	})
+	a.probeRow(c, p, "route-pending-test", &a.pendingProbe, *r,
+		a.testPendingRoute, "建议先测一次再添加")
 
 	// 「添加」是这一屏唯一的主操作。校验不过时**不置灰**，而是退回描边样式
 	// 并说明缺什么：
@@ -935,4 +932,51 @@ func pendingRouteMissing(r route.Route) string {
 		return "线路名称（不能与现有线路重名）"
 	}
 	return strings.Join(missing, "、")
+}
+
+// probeRow 「测试连接」按钮 + 结果/提示一行（草稿与编辑区共用）。
+//
+// 抽出来的理由：两处的三段式状态机完全一样（测试中 / 失败 / 成功），
+// 各写一份迟早分叉——尤其是「校验不过时按钮置灰 + 提示改口径」这种细节。
+//
+// hint 是「还没测」时的引导语：草稿说「建议先测一次再添加」，编辑区说
+// 「建议先测一次再应用」——它要指向各自的下一个动作。
+func (a *app) probeRow(c *ui.Context, p *glass.Palette, key string,
+	probe *routeProbe, r route.Route, onTest func(), hint string) {
+
+	// 校验不过时也置灰：字段没填全，拨号必然失败，让它可点只会白等一个超时。
+	canProbe := r.Normalize().Validate() == nil
+	ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(8).Children(func() {
+		label := "测试连接"
+		if probe.testing {
+			label = "测试中…"
+		}
+		if a.actionButton(c, p, key, label, false, probe.testing || !canProbe).Clicked() {
+			onTest()
+		}
+		switch {
+		case probe.testing:
+			ui.Text(c, "正在拨号…").FontSize(10).
+				TextColor(p.Tertiary).Grow(1).SingleLine()
+		case probe.err != nil:
+			ui.Text(c, probe.err.Error()).FontSize(10).
+				TextColor(p.DangerText).MaxLines(3).Grow(1)
+		case probe.result != nil:
+			pr := probe.result
+			txt := fmt.Sprintf("通了 · 握手 %d ms · 往返 %d ms · %s",
+				pr.HandshakeMS, pr.RTTMS, strings.ToUpper(pr.Transport))
+			if pr.Dcz2 {
+				txt += " · dcz2"
+			}
+			ui.Text(c, txt).FontSize(10).TextColor(p.Success).Grow(1).SingleLine()
+		case !canProbe:
+			// 按钮此时是禁用的，再写「建议先测一次」就是在提示一个当前
+			// 做不到的动作。改成说清前置条件。
+			ui.Text(c, "填完必填项后可测试").FontSize(10).
+				TextColor(p.Tertiary).Grow(1).SingleLine()
+		default:
+			ui.Text(c, hint).FontSize(10).
+				TextColor(p.Tertiary).Grow(1).SingleLine()
+		}
+	})
 }

@@ -210,14 +210,15 @@ type app struct {
 	//
 	// 草稿不参与 routesDraft、不落盘、不影响择路；只有点「添加」才提交。
 	pendingRoute route.Route
-	// pendingTesting 草稿的探测是否在跑（按钮置灰 + 显示「测试中…」）。
-	pendingTesting bool
-	// pendingProbe 最近一次探测结果（nil = 没测过或已清空）。
-	pendingProbe *relayclient.ProbeResult
-	// pendingProbeErr 探测失败原因（与 pendingProbe 互斥）。
-	pendingProbeErr error
-	// pendingProbeGen 探测世代号：用户连点测试 / 改字段后旧结果必须作废。
-	pendingProbeGen int
+	// pendingProbe 草稿（新建）的探测状态。
+	pendingProbe routeProbe
+	// editProbe 编辑区（改已有线路）的探测状态。
+	//
+	// 为什么要两套（owner 2026-11-25：「修改线路的时候，不能测试线路」）：
+	// 原先只有新建草稿能测，改已有线路反而不能——而改的风险更高（可能把
+	// 一条正在用的线路改坏）。草稿与编辑区互斥（进草稿会收起编辑区），
+	// 所以两份状态不会同时活跃，不存在歧义。
+	editProbe routeProbe
 
 	// routeErr 线路配置保存失败的原因（nil 表示正常）
 	routeErr error
@@ -1183,4 +1184,33 @@ func (a *app) routeSummary() string {
 		out += " · 最快 " + best
 	}
 	return out
+}
+
+// routeProbe 一次线路探测的进行中标记与最近结果。
+//
+// 抽成结构体的理由：草稿与编辑区需要各自独立的一份（见 app.editProbe）。
+// 若继续用四个并列字段，两处就要各写一遍重置/世代号逻辑，迟早漏一处。
+type routeProbe struct {
+	// testing 探测是否在跑（按钮置灰 + 显示「测试中…」）。
+	testing bool
+	// result 最近一次成功结果（nil = 没测过或已作废）。
+	result *relayclient.ProbeResult
+	// err 最近一次失败原因（与 result 互斥）。
+	err error
+	// gen 世代号：用户连点测试、改字段、或收起编辑区后，旧结果必须丢弃。
+	gen int
+}
+
+// reset 作废进行中/已完成的结果（字段一改，之前的结论就不再成立）。
+func (p *routeProbe) reset() {
+	p.result, p.err = nil, nil
+	p.gen++
+}
+
+// start 标记一次探测开始，返回本轮的世代号供回调比对。
+func (p *routeProbe) start() int {
+	p.testing = true
+	p.result, p.err = nil, nil
+	p.gen++
+	return p.gen
 }

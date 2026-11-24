@@ -134,6 +134,26 @@ func TestShotRouteEditing(t *testing.T) {
 	shot(t, a, "/tmp/shot-route-editing.png")
 }
 
+// 编辑已有线路 + 已测通（owner 2026-11-25：修改线路时也要能测试）。
+func TestShotEditProbeSuccess(t *testing.T) {
+	a := newTestApp(t)
+	setRunning(a, true)
+	a.tab = tabSettings
+	a.routesExpanded = true
+	a.routesDraft = demoRoutes()
+	a.routeSnaps = demoSnaps()
+	a.appliedRoutes = a.routesDraft.Normalize()
+	for i := range a.routesDraft {
+		if a.routesDraft[i].Kind == route.KindRelay {
+			a.setEditingRoute(i)
+		}
+	}
+	a.editProbe.result = &relayclient.ProbeResult{
+		HandshakeMS: 52, RTTMS: 14, Transport: "tcp", Dcz2: true,
+	}
+	shot(t, a, "/tmp/shot-edit-probe.png")
+}
+
 // 测试连接成功的状态（注入探测结果，不真拨号）。
 func TestShotProbeSuccess(t *testing.T) {
 	a := newTestApp(t)
@@ -145,7 +165,7 @@ func TestShotProbeSuccess(t *testing.T) {
 	a.appliedRoutes = a.routesDraft.Normalize()
 	a.beginAddRoute(route.KindProxy)
 	a.pendingRoute.Proxy = "http://127.0.0.1:7890"
-	a.pendingProbe = &relayclient.ProbeResult{
+	a.pendingProbe.result = &relayclient.ProbeResult{
 		HandshakeMS: 46, RTTMS: 12, Transport: "tcp", Dcz2: true,
 	}
 	shot(t, a, "/tmp/shot-probe-success.png")
@@ -162,7 +182,7 @@ func TestShotProbeFailure(t *testing.T) {
 	a.appliedRoutes = a.routesDraft.Normalize()
 	a.beginAddRoute(route.KindRelay)
 	a.pendingRoute.Server = "47.117.152.3:28443"
-	a.pendingProbeErr = errors.New(
+	a.pendingProbe.err = errors.New(
 		"tls: failed to verify certificate: x509: cannot validate certificate for 47.117.152.3 " +
 			"because it doesn't contain any IP SANs\n→ 这条线路指向 IP 但证书只签了域名：请在「证书域名」里填证书上的域名")
 	shot(t, a, "/tmp/shot-probe-failure.png")

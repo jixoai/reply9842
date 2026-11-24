@@ -572,3 +572,75 @@ func TestRevertRoutesRestoresApplied(t *testing.T) {
 		t.Fatal("revert 之后两份切片共享底层数组，改一份会污染另一份")
 	}
 }
+
+// 修改已有线路时必须能测试连接（owner 2026-11-25：「修改线路的时候，
+// 不能测试线路」）。改比新建风险更高——改坏了影响的是正在用的那条。
+func TestEditingRouteHasProbeButton(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	a.routesExpanded = true
+	a.routesDraft = route.Set{{
+		ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",
+		ServerName: "magpie.aiweb.xin",
+	}}
+	a.appliedRoutes = a.routesDraft.Normalize()
+	a.setEditingRoute(0)
+
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if !tt.HasText("测试连接") {
+		t.Fatalf("编辑区必须有「测试连接」：%q", tt.Texts())
+	}
+	// 引导语要指向编辑区自己的下一步动作（应用），而不是草稿的（添加）
+	if !tt.HasText("建议先测一次再应用") {
+		t.Fatalf("编辑区的测试引导语应指向「应用」：%q", tt.Texts())
+	}
+}
+
+// 编辑区改了字段后，上一次的探测结论必须作废。
+//
+// 「测通了」是针对**改之前**那份配置的结论；字段一变还显示通过会误导。
+func TestEditProbeResetOnFieldChange(t *testing.T) {
+	a := newTestApp(t)
+	a.tab = tabSettings
+	a.routesExpanded = true
+	a.routesDraft = route.Set{{
+		ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",
+	}}
+	a.appliedRoutes = a.routesDraft.Normalize()
+	a.setEditingRoute(0)
+
+	// 假装刚测过一次（成功），并让界面渲染出结果
+	a.editProbe.result = &relayclient.ProbeResult{
+		HandshakeMS: 40, RTTMS: 11, Transport: "tcp", Dcz2: true,
+	}
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if !tt.HasText("通了 · 握手 40 ms") {
+		t.Fatalf("探测结果应显示在编辑区：%q", tt.Texts())
+	}
+
+	// 模拟用户改字段（routeFields 的 onChange 会调 save，里面 reset）
+	a.editProbe.reset()
+	tt2 := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if tt2.HasText("通了 · 握手 40 ms") {
+		t.Fatalf("改字段后旧的探测结果必须消失：%q", tt2.Texts())
+	}
+	// 引导语回来
+	if !tt2.HasText("建议先测一次再应用") {
+		t.Fatalf("作废后应回到未测引导态：%q", tt2.Texts())
+	}
+}
+
+// 草稿与编辑区的探测状态互不污染。
+func TestPendingAndEditProbeIndependent(t *testing.T) {
+	a := newTestApp(t)
+	a.routesDraft = route.Set{{ID: "A", Kind: route.KindDirect, Server: "h:28443"}}
+	a.editProbe.result = &relayclient.ProbeResult{HandshakeMS: 1, RTTMS: 2, Transport: "tcp"}
+	a.beginAddRoute(route.KindProxy)
+
+	if a.editProbe.result != nil {
+		t.Fatal("进入草稿应收起编辑区并作废它的探测结果（那份结果已无展示位）")
+	}
+	if a.pendingProbe.result != nil {
+		t.Fatal("新草稿不该带着上一次的探测结果")
+	}
+}
