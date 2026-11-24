@@ -208,3 +208,44 @@ func TestDemoRoutesHasDisabledSample(t *testing.T) {
 		t.Fatalf("演示数据应有 1 条停用线路（供截图验证状态表达），实际 %d 条", disabled)
 	}
 }
+
+// 中继线路同样需要源地址绑定：中继只是服务端再转发一跳，本机到中继这
+// 一跳仍是本机外连，TUN 全局模式照样劫持。曾只补 direct，实测 relay
+// 线路全程 tls: EOF、永不参与择路。
+func TestFillRuntimeFieldsCoversRelay(t *testing.T) {
+	rs := route.Set{
+		{ID: "香港", Kind: route.KindDirect, Server: "h:28443"},
+		{ID: "上海", Kind: route.KindRelay, Server: "47.117.152.3:28443"},
+		{ID: "代理", Kind: route.KindProxy, Server: "h:28443", Proxy: "http://p:7890"},
+	}
+	fillRuntimeRouteFields(rs, relayclient.NetworkDirect, "192.168.1.106", "")
+	if rs[0].LocalAddr != "192.168.1.106" {
+		t.Fatalf("direct 未补源地址: %+v", rs[0])
+	}
+	if rs[1].LocalAddr != "192.168.1.106" {
+		t.Fatalf("relay 未补源地址（这正是 tls: EOF 的根因）: %+v", rs[1])
+	}
+	if rs[2].LocalAddr != "" {
+		t.Fatalf("proxy 不该补源地址: %+v", rs[2])
+	}
+
+	// 用户显式填的不能被覆盖
+	rs2 := route.Set{{ID: "x", Kind: route.KindDirect, Server: "h:28443", LocalAddr: "10.0.0.9"}}
+	fillRuntimeRouteFields(rs2, relayclient.NetworkDirect, "192.168.1.106", "")
+	if rs2[0].LocalAddr != "10.0.0.9" {
+		t.Fatalf("显式源地址被覆盖: %+v", rs2[0])
+	}
+
+	// 代理模式：只补代理线路
+	rs3 := route.Set{
+		{ID: "a", Kind: route.KindDirect, Server: "h:28443"},
+		{ID: "b", Kind: route.KindProxy, Server: "h:28443"},
+	}
+	fillRuntimeRouteFields(rs3, relayclient.NetworkProxy, "", "socks5://p:1080")
+	if rs3[0].LocalAddr != "" || rs3[0].Proxy != "" {
+		t.Fatalf("direct 在代理模式下不该变: %+v", rs3[0])
+	}
+	if rs3[1].Proxy != "socks5://p:1080" {
+		t.Fatalf("proxy 未补代理地址: %+v", rs3[1])
+	}
+}

@@ -146,7 +146,11 @@ func (s Settings) Equal(o Settings) bool {
 	}
 	for i := range s.Routes {
 		a, b := s.Routes[i], o.Routes[i]
+		// ServerName 必须比：漏了它，用户改了 SNI 会被脏检查判成「无变更」，
+		// 于是不触发保存，重启后 SNI 静默消失、线路退化成按 IP 校验证书
+		// （= 必然 x509 失败）。配置比对漏字段的后果是「改了等于没改」。
 		if a.ID != b.ID || a.Kind != b.Kind || a.Server != b.Server ||
+			a.ServerName != b.ServerName ||
 			a.Proxy != b.Proxy || a.LocalAddr != b.LocalAddr ||
 			a.Transport != b.Transport || a.IsEnabled() != b.IsEnabled() {
 			return false

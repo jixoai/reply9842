@@ -205,3 +205,20 @@ func TestApplyToEmptyRoutesLeavesConfig(t *testing.T) {
 		t.Fatalf("空 Routes 的 settings 不应清空 cfg.Routes：%+v", cfg.Routes)
 	}
 }
+
+// 改了 SNI 必须被判定为「有变更」，否则 GUI 脏检查不会保存，
+// 重启后 SNI 静默消失、线路退化成按 IP 校验证书（必然 x509 失败）。
+func TestEqualNoticesServerNameChange(t *testing.T) {
+	a := Settings{Routes: route.Set{{
+		ID: "上海", Kind: route.KindRelay, Server: "47.117.152.3:28443",
+		ServerName: "magpie.aiweb.xin",
+	}}}
+	b := a
+	b.Routes = route.Set{{
+		ID: "上海", Kind: route.KindRelay, Server: "47.117.152.3:28443",
+		ServerName: "other.example",
+	}}
+	if a.Equal(b) {
+		t.Fatal("仅 ServerName 不同却被判为相等——保存会被静默跳过")
+	}
+}

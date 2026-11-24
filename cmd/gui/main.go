@@ -865,16 +865,7 @@ func (a *app) start() {
 		}
 		a.routeErr = nil
 		// 逐条补上 netMode 的运行时结果（只补空的，不覆盖用户显式填的）
-		for i := range rs {
-			switch {
-			case rs[i].Kind == route.KindDirect && rs[i].LocalAddr == "" &&
-				a.netMode == relayclient.NetworkDirect:
-				rs[i].LocalAddr = cfg.LocalAddr
-			case rs[i].Kind == route.KindProxy && rs[i].Proxy == "" &&
-				a.netMode == relayclient.NetworkProxy:
-				rs[i].Proxy = cfg.Proxy
-			}
-		}
+		fillRuntimeRouteFields(rs, a.netMode, cfg.LocalAddr, cfg.Proxy)
 		// 补完 LocalAddr/Proxy 后重新校验（代理线路缺 URL 会在这一步报出来）
 		if err := rs.Validate(); err != nil {
 			a.routeErr = err
@@ -1101,5 +1092,27 @@ func (a *app) applyAutostart() {
 		a.setNotice("已开启开机自启（下次登录生效）", false)
 	} else {
 		a.setNotice("已关闭开机自启", false)
+	}
+}
+
+// fillRuntimeRouteFields 把「网络」快捷设置在运行时算出来的出口，逐条补进
+// 字段为空的线路（只补空，不覆盖用户显式填的值）。
+//
+// 为什么源地址对 direct 与 relay 一视同仁：中继只是服务端再转发一跳，
+// 本机到中继这一跳仍是本机发起的外连，TUN 全局模式照样劫持。以前这里
+// 只认 direct，relay 线路永远拿不到绑定，实测全程 tls: EOF。
+//
+// proxy 线路不补源地址：CONNECT 由代理程序自己发，绑本机网卡反而会和
+// 代理进程自己的路由选择打架。
+func fillRuntimeRouteFields(rs route.Set, netMode, localAddr, proxy string) {
+	for i := range rs {
+		if rs[i].Kind != route.KindProxy && rs[i].LocalAddr == "" &&
+			netMode == relayclient.NetworkDirect {
+			rs[i].LocalAddr = localAddr
+		}
+		if rs[i].Kind == route.KindProxy && rs[i].Proxy == "" &&
+			netMode == relayclient.NetworkProxy {
+			rs[i].Proxy = proxy
+		}
 	}
 }
