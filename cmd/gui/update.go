@@ -769,15 +769,15 @@ func (a *app) updateRow(c *ui.Context, p *glass.Palette) {
 
 		switch {
 		case s.stage.cancelable() && s.cancel != nil:
-			if a.actionButton(c, p, "update-cancel", "取消", false).Clicked() {
+			if a.actionButton(c, p, "update-cancel", "取消", false, false).Clicked() {
 				a.cancelUpdate()
 			}
 		case s.stage == updAvailable && !dev:
-			if a.actionButton(c, p, "update-install", "更新到 "+s.info.Latest, true).Clicked() {
+			if a.actionButton(c, p, "update-install", "更新到 "+s.info.Latest, true, false).Clicked() {
 				a.installUpdate()
 			}
 		default:
-			btn := a.actionButton(c, p, "update-check", "检查更新", false)
+			btn := a.actionButton(c, p, "update-check", "检查更新", false, false)
 			if s.stage.busy() {
 				btn = btn.Disabled(true)
 			}

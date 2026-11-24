@@ -258,9 +258,9 @@ func TestAllRoutesDisabledRejected(t *testing.T) {
 // 实测两处缺陷，本质是同一个错误判断——「relay 不依赖本机网络，所以不用绑
 // 源地址」。这个判断是错的：中继只是让服务端再转发一跳，本机到中继那一跳
 // 仍是本机发起的外连，TUN 全局代理照样劫持它。
-//   1. normalizeRoutes 在 Routes 非空的分支里漏继承 LocalAddr
-//      → `-routes-file + -local-addr` 连不上（502/EOF）
-//   2. 补继承后只认 direct，relay 仍拿不到 → 中继线路清一色 tls: EOF
+//  1. normalizeRoutes 在 Routes 非空的分支里漏继承 LocalAddr
+//     → `-routes-file + -local-addr` 连不上（502/EOF）
+//  2. 补继承后只认 direct，relay 仍拿不到 → 中继线路清一色 tls: EOF
 func TestGlobalLocalAddrInheritedByRoutes(t *testing.T) {
 	c := Config{
 		LocalAddr: "192.168.1.106",

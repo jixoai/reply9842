@@ -8,7 +8,10 @@ package main
 //  2. 删除线路保护：不允许删到 0 条（没有线路的客户端起不来）
 
 import (
+	"strings"
 	"testing"
+
+	"github.com/egoist/mygo/ui"
 
 	"github.com/jixoai/reply9842/internal/relayclient"
 	"github.com/jixoai/reply9842/internal/route"
@@ -110,27 +113,37 @@ func TestRemoveRouteMiddle(t *testing.T) {
 	}
 }
 
-// 添加中继线路：server 必须留空（避免悄悄复制一个同地址的线路）
+// 新建中继：草稿的 server 必须留空（避免悄悄复制一个同地址的线路）。
 func TestAddRelayLeavesServerEmpty(t *testing.T) {
 	a := &app{server: "magpie.aiweb.xin", settingsPath: t.TempDir() + "/s.json"}
-	a.addRoute(route.KindRelay)
-	if len(a.routesDraft) != 1 {
-		t.Fatal("应新增一条")
+	a.beginAddRoute(route.KindRelay)
+	if a.pendingRoute.Kind != route.KindRelay {
+		t.Fatalf("草稿类型应为 relay，实际 %q", a.pendingRoute.Kind)
 	}
-	if a.routesDraft[0].Server == "magpie.aiweb.xin" {
-		t.Fatal("中继线路不该自动填入同一台 server（它的语义就是指向另一台）")
+	if a.pendingRoute.Server == "magpie.aiweb.xin" ||
+		strings.Contains(a.pendingRoute.Server, "magpie.aiweb.xin") {
+		t.Fatal("中继草稿不该自动填入同一台 server（它的语义就是指向另一台）")
 	}
 }
 
-// 添加代理线路：给一个可用的默认 URL（避免一加就是坏配置）
-func TestAddProxyHasDefaultURL(t *testing.T) {
+// 新建代理：**不预设代理地址**。
+//
+// 这条测试守的是 owner 2026-11-24 的批评：「添加代理的时候你就直接用 7890
+// 端口了」——硬编码一个端口会让用户以为「已经填好了」，而绝大多数人的
+// 代理并不在 7890。占位符给示例，字段留空，由用户填真实值。
+func TestAddProxyLeavesURLBlank(t *testing.T) {
 	a := &app{server: "magpie.aiweb.xin", settingsPath: t.TempDir() + "/s.json"}
-	a.addRoute(route.KindProxy)
-	if a.routesDraft[0].Proxy == "" {
-		t.Fatal("代理线路应有默认代理地址")
+	a.beginAddRoute(route.KindProxy)
+	if a.pendingRoute.Proxy != "" {
+		t.Fatalf("代理草稿不该预设地址，实际 %q", a.pendingRoute.Proxy)
 	}
-	if err := a.routesDraft.Normalize().Validate(); err != nil {
-		t.Fatalf("新加的代理线路应合法：%v", err)
+	// 留空时校验必须失败（诚实提示用户填），填上后必须通过
+	if err := a.pendingRoute.Normalize().Validate(); err == nil {
+		t.Fatal("代理草稿缺地址时应校验失败")
+	}
+	a.pendingRoute.Proxy = "socks5://127.0.0.1:1081"
+	if err := a.pendingRoute.Normalize().Validate(); err != nil {
+		t.Fatalf("填好地址后应合法：%v", err)
 	}
 }
 
@@ -301,19 +314,27 @@ func TestRemoveRouteKeepsEditTarget(t *testing.T) {
 // 用户没有任何途径填它们。
 func TestRelayRouteConfigurableThroughGUI(t *testing.T) {
 	a := &app{server: "magpie.aiweb.xin", settingsPath: t.TempDir() + "/s.json"}
-	a.addRoute(route.KindRelay)
+	a.beginAddRoute(route.KindRelay)
 
-	// 刚加出来是禁用的「请填另一台服务器」状态：必须校验失败（诚实）
-	if err := a.routesDraft.Normalize().Validate(); err == nil {
-		t.Fatal("新加的中继缺 server，校验应当失败以提示用户填写")
+	// 草稿态：还没有进入 routesDraft，更没有落盘
+	if len(a.routesDraft) != 0 {
+		t.Fatalf("草稿不该进入线路列表，实际 %d 条", len(a.routesDraft))
+	}
+	// 中继留空 server：此时必须校验失败（诚实地说「请填另一台服务器」）
+	if err := a.pendingRoute.Normalize().Validate(); err == nil {
+		t.Fatal("中继草稿缺 server，校验应当失败以提示用户填写")
 	}
 
-	// 模拟用户在编辑区里逐格填入（即编辑区提供的四个字段）
-	a.routesDraft[0].Server = "47.117.152.3:28443"
-	a.routesDraft[0].ServerName = "magpie.aiweb.xin"
-	a.routesDraft[0].LocalAddr = "192.168.1.106"
-	a.routesDraft[0].Transport = "tcp"
+	// 模拟用户在草稿表单里逐格填入
+	a.pendingRoute.Server = "47.117.152.3:28443"
+	a.pendingRoute.ServerName = "magpie.aiweb.xin"
+	a.pendingRoute.LocalAddr = "192.168.1.106"
+	a.pendingRoute.Transport = "tcp"
+	a.commitPendingRoute()
 
+	if len(a.routesDraft) != 1 {
+		t.Fatalf("添加后应有 1 条线路，实际 %d", len(a.routesDraft))
+	}
 	rs := a.routesDraft.Normalize()
 	if err := rs.Validate(); err != nil {
 		t.Fatalf("编辑区能填出的配置必须合法，实际: %v", err)
@@ -321,6 +342,10 @@ func TestRelayRouteConfigurableThroughGUI(t *testing.T) {
 	// 填进去的值不能在任何一步被清掉（Normalize 不得抹掉显式 SNI/源地址）
 	if rs[0].ServerName != "magpie.aiweb.xin" || rs[0].LocalAddr != "192.168.1.106" {
 		t.Fatalf("显式字段被改写: %+v", rs[0])
+	}
+	// 草稿要清空，否则下次点「＋」会看到上一条的残留
+	if a.pendingRoute.ID != "" {
+		t.Fatalf("提交后草稿应清空，实际 %+v", a.pendingRoute)
 	}
 }
 
@@ -331,12 +356,13 @@ func TestRelayRouteConfigurableThroughGUI(t *testing.T) {
 func TestRouteEditorFieldsSurviveSaveReload(t *testing.T) {
 	dir := t.TempDir()
 	a := &app{server: "magpie.aiweb.xin", settingsPath: dir + "/s.json"}
-	a.addRoute(route.KindRelay)
-	a.routesDraft[0].ID = "上海"
-	a.routesDraft[0].Server = "47.117.152.3:28443"
-	a.routesDraft[0].ServerName = "magpie.aiweb.xin"
-	a.routesDraft[0].LocalAddr = "192.168.1.106"
-	a.routesDraft[0].Transport = "tcp"
+	a.beginAddRoute(route.KindRelay)
+	a.pendingRoute.ID = "上海"
+	a.pendingRoute.Server = "47.117.152.3:28443"
+	a.pendingRoute.ServerName = "magpie.aiweb.xin"
+	a.pendingRoute.LocalAddr = "192.168.1.106"
+	a.pendingRoute.Transport = "tcp"
+	a.commitPendingRoute()
 	if err := a.saveSettings(); err != nil {
 		t.Fatalf("保存失败: %v", err)
 	}
@@ -350,5 +376,163 @@ func TestRouteEditorFieldsSurviveSaveReload(t *testing.T) {
 		r.ServerName != "magpie.aiweb.xin" ||
 		r.LocalAddr != "192.168.1.106" || r.Transport != "tcp" {
 		t.Fatalf("字段在往返中丢失: %+v", r)
+	}
+}
+
+// 「有改动未生效」的判断口径：必须逐字段比，不能只比条数。
+//
+// owner 2026-11-24：「编辑完是落入一个未应用的配置中，最后实现一键生效」。
+// 这条守的是「一键生效」的前置条件——判断错了就会要么一直提示有改动
+// （用户以为点了没用），要么改完不提示（用户以为已经生效）。
+func TestRoutesDirtyDetectsFieldChange(t *testing.T) {
+	// appliedRoutes 在真实路径上恒为 Normalize 后的值（start/applyRoutes 都
+	// 先 Normalize 再赋值），所以比较的基准也必须 Normalize——否则测试会
+	// 因为「一侧补了默认 Transport、另一侧没有」而误报。
+	applied := route.Set{
+		{ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",
+			ServerName: "magpie.aiweb.xin", LocalAddr: "192.168.1.106"},
+	}.Normalize()
+
+	// 完全相同 → 不 dirty
+	if !applied.Normalize().Equal(applied) {
+		t.Fatal("同一份配置应判为相等")
+	}
+
+	// 只改 SNI 一个字段 → 必须 dirty（漏比字段是「改了等于没改」的老坑）
+	mut := route.Set{{ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",
+		ServerName: "other.example", LocalAddr: "192.168.1.106"}}
+	if mut.Normalize().Equal(applied) {
+		t.Fatal("只改 server_name 应判为有改动")
+	}
+
+	// 停用一条 → dirty（启停也是生效状态的一部分）
+	off := false
+	mut2 := route.Set{{ID: "香港", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",
+		ServerName: "magpie.aiweb.xin", LocalAddr: "192.168.1.106", Enabled: &off}}
+	if mut2.Normalize().Equal(applied) {
+		t.Fatal("停用线路应判为有改动")
+	}
+}
+
+// 未运行时不该提示「有改动未生效」：没有正在跑的东西需要生效。
+func TestRoutesDirtyFalseWhenNotRunning(t *testing.T) {
+	a := &app{routesDraft: route.Set{
+		{ID: "A", Kind: route.KindDirect, Server: "changed:28443"},
+	}}
+	a.appliedRoutes = route.Set{
+		{ID: "A", Kind: route.KindDirect, Server: "original:28443"},
+	}
+	// runner 为 nil → running() 为 false
+	if a.routesDirty() {
+		t.Fatal("未运行时不该提示有改动未生效（改动会在下次启动生效）")
+	}
+}
+
+// 草稿取消后必须彻底清空：否则下一次点「＋」会看到上一条的残留字段。
+func TestCancelPendingRouteClearsDraft(t *testing.T) {
+	a := &app{server: "magpie.aiweb.xin", settingsPath: t.TempDir() + "/s.json"}
+	a.beginAddRoute(route.KindProxy)
+	a.pendingRoute.Proxy = "http://127.0.0.1:9999"
+	a.pendingRoute.ID = "改过的名字"
+	a.cancelPendingRoute()
+
+	if a.pendingRoute.ID != "" || a.pendingRoute.Proxy != "" {
+		t.Fatalf("取消后草稿应清空，实际 %+v", a.pendingRoute)
+	}
+	if len(a.routesDraft) != 0 {
+		t.Fatal("取消不该往线路列表里加东西")
+	}
+}
+
+// 草稿的重名会挡住提交（线路名是身份，日志与面板都靠它区分）。
+func TestCommitRejectsDuplicateID(t *testing.T) {
+	a := &app{server: "magpie.aiweb.xin", settingsPath: t.TempDir() + "/s.json"}
+	a.routesDraft = route.Set{{ID: "香港", Kind: route.KindDirect, Server: "h:28443"}}
+	a.beginAddRoute(route.KindDirect)
+	a.pendingRoute.ID = "香港" // 撞名
+	a.pendingRoute.Server = "h2:28443"
+	a.commitPendingRoute()
+
+	if len(a.routesDraft) != 1 {
+		t.Fatalf("重名不该被加入，实际 %d 条", len(a.routesDraft))
+	}
+	// 草稿要保留（用户只是改个名就能继续，不该丢弃他填的内容）
+	if a.pendingRoute.ID != "香港" {
+		t.Fatal("提交失败时草稿应保留，用户可以改名重试")
+	}
+}
+
+// 草稿态的列表开关文案必须与真实状态一致。
+//
+// 视觉终验 P1：早期草稿期**强制**收起列表，于是摘要写「列表已收起」、
+// 右边按钮还显示「折叠」——点它既不像折叠也不像展开。
+// 现在 beginAddRoute 只收起一次，之后允许展开，文案必须跟着状态走。
+func TestDraftModeListToggleConsistent(t *testing.T) {
+	mk := func() *app {
+		x := newTestApp(t)
+		x.tab = tabSettings
+		x.routesExpanded = true
+		x.routesDraft = route.Set{
+			{ID: "A", Kind: route.KindDirect, Server: "h:28443"},
+		}
+		return x
+	}
+
+	// 进入草稿：列表被收起一次 → 摘要说「列表已收起」，按钮应是「展开」
+	a := mk()
+	a.beginAddRoute(route.KindProxy)
+	if a.routesExpanded {
+		t.Fatal("进入草稿时应收起列表一次")
+	}
+	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+	if !tt.HasText("列表已收起") {
+		t.Errorf("收起时应说明「列表已收起」")
+	}
+	if tt.HasText("折叠") {
+		t.Errorf("列表已收起时按钮不该显示「折叠」（应显示「展开」）")
+	}
+	// **草稿表单必须可见**——这是最容易漏的一条（我自己漏过）：折叠只该跳过
+	// 列表，不能连草稿一起跳过。视觉第四轮用像素差抓到过「点＋代理后表单根本
+	// 不在屏上，草稿态与折叠态只差摘要行」。
+	for _, want := range []string{"新建代理线路", "服务器", "代理地址", "测试连接", "添加", "取消"} {
+		if !tt.HasText(want) {
+			t.Errorf("草稿态必须能看到 %q，否则用户点完＋代理什么也填不了：%q", want, tt.Texts())
+		}
+	}
+
+	// 用户主动展开：摘要不再说「已收起」，按钮变「折叠」
+	b := mk()
+	b.beginAddRoute(route.KindProxy)
+	b.routesExpanded = true
+	tt2 := ui.NewTester(b.view, defaultWinWidth, defaultWinHeight)
+	if tt2.HasText("列表已收起") {
+		t.Errorf("展开后不该再提示「列表已收起」")
+	}
+	if !tt2.HasText("折叠") {
+		t.Errorf("展开后按钮应显示「折叠」")
+	}
+}
+
+// 草稿期间「还需填写：X」必须点名缺的那一项，而不是只说「不能添加」。
+//
+// 视觉复验 N2 的延伸要求：禁用按钮只能表达「不能点」，说不出「为什么」。
+func TestPendingRouteMissingNamesField(t *testing.T) {
+	base := route.Route{ID: "代理1", Kind: route.KindProxy, Server: "magpie.aiweb.xin:28443"}
+	if got := pendingRouteMissing(base); !strings.Contains(got, "代理地址") {
+		t.Fatalf("缺代理地址时应点名它，实际 %q", got)
+	}
+	base.Proxy = "127.0.0.1:7890" // 缺协议头
+	if got := pendingRouteMissing(base); !strings.Contains(got, "协议头") {
+		t.Fatalf("缺协议头时应指出，实际 %q", got)
+	}
+	base.Proxy = "socks5://127.0.0.1:1080"
+	if got := pendingRouteMissing(base); got != "线路名称（不能与现有线路重名）" {
+		t.Fatalf("必填都齐了应只剩重名检查，实际 %q", got)
+	}
+
+	// 中继指向 IP 时必须点名证书域名
+	relay := route.Route{ID: "中继1", Kind: route.KindRelay, Server: "47.117.152.3:28443"}
+	if got := pendingRouteMissing(relay); !strings.Contains(got, "证书域名") {
+		t.Fatalf("IP 中继缺 SNI 时应点名证书域名，实际 %q", got)
 	}
 }

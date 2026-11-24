@@ -1,37 +1,55 @@
 package main
 
-import "testing"
+// 这个文件原本测「网络三选一下的传输方式选项」与「启动时纠正 proxy+QUIC」。
+//
+// 2026-11-24 owner：「线路和网络是不是应该合并到一起，不然很奇怪？」
+// 网络三选一与传输方式两行已删除——它们是「第一条线路的字段」的另一种写法。
+// 但**代理不能承载 QUIC** 这条约束仍然成立，只是落点从界面搬到了配置迁移：
+// 旧 GUI 允许存下这个非法组合，升级后若直接交给 route.Validate 会被拒绝，
+// 客户端起不来。所以纠正逻辑留在 MigrateRoutes，这里测它。
 
-func TestTransportChoicesByNetworkMode(t *testing.T) {
-	t.Run("代理只提供自动/TCP", func(t *testing.T) {
-		options, labels := transportChoices("proxy")
-		if len(options) != 2 || options[0] != "auto" || options[1] != "tcp" {
-			t.Fatalf("代理模式选项 = %v，期望 [auto tcp]", options)
-		}
-		for _, l := range labels {
-			if l == "QUIC" {
-				t.Fatalf("代理模式不得出现 QUIC 选项：%v", labels)
-			}
-		}
-	})
-	t.Run("其它模式保留三种", func(t *testing.T) {
-		for _, mode := range []string{"direct", "system"} {
-			options, _ := transportChoices(mode)
-			if len(options) != 3 || options[1] != "quic" {
-				t.Fatalf("%s 模式选项 = %v，期望含 QUIC 的三项", mode, options)
-			}
-		}
-	})
-}
+import (
+	"testing"
 
-func TestTransportForNetworkCoercesProxyQUIC(t *testing.T) {
-	if got := transportForNetwork("proxy", "quic"); got != "auto" {
-		t.Fatalf("代理 + QUIC 应纠正为 auto，实际 %q", got)
+	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/route"
+)
+
+func TestMigrationCoercesProxyQUIC(t *testing.T) {
+	cases := []struct {
+		name      string
+		mode      string
+		proxyURL  string
+		transport string
+		wantKind  route.Kind
+		wantTrans string
+	}{
+		{"代理 + QUIC → 纠正为 auto", relayclient.NetworkProxy,
+			"http://127.0.0.1:7890", "quic", route.KindProxy, "auto"},
+		{"代理 + TCP 不动", relayclient.NetworkProxy,
+			"http://127.0.0.1:7890", "tcp", route.KindProxy, "tcp"},
+		{"直连 + QUIC 保留", relayclient.NetworkDirect, "", "quic", route.KindDirect, "quic"},
 	}
-	if got := transportForNetwork("proxy", "tcp"); got != "tcp" {
-		t.Fatalf("代理 + TCP 不应改动，实际 %q", got)
-	}
-	if got := transportForNetwork("direct", "quic"); got != "quic" {
-		t.Fatalf("直连模式应保留 QUIC，实际 %q", got)
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			s := relayclient.Settings{
+				NetworkMode: c.mode, ProxyURL: c.proxyURL,
+				Transport: c.transport, Server: "magpie.aiweb.xin",
+			}
+			rs := s.MigrateRoutes()
+			if len(rs) != 1 {
+				t.Fatalf("应迁移出 1 条线路，实际 %d", len(rs))
+			}
+			if rs[0].Kind != c.wantKind {
+				t.Fatalf("kind = %q，期望 %q", rs[0].Kind, c.wantKind)
+			}
+			if rs[0].Transport != c.wantTrans {
+				t.Fatalf("transport = %q，期望 %q", rs[0].Transport, c.wantTrans)
+			}
+			// 纠正后必须能通过校验（否则用户升级即不可用）
+			if err := rs.Validate(); err != nil {
+				t.Fatalf("迁移结果应合法：%v", err)
+			}
+		})
 	}
 }

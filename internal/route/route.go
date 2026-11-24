@@ -332,3 +332,27 @@ func (s Set) Servers() []string {
 	}
 	return out
 }
+
+// Equal 判断两份线路列表是否逐字段等价。
+//
+// 用途：GUI 判断「当前编辑有未应用的改动」。不能只比长度或比 ID——用户
+// 改的可能正是某个字段（server / SNI / 源地址），那些才是要生效的东西。
+//
+// 与 Settings.Equal 的关系：那边是偏好整体比较（含线路），这里只比线路，
+// 供「运行中改了线路但还没点应用」这一状态使用。两处语义必须一致，
+// 所以 Settings.Equal 也走这个函数而不是自己再写一遍。
+func (s Set) Equal(o Set) bool {
+	if len(s) != len(o) {
+		return false
+	}
+	for i := range s {
+		a, b := s[i], o[i]
+		if a.ID != b.ID || a.Kind != b.Kind || a.Server != b.Server ||
+			a.ServerName != b.ServerName ||
+			a.Proxy != b.Proxy || a.LocalAddr != b.LocalAddr ||
+			a.Transport != b.Transport || a.IsEnabled() != b.IsEnabled() {
+			return false
+		}
+	}
+	return true
+}

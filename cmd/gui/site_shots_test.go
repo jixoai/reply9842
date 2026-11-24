@@ -409,12 +409,15 @@ func TestSettingsFitsInWindowWhenCollapsed(t *testing.T) {
 		}
 	}
 
-	// 基线：v1（无线路区）的折叠态。线路区折叠后只多 1 行概览 + 1 条分隔线。
-	const baseline = 10
-	if lines < baseline-1 {
-		t.Fatalf("折叠态只找到 %d 条分隔线（基线 %d）：有设置项被挤出可视区", lines, baseline)
+	// 基线随设置项增减而变，所以断言的是「下限」而不是具体值：
+	// 合并掉「目标机器 / 证书域名 / 网络 / 传输方式」四行后，折叠态的分隔线
+	// 从 10 条降到 7 条（少 4 行、线路区多 1 行概览）。下限取 6：
+	// 再少就意味着监听地址/监听/线路概览/两个时间跨度/更新那几行也丢了。
+	const minLines = 6
+	if lines < minLines {
+		t.Fatalf("折叠态只找到 %d 条分隔线（下限 %d）：有设置项被挤出可视区", lines, minLines)
 	}
-	t.Logf("折叠态分隔线 %d 条（基线 %d）", lines, baseline)
+	t.Logf("折叠态分隔线 %d 条（下限 %d）", lines, minLines)
 }
 
 // 展开态护栏：记录「内容超出时卡片底圆角被推出视口」这一观感事实。

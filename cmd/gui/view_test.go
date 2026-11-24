@@ -18,6 +18,7 @@ import (
 	"github.com/jixoai/reply9842/internal/autostart"
 	"github.com/jixoai/reply9842/internal/glass"
 	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/route"
 	"github.com/jixoai/reply9842/internal/stats"
 	"github.com/jixoai/reply9842/internal/update"
 )
@@ -193,9 +194,18 @@ func TestSettingsTab(t *testing.T) {
 	a.tab = tabSettings
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
-	for _, want := range []string{"目标机器", "监听地址", "传输方式", "日志保留", "显示区间"} {
+	// 2026-11-24 owner：「线路和网络是不是应该合并到一起，不然很奇怪？」
+	// 「目标机器 / 证书域名 / 网络 / 传输方式」四行已合并进线路（它们是
+	// 「第一条线路的字段」的另一种写法），设置页只留监听地址 + 线路。
+	for _, want := range []string{"监听地址", "线路", "日志保留", "显示区间"} {
 		if !tt.HasText(want) {
 			t.Errorf("设置 tab 缺少 %q：%q", want, tt.Texts())
+		}
+	}
+	// 反向断言：被合并掉的四行不该再出现在设置页顶层
+	for _, gone := range []string{"目标机器", "传输方式"} {
+		if tt.HasText(gone) && !a.routesExpanded {
+			t.Errorf("「%s」应已合并进线路，不该单独成行：%q", gone, tt.Texts())
 		}
 	}
 	// 面板的内容不该出现在设置里（同一份信息不重复两处）
@@ -309,15 +319,28 @@ func TestHumanWindow(t *testing.T) {
 	}
 }
 
-// TestSettingsWhileRunning 运行中：字段被禁用并给出「先停止再改」的说明与出口。
+// TestSettingsWhileRunning 运行中：只有监听地址需要停止才能改，并且给出停止出口。
+//
+// 2026-11-24 前这条断言的是「连接设置在运行中不可修改」——那个说法在
+// 线路支持「待应用 + 立即生效」之后已经不成立：设置页上同时摆着「立即应用」
+// 和「运行中不可修改」，两者互相否定（视觉验收的阻塞项）。
+// 现在只有监听地址（要重新 bind）确实不能热改，文案也只说这一件事。
 func TestSettingsWhileRunning(t *testing.T) {
 	a := newTestApp(t)
 	a.tab = tabSettings
 	setRunning(a, true)
 	tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
 
-	if !tt.HasText("运行中不可修改") {
-		t.Errorf("运行中未提示不可修改：%q", tt.Texts())
+	if !tt.HasText("监听地址需停止后才能修改") {
+		t.Errorf("运行中未提示监听地址需要停止：%q", tt.Texts())
+	}
+	// 旧文案必须消失：它会让用户以为线路也不能改
+	if tt.HasText("连接设置在运行中不可修改") {
+		t.Errorf("旧的「连接设置不可修改」文案仍在，与「立即应用」矛盾：%q", tt.Texts())
+	}
+	// 停止出口必须还在（用户看完提示要能直接操作）
+	if !tt.HasText("停止") {
+		t.Errorf("缺少「停止」出口：%q", tt.Texts())
 	}
 }
 
@@ -365,7 +388,7 @@ func TestButtonStates(t *testing.T) {
 		view := func(c *ui.Context) {
 			c.SetTheme(pal.Theme())
 			ui.Row(c).FillWidth().Padding(30).Children(func() {
-				(&app{pal: pal}).actionButton(c, pal, "k", "按钮", true)
+				(&app{pal: pal}).actionButton(c, pal, "k", "按钮", true, false)
 			})
 		}
 		tt := ui.NewTester(view, 200, 100)
@@ -775,8 +798,8 @@ func TestTabsSwitchByClick(t *testing.T) {
 	if a.tab != tabSettings {
 		t.Fatalf("点「设置」后 tab = %d，期望 %d", a.tab, tabSettings)
 	}
-	// 切到设置后，设置的内容必须在
-	for _, want := range []string{"目标机器", "监听地址", "传输方式"} {
+	// 切到设置后，设置的内容必须在（网络类字段已合并进线路，见大改注释）
+	for _, want := range []string{"监听地址", "线路"} {
 		if !tt.HasText(want) {
 			t.Errorf("设置 pane 缺少 %q：%q", want, tt.Texts())
 		}
@@ -1052,7 +1075,9 @@ func TestSettingsFitsShippedWindow(t *testing.T) {
 	// 每一项都必须可见。前五项是「连接」组，其余在「其他」组——
 	// 任何一项被切掉都说明分区把行顶出了窗口。
 	rows := []string{
-		"连接", "目标机器", "网络", "监听地址", "传输方式",
+		// 「目标机器 / 网络 / 传输方式」已合并进线路（owner 2026-11-24），
+		// 这一组只留真正独立的行 + 两个组标题。
+		"连接", "监听地址", "线路",
 		"其他", "开机自启", "日志保留", "显示区间", "自动更新", "更新镜像", "软件更新",
 		"检查更新",
 	}
@@ -1093,7 +1118,9 @@ func TestSettingsHasTwoGroups(t *testing.T) {
 	// 分区标题的字重必须高于行标签（否则它读起来就是个字段名）。
 	// 用「颜色不同」间接验证：标题用 Foreground，行标签用 MutedForeground。
 	head, okH := tt.Find("连接")
-	label, okL := tt.Find("目标机器")
+	// 用「监听地址」当行标签基准：「目标机器」已合并进线路，
+	// 而监听地址是连接组里唯一与线路无关的独立行。
+	label, okL := tt.Find("监听地址")
 	if !okH || !okL {
 		t.Fatalf("找不到标题或行标签")
 	}
@@ -1148,11 +1175,13 @@ func TestFooterEffectiveTransport(t *testing.T) {
 	if !tt2.HasText("未运行 · —") {
 		t.Errorf("无记录时底栏应显示「未运行 · —」：%q", tt2.Texts())
 	}
-	// 设置页仍保留「自动 / QUIC / TCP」选择器（用户的意图在设置里表达）
+	// 设置页**不再**有「自动 / QUIC / TCP」选择器：传输方式是每条线路自己的
+	// 字段（代理线路不能 QUIC，直连可以），放在页面顶部只能表达「全局默认」，
+	// 而那个概念已经不存在了。线路编辑区里仍然能改。
 	b.tab = tabSettings
 	tt2.Frame()
-	if !tt2.HasText("传输方式") {
-		t.Errorf("设置页的传输方式选择器不该被删掉：%q", tt2.Texts())
+	if tt2.HasText("传输方式") {
+		t.Errorf("传输方式已并入线路，设置页不该再有这一行：%q", tt2.Texts())
 	}
 }
 
@@ -2394,26 +2423,41 @@ func TestRunStatePersisted(t *testing.T) {
 	}
 }
 
-// TestCertNameOnlyForIPTarget 「证书域名」只在填 IP 时出现。
+// TestCertNameOnlyForIPTarget 「证书域名」只在需要时出现。
 //
-// 这是「一个目标字段」的配套约束：域名目标下 SNI 自动等于它，多一栏只会让人
-// 以为必须填；IP 目标的证书 SAN 一般只有 DNS，那时才真的需要名字。
+// 2026-11-24 之前这条测的是设置页顶部的「目标机器」输入框：填 IP 时多出
+// 一栏证书域名。合并到线路编辑区后约束不变——域名目标下 SNI 自动等于它，
+// 多一个字段只会让人以为必须填；IP 目标（或中继指向另一台）才真的需要名字。
+//
+// 现在通过**线路编辑区**验证：进设置页 → 展开线路 → 编辑那条线路。
 func TestCertNameOnlyForIPTarget(t *testing.T) {
 	for _, tc := range []struct {
-		server string
-		want   bool
+		name string
+		r    route.Route
+		want bool
 	}{
-		{"magpie.aiweb.xin", false},
-		{"magpie.aiweb.xin:28443", false},
-		{"47.82.76.102:28443", true},
-		{"47.82.76.102", true},
+		{"域名直连", route.Route{ID: "A", Kind: route.KindDirect,
+			Server: "magpie.aiweb.xin:28443"}, false},
+		{"IP 直连", route.Route{ID: "A", Kind: route.KindDirect,
+			Server: "47.82.76.102:28443"}, true},
+		{"域名中继", route.Route{ID: "A", Kind: route.KindRelay,
+			Server: "relay.example:28443"}, true},
+		{"IP 中继", route.Route{ID: "A", Kind: route.KindRelay,
+			Server: "47.117.152.3:28443"}, true},
+		{"代理线路", route.Route{ID: "A", Kind: route.KindProxy,
+			Server: "magpie.aiweb.xin:28443", Proxy: "http://p:7890"}, false},
 	} {
-		a := newTestApp(t)
-		a.tab = tabSettings
-		a.server = tc.server
-		tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
-		if got := tt.HasText("证书域名"); got != tc.want {
-			t.Errorf("目标 %q：证书域名行存在=%v，期望 %v", tc.server, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			a := newTestApp(t)
+			a.tab = tabSettings
+			a.routesExpanded = true
+			a.routesDraft = route.Set{tc.r}
+			a.setEditingRoute(0)
+			tt := ui.NewTester(a.view, defaultWinWidth, defaultWinHeight)
+			if got := tt.HasText("证书域名"); got != tc.want {
+				t.Fatalf("证书域名字段存在=%v，期望 %v（server=%s kind=%s）",
+					got, tc.want, tc.r.Server, tc.r.Kind)
+			}
+		})
 	}
 }

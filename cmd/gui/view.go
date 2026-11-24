@@ -26,7 +26,6 @@ import (
 
 	"github.com/jixoai/reply9842/internal/autostart"
 	"github.com/jixoai/reply9842/internal/glass"
-	"github.com/jixoai/reply9842/internal/netif"
 	"github.com/jixoai/reply9842/internal/relayclient"
 	"github.com/jixoai/reply9842/internal/stats"
 )
@@ -1300,11 +1299,23 @@ func clampF(v, lo, hi float64) float64 {
 // inset 阴影：顶部高光（rim）与内圈发丝线，pattern 与 Surface 一致。
 //
 // 三态颜色来自 Theme（AccentHover/AccentPressed 真的不同），所以按下有反馈。
-func (a *app) actionButton(c *ui.Context, p *glass.Palette, key, label string, primary bool) ui.Element {
+// actionButton 通用按钮。primary 是**样式**（实心强调 / 描边次级），
+// disabled 是**可点性**——两者必须分开传。
+//
+// 为什么要拆（2026-11-24 自查 + 视觉复盘）：最初只有一个 bool 参数，我把它
+// 当「禁用」用在了四处（草稿期间禁添加、测试中禁测试、应用中禁应用、运行中
+// 禁编辑），实际它是 primary ⇒ 这些按钮全都变成了实心白胶囊。视觉验收看到的
+// 「底部三枚白色胶囊被 footer 切断、与其它控件风格不符」就是这个——不是裁切，
+// 是样式全错 + 三个本该消失的按钮还占着位置。
+//
+// 现在两个 bool 并列，传错会编译失败（不是隐式行为），调用点必须想清楚。
+func (a *app) actionButton(c *ui.Context, p *glass.Palette, key, label string,
+	primary, disabled bool) ui.Element {
 	if primary {
 		return ui.PrimaryButton(c.Key(key), label).
 			FontSize(12).FontWeight(540).Padding(0, 14).
 			Height(30).Radius(glass.RadiusControl).
+			Disabled(disabled).
 			InsetShadow(0, 1, 0, 0, p.PrimaryRim).
 			InsetShadow(0, 0, 0, 1, p.PrimaryInner).
 			Shadow(0, 1, 2, 0, p.PrimaryUnder).
@@ -1313,6 +1324,7 @@ func (a *app) actionButton(c *ui.Context, p *glass.Palette, key, label string, p
 	return ui.Button(c.Key(key), label).
 		FontSize(11.5).FontWeight(520).Padding(0, 12).
 		Height(28).Radius(glass.RadiusControl).
+		Disabled(disabled).
 		InsetShadow(0, 1, 0, 0, p.ControlRim).
 		InsetShadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.045)).
 		Shadow(0, 0, 0, 1, ui.RGBA(255, 255, 255, 0.055)).
@@ -1349,8 +1361,14 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 //
 // 现在用「组标题 + 组间加高间隙」表达分区：
 //
-//	连接  目标机器（域名或 IP）/ 证书域名（仅 IP 时）/ 网络 / 监听地址 / 传输方式 / 线路
+//	连接  监听地址 / 线路
 //	其他  开机自启 / 日志保留 / 显示区间 / 自动更新 / 更新镜像 / 软件更新
+//
+// 2026-11-24 owner：「线路和网络是不是应该合并到一起，不然很奇怪？」
+// 合并掉了原来的「目标机器 / 证书域名 / 网络 / 传输方式」四行——它们本质是
+// 「第一条线路的字段」的另一种写法。两套配置并存需要 syncNetModeToRoutes
+// 这种同步函数才能不打架，而「需要同步」本身就是它们是同一件事的证据。
+// 现在线路是唯一真相源：点某条线路的「编辑」改它的 server/SNI/源地址。
 //
 // 组标题本身只有一行 11px 文字（约 26px 含上下留白），比一张卡的装饰开销小一个
 // 数量级；卡片的厚度语义也保持单层，不会读成「两张卡上下堆着」。
@@ -1359,29 +1377,21 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 
 	glass.Surface(ui.Column(c).Padding(3, 14, 6), p, glass.Card).Children(func() {
 		a.groupTitle(c, p, "连接", true)
-		// 目标机器：域名或 IP 都行，一个字段说清「连哪儿」。
-		//
-		// 为什么并掉了原来的「服务器域名」：目标是域名时 SNI 就是它自己，
-		// 再填一遍是重复；本质这就是一次代理请求，配置只需要一个目标。
-		// 只有目标是 IP 时才需要额外知道用哪个名字校验证书（证书 SAN 通常
-		// 只有 DNS），那一行届时才出现。
-		a.configField(c, p, "目标机器", &a.server,
-			"域名或 IP；不写端口默认 "+relayclient.DefaultTunnelPort, running)
-		a.configRule(c, p)
-		if relayclient.SNINeeded(a.server) {
-			a.configField(c, p, "证书域名", &a.serverName,
-				relayclient.DefaultServerName, running)
-			a.configRule(c, p)
-		}
-		// 源地址绑定：开代理 TUN 全局模式时，发往隧道服务器的流量也会被导进
-		// utun。代理对 28443 这类非标端口没有正确规则，TLS 握手会被中途切断，
-		// 客户端只看到 "tcp tls: EOF"——看起来像服务端崩了。填物理网卡 IP
-		// （macOS: ipconfig getifaddr en0）让内核直接走该网卡即可绕过。
-		a.networkRow(c, p, running)
-		a.configRule(c, p)
+		// 监听地址：本机 HTTP 入口。它不是线路字段（线路描述「怎么出去」，
+		// 它描述「从哪进来」），所以留在这里。
 		a.configField(c, p, "监听地址", &a.listen, relayclient.DefaultListen, running)
-		a.configRule(c, p)
-		a.transportRow(c, p, running)
+		// 运行中唯一真的不能改的就是监听地址（要重新 bind）。线路不在此列——
+		// 线路改成「待应用 + 立即生效」了，所以原来那句「连接设置在运行中不可
+		// 修改」会与本页的「立即应用」按钮自相矛盾（视觉验收抓到的阻塞项）。
+		if running {
+			ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(6).Children(func() {
+				ui.Text(c, "监听地址需停止后才能修改；线路改完点「立即应用」即可").
+					FontSize(10).TextColor(p.Tertiary).MaxLines(1).Grow(1)
+				if a.actionButton(c, p, "stop-settings", "停止", false, false).Clicked() {
+					a.stop()
+				}
+			})
+		}
 		a.configRule(c, p)
 		// 多线路放在「连接」组**末尾**（视觉复核后调整）。
 		//
@@ -1407,23 +1417,6 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		a.configRule(c, p)
 		a.updateRow(c, p)
 
-		// 运行中不可改：说清「为什么点不动」+「怎么做」，而不是让输入框静静失效。
-		// 只针对上面那五个「连接类」字段——统计跨度与更新偏好随时可改。
-		//
-		// 这一行必须留在卡片内：上一版它跟在卡片外面，整行左缘比卡片内容列
-		// 左凸 14px，而且 28px 高的「停止」按钮会悬在卡片底边之下约 11px，
-		// 读起来像一个没有容器承接的浮层。放进卡片后它和字段共用同一条
-		// 内容栅格，分隔线也把它明确归到「连接」这一组的尾部。
-		if running {
-			a.configRule(c, p)
-			ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(6).Children(func() {
-				ui.Text(c, "连接设置在运行中不可修改，先停止再改").
-					FontSize(11).TextColor(p.Warning).MaxLines(1).Grow(1)
-				if a.actionButton(c, p, "stop-settings", "停止", false).Clicked() {
-					a.stop()
-				}
-			})
-		}
 	})
 }
 
@@ -1536,122 +1529,6 @@ func (a *app) configField(c *ui.Context, p *glass.Palette, label string, val *st
 				FontSize(11).Height(26).Radius(9).Disabled(disabled)
 		})
 	})
-}
-
-// transportRow 传输方式：三段分段控件（设计稿的 seg）
-// networkRow 网络出口三选一：直连 / 系统 / 代理。
-//
-// 为什么需要这一行（owner 2026-11-14）：代理软件的 TUN 全局模式会把整个
-// IPv4 路由接管到虚拟网卡（实测 route get 47.82.76.102 → 198.18.0.1/utun5），
-// 连隧道服务器的包也被导进代理，代理对 28443 这类非标端口没有正确规则，
-// TLS 被切断——客户端只看到 `tcp tls: EOF` 或 QUIC 超时。以前让用户手填
-// 「源地址」，等于把排查工作推给用户；现在三种模式说清楚：
-//
-//	直连  自动探测物理网卡 IP 并绑定（绕开 TUN），换网络也不用改
-//	系统  什么都不做，交给操作系统路由（被 TUN 劫持就连不上）
-//	代理  走 http/https/socks5 代理（QUIC 不可用，自动降级 TCP）
-func (a *app) networkRow(c *ui.Context, p *glass.Palette, disabled bool) {
-	options := []string{relayclient.NetworkDirect, relayclient.NetworkSystem, relayclient.NetworkProxy}
-	labels := []string{"直连", "系统", "代理"}
-	idx := 0
-	for i, o := range options {
-		if o == a.netMode {
-			idx = i
-		}
-	}
-	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
-		ui.Box(c).Width(84).Shrink(0).Children(func() {
-			ui.Text(c, "网络").FontSize(11).TextColor(p.MutedForeground).SingleLine()
-		})
-		ui.Box(c).Grow(1).Children(func() {
-			ui.Segmented(c, &idx, labels...).FontSize(11.5).Height(24).Disabled(disabled)
-		})
-	})
-	if options[idx] != a.netMode {
-		a.netMode = options[idx]
-		// 切到直连时立刻探测一次，界面上能马上看到会绑哪个 IP；探不到
-		// 就留空（Dial 会退回系统路由），不让切换本身失败。
-		if a.netMode == relayclient.NetworkDirect {
-			if ip, iface, err := netif.PrimaryIPv4(); err == nil {
-				a.detectedIP, a.detectedIface = ip, iface
-			}
-		}
-		// 代理只承载 TCP：QUIC 在这里不是一个「稍后才会失败」的选项，而是
-		// 必然失败的组合。切到代理时自动纠正，免得用户以为选了它就能用。
-		if fixed := transportForNetwork(a.netMode, a.transport); fixed != a.transport {
-			a.transport = fixed
-			a.setNotice("代理模式不支持 QUIC，传输方式已改为「自动」（走 TCP）", false)
-		}
-		// 「网络」区是**快捷设置**：它必须真的作用到线路，否则界面说「已走代理」、
-		// 实际仍走直连——TUN 环境下用户会陷入「怎么都不通」的死循环。
-		// （对抗审查 P2-5：两个配置入口并存且无提示。）
-		a.syncNetModeToRoutes()
-	}
-
-	// 一行说明：三选一各自的含义不同，光看标签猜不出来。
-	hint := ""
-	switch a.netMode {
-	case relayclient.NetworkDirect:
-		if a.detectedIP != "" {
-			hint = "绑定 " + a.detectedIface + " " + a.detectedIP + "，绕开 TUN 代理"
-		} else {
-			hint = "未探测到物理网卡，退回系统路由"
-		}
-	case relayclient.NetworkProxy:
-		hint = "代理只承载 TCP，QUIC 自动降级"
-	default:
-		hint = "跟随系统路由（TUN 全局模式下可能连不上）"
-	}
-	ui.Row(c).Padding(6, 0).Gap(12).Children(func() {
-		ui.Box(c).Width(84).Shrink(0)
-		ui.Text(c, hint).FontSize(10).TextColor(p.Tertiary).SingleLine()
-	})
-
-	if a.netMode == relayclient.NetworkProxy {
-		a.configField(c, p, "代理地址", &a.proxyURL,
-			"http://127.0.0.1:7890 或 socks5://127.0.0.1:7890", disabled)
-	}
-}
-
-// transportChoices 按网络出口返回可选的传输方式。
-//
-// 代理只承载 TCP（HTTP CONNECT / SOCKS5 都是 TCP 隧道），所以代理模式下
-// 不提供 QUIC 选项——否则用户选了也只会白等一个握手超时，报错还指向服务端。
-func transportChoices(netMode string) (options, labels []string) {
-	if netMode == relayclient.NetworkProxy {
-		return []string{"auto", "tcp"}, []string{"自动", "TCP"}
-	}
-	return []string{"auto", "quic", "tcp"}, []string{"自动", "QUIC", "TCP"}
-}
-
-// transportForNetwork 把「网络模式 + 传输方式」纠正成合法组合。
-// 唯一需要纠正的是 代理 + QUIC：代理承载不了 UDP，QUIC 必然失败。
-func transportForNetwork(netMode, transport string) string {
-	if netMode == relayclient.NetworkProxy && transport == "quic" {
-		return "auto"
-	}
-	return transport
-}
-
-func (a *app) transportRow(c *ui.Context, p *glass.Palette, disabled bool) {
-	options, labels := transportChoices(a.netMode)
-	idx := 0
-	for i, o := range options {
-		if o == a.transport {
-			idx = i
-		}
-	}
-	ui.Row(c).Padding(6, 0).Gap(12).AlignItems(ui.Center).Children(func() {
-		ui.Box(c).Width(84).Shrink(0).Children(func() {
-			ui.Text(c, "传输方式").FontSize(11).TextColor(p.MutedForeground).SingleLine()
-		})
-		ui.Box(c).Grow(1).Children(func() {
-			ui.Segmented(c, &idx, labels...).FontSize(11.5).Height(24).Disabled(disabled)
-		})
-	})
-	if options[idx] != a.transport {
-		a.transport = options[idx]
-	}
 }
 
 // autoStartRow 开机自启开关。

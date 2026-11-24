@@ -378,6 +378,39 @@ func (r *Runner) Err() error {
 	return r.lastErr
 }
 
+// ApplyConfig 让新配置立刻生效：未运行时只更新配置，运行中则**优雅重启**。
+//
+// 为什么需要它（owner 2026-11-24）：「我不觉得线路必须停止才能编辑，而是说
+// 不论是否在工作中都可以编辑，编辑完是落入一个未应用的配置中，最后实现
+// 一键生效」。旧路径要求用户「先停 → 改 → 再启」，把重启成本推给了人。
+//
+// 为什么重启是安全的：Stop 走 srv.Shutdown（等在途请求结束，5 秒上限）而不是
+// 硬 Close，之后才释放连接池。所以「应用」不会粗暴掐断正在传输的请求；
+// 超过 5 秒的长请求会被 Close 收尾，客户端侧有断线续传兜底。
+//
+// 返回 restarted 表示是否真的重启过（未运行时为 false），供界面决定提示文案。
+func (r *Runner) ApplyConfig(c Config) (restarted bool, err error) {
+	r.mu.Lock()
+	wasRunning := r.running
+	r.mu.Unlock()
+
+	if !wasRunning {
+		return false, r.SetConfig(c)
+	}
+	// 顺序必须是 Stop → SetConfig → Start：SetConfig 在 running 时会直接
+	// 报错（那是它的保护），所以不能反过来。
+	if err := r.Stop(context.Background()); err != nil {
+		return false, fmt.Errorf("应用配置：停止旧监听失败: %w", err)
+	}
+	if err := r.SetConfig(c); err != nil {
+		return false, fmt.Errorf("应用配置：%w", err)
+	}
+	if err := r.Start(); err != nil {
+		return false, fmt.Errorf("应用配置：用新配置重新监听失败: %w", err)
+	}
+	return true, nil
+}
+
 // StartedAt 本次启动时刻（未运行为零值）
 func (r *Runner) StartedAt() time.Time {
 	r.mu.Lock()

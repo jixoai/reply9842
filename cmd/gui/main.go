@@ -187,6 +187,38 @@ type app struct {
 	// 展开会把内滚动容器撑到必须滚很久才能找到目标，视觉复核曾因「设置页
 	// 变太高」打过回。
 	editRouteIdx int
+	// appliedRoutes 最近一次**交给 Runner** 的线路列表。
+	//
+	// 用途：判断「当前编辑有没有还没生效的改动」。owner 2026-11-24：
+	// 「不论是否在工作中都可以编辑，编辑完是落入一个未应用的配置中，
+	// 最后实现一键生效」——所以「落盘」与「生效」必须是两个状态：
+	//   routesDraft 改了 → 立刻落盘（重启后仍在）
+	//   与 appliedRoutes 不同 → 界面提示「有改动未生效」+ 一个应用按钮
+	// 相等则说明 Runner 跑的就是界面上看到的。
+	appliedRoutes route.Set
+	// applying 正在应用配置（异步重启中），按钮置灰防连点。
+	applying bool
+	// applyErr 上一次应用失败的原因。
+	applyErr error
+
+	// pendingRoute 正在**新建**的线路草稿（零 ID 表示没有草稿）。
+	//
+	// 为什么要有草稿态（owner 2026-11-24）：「添加代理时直接就落盘了，我都
+	// 不能编辑表单、测试线路、最后再确认添加？」——旧实现点「＋代理」立刻
+	// append 一条带默认值（还硬编码 7890）的线路并写盘，用户既没机会改，
+	// 也没机会验证，只能先加进去再看它失败。
+	//
+	// 草稿不参与 routesDraft、不落盘、不影响择路；只有点「添加」才提交。
+	pendingRoute route.Route
+	// pendingTesting 草稿的探测是否在跑（按钮置灰 + 显示「测试中…」）。
+	pendingTesting bool
+	// pendingProbe 最近一次探测结果（nil = 没测过或已清空）。
+	pendingProbe *relayclient.ProbeResult
+	// pendingProbeErr 探测失败原因（与 pendingProbe 互斥）。
+	pendingProbeErr error
+	// pendingProbeGen 探测世代号：用户连点测试 / 改字段后旧结果必须作废。
+	pendingProbeGen int
+
 	// routeErr 线路配置保存失败的原因（nil 表示正常）
 	routeErr error
 
@@ -411,10 +443,6 @@ func main() {
 			a.detectedIP, a.detectedIface = ip, iface
 		}
 	}
-	// 老配置可能保存过「代理 + QUIC」这个非法组合：启动即纠正，避免第一次
-	// 启动就撞上一个必然失败的组合（代理承载不了 UDP）。
-	a.transport = transportForNetwork(a.netMode, a.transport)
-
 	a.runner = relayclient.New(cfg)
 	a.runner.SetLogger(logger)
 	a.runner.OnEvent = a.onRunnerEvent
@@ -589,9 +617,9 @@ const (
 func (a *app) state() (kind statusKind, label, detail string) {
 	switch {
 	case a.running():
-		// 运行时长不放进这一行：它和上游地址叠起来会顶到主操作按钮上。
+		// 运行时长不放进这一行：它和上游描述叠起来会顶到主操作按钮上。
 		// 时长只在 footer 出现一次。
-		return stateRunning, "已连接", "上游 " + a.server
+		return stateRunning, "已连接", a.routeSummary()
 	case a.lastErr() != nil:
 		// 启动失败：只说一句人话（原始错误前缀叠了三层，见 humanError）
 		return stateFailed, "启动失败", humanError(a.lastErr())
@@ -903,6 +931,8 @@ func (a *app) start() {
 		a.setNotice(humanError(err), true)
 		return
 	}
+	// 记下「交给 Runner 的线路」，供「有改动未生效」判断（见 appliedRoutes）。
+	a.appliedRoutes = cfg.Routes
 	if err := a.runner.Start(); err != nil {
 		// 不再额外弹一条「启动失败」：面板的 failureLine 已经把「启动失败 + 原因」
 		// 常驻显示出来了，同一件事说两遍只会让用户怀疑自己漏看了什么。
@@ -1130,4 +1160,27 @@ func fillRuntimeRouteFields(rs route.Set, netMode, localAddr, proxy string) {
 			rs[i].Proxy = proxy
 		}
 	}
+}
+
+// routeSummary 面板大字下面那行说明：几条线、最快的叫什么。
+//
+// 为什么不再显示单一「上游 <地址>」（2026-11-24 合并网络与线路后）：
+// 出口已经是一组线路，只报一个地址会漏掉用户最关心的信息（现在几条在跑、
+// 哪条最快）。单线路时它退化成「1 条线路 · 香港」，仍能看出连的是哪条。
+func (a *app) routeSummary() string {
+	rs := a.routesDraft
+	if len(rs) == 0 {
+		return "无可用线路"
+	}
+	enabled := 0
+	for _, r := range rs {
+		if r.IsEnabled() {
+			enabled++
+		}
+	}
+	out := fmt.Sprintf("%d 条线路（%d 启用）", len(rs), enabled)
+	if best := a.fastestRouteID(); best != "" {
+		out += " · 最快 " + best
+	}
+	return out
 }

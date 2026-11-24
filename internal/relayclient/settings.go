@@ -141,22 +141,9 @@ func (s Settings) Equal(o Settings) bool {
 		s.Transport != o.Transport || s.Running != o.Running {
 		return false
 	}
-	if len(s.Routes) != len(o.Routes) {
-		return false
-	}
-	for i := range s.Routes {
-		a, b := s.Routes[i], o.Routes[i]
-		// ServerName 必须比：漏了它，用户改了 SNI 会被脏检查判成「无变更」，
-		// 于是不触发保存，重启后 SNI 静默消失、线路退化成按 IP 校验证书
-		// （= 必然 x509 失败）。配置比对漏字段的后果是「改了等于没改」。
-		if a.ID != b.ID || a.Kind != b.Kind || a.Server != b.Server ||
-			a.ServerName != b.ServerName ||
-			a.Proxy != b.Proxy || a.LocalAddr != b.LocalAddr ||
-			a.Transport != b.Transport || a.IsEnabled() != b.IsEnabled() {
-			return false
-		}
-	}
-	return true
+	// 线路逐字段比较交给 route.Set.Equal：GUI 的「有未应用改动」判断也要用
+	// 同一套语义，两处各写一份迟早漂移（漏比字段的后果是「改了等于没改」）。
+	return s.Routes.Equal(o.Routes)
 }
 
 // DefaultSettings 默认偏好：保留一天、看最近 30 分钟、不自动更新、镜像留空
@@ -258,6 +245,13 @@ func (s Settings) MigrateRoutes() route.Set {
 	default: // system
 		r.Kind = route.KindDirect
 		// 不设 LocalAddr：system 的语义就是让内核选路由
+	}
+	// 旧 GUI 允许存下「代理 + QUIC」这个非法组合（代理只承载 TCP）。以前
+	// 由界面在启动时自动改成 auto；现在界面不再有传输方式那一栏，纠正必须
+	// 落在迁移里——否则这类老配置升级后会直接被 route.Validate 拒绝、
+	// 客户端起不来（升级破坏比「传输方式被悄悄改掉」严重得多）。
+	if r.Kind == route.KindProxy && r.Transport == "quic" {
+		r.Transport = "auto"
 	}
 	return route.Set{r.Normalize()}
 }
