@@ -873,6 +873,15 @@ func estimateWireBytes(finder *basefind.Finder, body []byte, minDelta int) int64
 	return est
 }
 
+// multiServer 当前配置是否包含指向**不同 server**的多条线路。
+//
+// 用途：区分「delta-miss 是跨 server 的必然结果」与「是单 server 的 store 淘汰」。
+// 前者应丢本地基线（那台机器确实没有），后者不能丢（丢了会让下次请求
+// 必然 miss，陷入永久振荡——实测单 server 复现）。
+func (h *handler) multiServer() bool {
+	return len(h.cfg.Routes.Servers()) > 1
+}
+
 func (h *handler) logf(format string, args ...any) {
 	if h.logger != nil {
 		h.logger.Printf(format, args...)
@@ -1179,6 +1188,27 @@ func (h *handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// DeltaMiss / 断线 → 按需要重发
 	if stream.ResumeMiss {
+		// 服务端明确说「没有这份基线」→ 从本地 finder 里丢掉它。
+		//
+		// 真实 e2e（跨 server 线路）抓出的缺陷：不丢掉的话，下一次请求还会
+		// 选中同一份基线、再吃一次 miss、再全量重发——形成「每次都 miss、
+		// 每次都全量」的稳定劣化。基线是 server 侧状态，跨 server 必然不一致；
+		// 丢掉让客户端下一轮重新挑（大概率挑到对端也有的那份）。
+		//
+		// 但只有当「这条基线**不是**刚由本线路的 server 确认过的」才丢。
+		// 判据：本次请求走的是哪台 server —— 若与基线记录时的 server 不同，
+		// 那丢掉是对的（那台机器没有它）；若是同一台，说明是 store 淘汰，
+		// 丢掉会让下一次请求必然 miss（实测单 server 会因此陷入
+		// 「zstd → resend-full → zstd → …」的永久振荡）。
+		//
+		// 现状实现：只在本连接的 server 与基线来源不同时丢。client 侧没有
+		// 「基线来自哪台 server」的记录，所以改用更保守的判据——只在
+		// **存在多条线路且各自指向不同 server** 时才丢弃。
+		if !baseHash.IsZero() && h.multiServer() {
+			if h.finder.Forget(baseHash) {
+				h.logf("服务端无此基线，已从本地遗忘（跨 server 常态）")
+			}
+		}
 		// 服务端无该 key（store 淘汰或首发失败）→ 全量重发一次
 		z, cerr := codec.Compress(body, codec.PickLevel(len(body)), nil)
 		if cerr != nil || len(z) >= len(body) {

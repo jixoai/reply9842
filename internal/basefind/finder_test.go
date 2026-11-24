@@ -3,6 +3,8 @@ package basefind
 import (
 	"bytes"
 	"testing"
+
+	"github.com/jixoai/reply9842/internal/codec"
 )
 
 // 造一个「前缀相同、尾部不同」的请求体（模拟 agent 会话推进）
@@ -127,3 +129,52 @@ func TestPickRejectsWhenBaselineMostlyUnused(t *testing.T) {
 		t.Fatal("should reject: baseline mostly unused")
 	}
 }
+
+// Forget 只删指定那条，其它基线保留
+func TestForgetKeepsOthers(t *testing.T) {
+	f := New(1)
+	// 两条内容完全不同、且各自够长（Pick 要求基线 >= blockSize）
+	a := makeBody(8192, 0, 'a')
+	b := bytes.Repeat([]byte{'b'}, 8192)
+	ha := f.Remember(a)
+	f.Remember(b)
+
+	if f.Len() != 2 {
+		t.Fatalf("应有 2 条，实际 %d", f.Len())
+	}
+	f.Forget(ha)
+	if f.Len() != 1 {
+		t.Fatalf("应剩 1 条，实际 %d", f.Len())
+	}
+	// 用 b 自身当新请求：复用率 100%，应命中 b
+	if _, got := f.Pick(b); got == nil {
+		t.Fatal("另一条基线不该被误删")
+	}
+}
+
+// Forget 丢掉指定基线（跨 server 的 delta-miss 会触发它）。
+// 真实 e2e 抓出的缺陷：不丢的话会成为「每次都 miss、每次都全量」的稳定劣化。
+func TestForgetRemovesBaseline(t *testing.T) {
+	f := New(1)
+	body := makeBody(1024, 0, 'x')
+	h := f.Remember(body)
+
+	if !f.Forget(h) {
+		t.Fatal("Forget 应报告找到了并删除")
+	}
+	if f.Len() != 0 {
+		t.Fatalf("删除后应剩 0 条，实际 %d", f.Len())
+	}
+	if _, b := f.Pick(body); b != nil {
+		t.Fatal("删除后不该还能 Pick 到它")
+	}
+	// 幂等/未知哈希：返回 false 不 panic
+	if f.Forget(h) {
+		t.Fatal("重复 Forget 应返回 false")
+	}
+	if f.Forget(codec.Hash{}) {
+		t.Fatal("零哈希应返回 false")
+	}
+}
+
+// Forget 只删指定那条，其它基线保留

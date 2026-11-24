@@ -82,6 +82,32 @@ func (f *Finder) Remember(body []byte) codec.Hash {
 	return h
 }
 
+// Forget 丢掉某条基线。
+//
+// 用途（跨 server 场景，真实 e2e 抓出的缺陷）：服务端回 FrameDeltaMiss
+// 说明**那台 server 的 store 里没有这份基线**。此时客户端若仍把它记在
+// finder 里，下一次请求还会选中它、再吃一次 miss、再全量重发——形成
+// 「每次都 miss」的稳定劣化。
+//
+// 基线是**按 server 隔离的服务端状态**（store 是进程内的纯 KV），而客户端
+// 的 finder 是全局的。跨 server 线路共存时，这条不一致必然出现；丢掉它
+// 让客户端下一轮重新找基线（大概率改选一个对端也有的）。
+func (f *Finder) Forget(h codec.Hash) bool {
+	if h.IsZero() {
+		return false
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for i, c := range f.items {
+		if c.hash == h {
+			f.used -= int64(len(c.body))
+			f.items = append(f.items[:i], f.items[i+1:]...)
+			return true
+		}
+	}
+	return false
+}
+
 // Pick 为 newBody 选基线：从新到旧，第一个块命中复用率 >= minReuseRatio 的。
 // 返回零哈希表示「无合适基线，应发全量」。
 //
