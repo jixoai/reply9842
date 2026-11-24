@@ -20,7 +20,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 		t.Fatal(err)
 	}
 	got := LoadSettings(path)
-	if got != want {
+	if !got.Equal(want) {
 		t.Fatalf("读回 %+v，期望 %+v", got, want)
 	}
 }
@@ -29,7 +29,7 @@ func TestSettingsRoundTrip(t *testing.T) {
 func TestSettingsDefaultsWhenMissing(t *testing.T) {
 	got := LoadSettings(filepath.Join(t.TempDir(), "nope.json"))
 	want := DefaultSettings()
-	if got != want {
+	if !got.Equal(want) {
 		t.Fatalf("缺文件时 %+v，期望默认 %+v", got, want)
 	}
 }
@@ -66,7 +66,7 @@ func TestSettingsWindowClampedToRetain(t *testing.T) {
 func TestSettingsCorruptFallsBack(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "settings.json")
 	os.WriteFile(path, []byte(`{not json`), 0o644)
-	if got := LoadSettings(path); got != DefaultSettings() {
+	if got := LoadSettings(path); !got.Equal(DefaultSettings()) {
 		t.Errorf("损坏文件时 %+v，期望默认值", got)
 	}
 }
@@ -181,7 +181,7 @@ func TestSettingsUpdateFieldsRoundTrip(t *testing.T) {
 	if err := SaveSettings(path, want); err != nil {
 		t.Fatal(err)
 	}
-	if got := LoadSettings(path); got != want {
+	if got := LoadSettings(path); !got.Equal(want) {
 		t.Fatalf("读回 %+v，期望 %+v", got, want)
 	}
 }

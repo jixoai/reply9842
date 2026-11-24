@@ -67,7 +67,14 @@ type Record struct {
 	UpBps       float64 `json:"up_bps"`
 	DownBps     float64 `json:"down_bps"`
 	Transport   string  `json:"transport"` // quic / tcp
-	Err         string  `json:"err,omitempty"`
+	// Route 本次请求实际走的线路标识（多线路择路的结果）。
+	//
+	// 单线路时代它是空串，json 因 omitempty 不输出——旧日志格式不受影响。
+	// 有了它，事后回答「是不是这条线路坏了」才有证据。
+	Route string `json:"route,omitempty"`
+	// RouteReason 择路理由（如「est 最低」「已降权 ×2.5」「主动探测」）。
+	RouteReason string `json:"route_reason,omitempty"`
+	Err         string `json:"err,omitempty"`
 }
 
 // Bucket 一个时间桶里的流量与延迟。
@@ -154,6 +161,15 @@ type Agg struct {
 	// 窗口内最新一条（accumulateLocked 是所有路径的唯一累加入口）。
 	LastTransport string `json:"last_transport,omitempty"`
 
+	// Routes 按线路分组的统计（多线路择路的可观测面）。
+	//
+	// 键 = Record.Route（线路 ID）。nil/空 map 表示「这份统计来自单线路
+	// 或旧日志」——JSON 里因 omitempty 不出现，旧读法不受影响。
+	//
+	// 为什么值得单独统计：用户排障时要回答「是不是这条线路拖慢的」。
+	// 全局 p50 会把快线路和坏线路混在一起，看不出任何东西。
+	Routes map[string]RouteStat `json:"routes,omitempty"`
+
 	// RetainSec / WindowSec / BucketSec 让「这份快照说的是哪段时间」自带说明：
 	// 图表横轴、图下那句「最近 30 分钟（每 1 分钟一柱）」都从这里取，
 	// 不再假设某个写死的窗口。
@@ -166,6 +182,19 @@ type Agg struct {
 	// json:"-" 是有意的：图表每秒都在变，写进 client-stats.json 只会让快照
 	// 又大又无意义（回看历史的人要的是总量，逐条细节在 jsonl 里都有）。
 	Series []Bucket `json:"-"`
+}
+
+// RouteStat 单条线路的累计统计。
+//
+// 刻意保持极简（计数 + 字节 + 耗时和），与 Agg 一样由读时再求均值：
+// 保留「和」而不是「均值」的理由同 Agg——同一窗口里先来一条 200ms
+// 再来一条 20s，逐条平均会把极端值抹平。
+type RouteStat struct {
+	Requests  int64 `json:"requests"`
+	Errors    int64 `json:"errors"`
+	UpWire    int64 `json:"up_wire"`
+	DownWire  int64 `json:"down_wire"`
+	MsWireSum int64 `json:"ms_wire_sum"`
 }
 
 // Options 采集器选项
@@ -386,6 +415,22 @@ func (c *Collector) accumulateLocked(r *Record, t time.Time) {
 		// 只记「最近一次」：为空（旧日志/未走隧道）时保留上一个有效值，
 		// 这样界面永远显示「最近一次真实用过的传输」而不是被空值抹掉。
 		a.LastTransport = r.Transport
+	}
+	// 按线路累计（单线路/旧日志时 Route 为空，整段跳过——
+	// 旧读法不会因为多了这一层而看到意外的键）
+	if r.Route != "" {
+		if a.Routes == nil {
+			a.Routes = make(map[string]RouteStat)
+		}
+		st := a.Routes[r.Route]
+		st.Requests++
+		if r.Status >= 400 || r.Err != "" {
+			st.Errors++
+		}
+		st.UpWire += r.UpWire
+		st.DownWire += r.DownWire
+		st.MsWireSum += r.MsWire
+		a.Routes[r.Route] = st
 	}
 
 	c.bucketLocked(t, r)

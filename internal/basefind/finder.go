@@ -90,23 +90,38 @@ func (f *Finder) Remember(body []byte) codec.Hash {
 // （如 JSON 中段的数值字段），但第 64 字节之后有 90% 内容完全相同。
 // 块命中率能跨过变化点，实测区分度 87.5%。
 func (f *Finder) Pick(newBody []byte) (codec.Hash, []byte) {
+	h, b, _ := f.PickWithReuse(newBody)
+	return h, b
+}
+
+// PickWithReuse 与 Pick 相同，但额外返回**基线实际被复用的字节数**。
+//
+// 为什么需要这个数（对抗审查指出的缺陷）：
+// blockReuseRatio 的分母是**基线长度**，扫到 reused >= len(base) 就提前退出。
+// 于是「64 KB 旧基线 + 1.4 MB 新增内容」的 1.5 MB 请求复用率算出 100%（命中），
+// 但真正被字典覆盖的只有 64 KB，剩下 1.4 MB 仍要按普通 zstd 压——实际 wire
+// 约 200–400 KB，而不是「几百字节」。
+//
+// 择路需要一个正确的量级估计：`est ≈ 0.2 × (len(body) − reused)`。
+// 没有 reused 这个数就只能猜，猜小了会把大请求塞进窄带线路。
+func (f *Finder) PickWithReuse(newBody []byte) (codec.Hash, []byte, int) {
 	f.mu.Lock()
 	items := make([]*candidate, len(f.items))
 	copy(items, f.items)
 	f.mu.Unlock()
 
 	if len(newBody) == 0 {
-		return codec.Hash{}, nil
+		return codec.Hash{}, nil, 0
 	}
 	for _, c := range items {
 		if len(c.body) < blockSize {
 			continue
 		}
-		if blockReuseRatio(c.body, newBody) >= minReuseRatio {
-			return c.hash, c.body
+		if r, reused := blockReuse(newBody, c.body); r >= minReuseRatio {
+			return c.hash, c.body, reused
 		}
 	}
-	return codec.Hash{}, nil
+	return codec.Hash{}, nil, 0
 }
 
 // blockReuseRatio 估算「基线有多少字节可被新请求复用」。
@@ -117,8 +132,17 @@ func (f *Finder) Pick(newBody []byte) (codec.Hash, []byte) {
 // 复杂度 O(len(new)/step)，step 在命中和未命中时不同，最坏 O(n*4)。
 // 1MB 请求约 1-3ms，可接受（相比 zstd 压缩本身 10-70ms）。
 func blockReuseRatio(base, newBody []byte) float64 {
+	r, _ := blockReuse(newBody, base)
+	return r
+}
+
+// blockReuse 返回（复用率, 复用字节数）。
+//
+// 复用率的分母是**基线长度**（「基线有多少被用上」），复用字节数的上限
+// 因此是 len(base)——这正是 PickWithReuse 需要它的原因。
+func blockReuse(newBody, base []byte) (float64, int) {
 	if len(base) < blockSize || len(newBody) < blockSize {
-		return 0
+		return 0, 0
 	}
 	idx := make(map[string]struct{}, len(base)/blockSize+1)
 	for i := 0; i+blockSize <= len(base); i += blockSize {
@@ -142,7 +166,7 @@ func blockReuseRatio(base, newBody []byte) float64 {
 	if r > 1 {
 		r = 1
 	}
-	return r
+	return r, reused
 }
 
 // Len 当前候选数

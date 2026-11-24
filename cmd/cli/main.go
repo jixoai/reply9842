@@ -17,11 +17,13 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"sort"
 	"strings"
 	"syscall"
 	"time"
 
 	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/route"
 	"github.com/jixoai/reply9842/internal/stats"
 )
 
@@ -93,13 +95,53 @@ func newServeFlags(c *relayclient.Config) *flag.FlagSet {
 	fs.IntVar(&c.MaxResume, "max-resume", c.MaxResume, "断线后最大续传重试次数（0=不续传）")
 	fs.StringVar(&c.LogPath, "log", "", "逐请求日志（默认 ~/.reply9842/client-<date>.jsonl）")
 	fs.StringVar(&c.StatsPath, "stats", "", "汇总统计（默认同目录 client-stats.json）")
+
+	// 多线路：-route 可重复（顺序即优先级），另有 -routes-file 读 JSON。
+	// 两者都可省略——省略时沿用上面的单值 flag，行为与旧版本完全一致。
+	rl := &routeList{}
+	fs.Var(rl, "route",
+		"新增一条线路（可重复，顺序即优先级）。格式 名称:类型:server[:代理/源地址]，"+
+			"类型可选 direct|proxy|relay")
+	routesFile = fs.String("routes-file", "",
+		"从 JSON 文件读线路列表（与 settings.json 的 routes 段同构）；与 -route 同时给出时两者取并集")
+	routeFlagList = rl
 	return fs
 }
+
+// 供 runServe 取回可变 flag 的解析结果（flag 包的回调式 Var 无法直接拿值）
+var (
+	routeFlagList *routeList
+	routesFile    *string
+)
 
 func runServe(args []string) {
 	c := relayclient.Config{}
 	fs := newServeFlags(&c)
 	fs.Parse(args) // ExitOnError：-h 会自己退出
+
+	// 线路来源（按优先级合并）：
+	//   1. -route（可重复）
+	//   2. -routes-file（JSON）
+	//   两者都给时取并集（文件名里的在前，命令行追加在后）。
+	//   都没给 → c.Routes 保持空，由 Normalize 从单值 flag 合成（向后兼容）。
+	var rs route.Set
+	if *routesFile != "" {
+		loaded, err := loadRoutesFile(*routesFile)
+		if err != nil {
+			log.Fatalf("%v", err)
+		}
+		rs = append(rs, loaded...)
+	}
+	if routeFlagList != nil && len(routeFlagList.routes) > 0 {
+		rs = append(rs, routeFlagList.routes...)
+	}
+	if len(rs) > 0 {
+		rs = rs.Normalize()
+		if err := rs.Validate(); err != nil {
+			log.Fatalf("线路配置有误：%v", err)
+		}
+		c.Routes = rs
+	}
 
 	// 日志带时间戳前缀，与旧版输出保持一致
 	log.SetFlags(log.LstdFlags)
@@ -170,6 +212,37 @@ func runStatus(args []string) {
 	if len(a.Transport) > 0 {
 		fmt.Printf("传输      %s\n", fmtMap(a.Transport))
 	}
+	// 线路统计（多线路时才有内容；单线路/旧日志整段不打印，保持旧输出）
+	if len(a.Routes) > 0 {
+		fmt.Println(strings.Repeat("-", 46))
+		fmt.Println("线路")
+		order := routeNames(a.Routes)
+		for _, name := range order {
+			st := a.Routes[name]
+			var avg int64
+			if st.Requests > 0 {
+				avg = st.MsWireSum / st.Requests
+			}
+			fmt.Printf("  %-12s 请求 %-6d 错误 %-4d 平均 %d ms  上下行 %s / %s\n",
+				name, st.Requests, st.Errors, avg,
+				human(st.UpWire), human(st.DownWire))
+		}
+	}
+}
+
+// routeNames 按请求量降序列出线路名（让最忙的线路排在最前，一眼看出主力）。
+func routeNames(m map[string]stats.RouteStat) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Slice(out, func(i, j int) bool {
+		if m[out[i]].Requests != m[out[j]].Requests {
+			return m[out[i]].Requests > m[out[j]].Requests
+		}
+		return out[i] < out[j] // 同量时按名字，保证输出稳定
+	})
+	return out
 }
 
 func fmtMap(m map[string]int64) string {

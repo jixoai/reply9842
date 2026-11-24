@@ -46,6 +46,7 @@ import (
 	"github.com/jixoai/reply9842/internal/glass"
 	"github.com/jixoai/reply9842/internal/netif"
 	"github.com/jixoai/reply9842/internal/relayclient"
+	"github.com/jixoai/reply9842/internal/route"
 	"github.com/jixoai/reply9842/internal/stats"
 	"github.com/jixoai/reply9842/internal/update"
 )
@@ -154,6 +155,25 @@ type app struct {
 	proxyURL      string
 	detectedIP    string
 	detectedIface string
+
+	// routesDraft 线路列表的编辑副本（用户在设置页直接改它，保存时提交）。
+	//
+	// 为什么是「编辑副本」而不是直接改 settings 的真相源：用户可能改到一半
+	// 就切 tab / 关窗口，直接改真相源会让配置停在半成品状态。只有保存动作
+	// （collectSettings）才提交它。
+	routesDraft route.Set
+	// routeSnaps 运行中的线路实时质量（每秒从 runner 拉一次）。
+	// 空表示未运行或还没有样本——面板显示「—」，不假装 0。
+	routeSnaps []route.Snapshot
+	// routesExpanded 线路区是否展开明细。
+	//
+	// 默认**折叠**（视觉复核的阻塞项「设置页被撑高 183px、底部 6 行被挤出」）：
+	// 580×640 的固定窗口里，3 条线路 × 40px 的行高 + 分隔线约 140px，
+	// 足以把「软件更新」及警告行推出可视区。折叠态只占 1 行（概览 + 展开按钮），
+	// 展开态才显示完整列表——用户要改动时才需要那些按钮。
+	routesExpanded bool
+	// routeErr 线路配置保存失败的原因（nil 表示正常）
+	routeErr error
 
 	settingsPath string
 	// settingsErr 上次保存偏好失败的原因（nil 表示正常）
@@ -351,19 +371,21 @@ func main() {
 	cfg.Transport = pick(*transport, defCfg.Transport, st.Transport, cfg.Transport)
 
 	a := &app{
-		logs:           logRing,
-		listen:         cfg.Listen,
-		server:         cfg.Server,
-		transport:      cfg.Transport,
-		serverName:     cfg.ServerName,
-		localAddr:      cfg.LocalAddr,
-		insecure:       cfg.Insecure,
-		pal:            pal,
-		retainIdx:      relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
-		windowIdx:      relayclient.OptionIndex(st.Window(), relayclient.WindowOptions),
-		settingsPath:   settingsPath,
-		netMode:        st.NetworkModeOr(),
-		proxyURL:       st.ProxyURL,
+		logs:         logRing,
+		listen:       cfg.Listen,
+		server:       cfg.Server,
+		transport:    cfg.Transport,
+		serverName:   cfg.ServerName,
+		localAddr:    cfg.LocalAddr,
+		insecure:     cfg.Insecure,
+		pal:          pal,
+		retainIdx:    relayclient.OptionIndex(st.Retain(), relayclient.RetainOptions),
+		windowIdx:    relayclient.OptionIndex(st.Window(), relayclient.WindowOptions),
+		settingsPath: settingsPath,
+		netMode:      st.NetworkModeOr(),
+		proxyURL:     st.ProxyURL,
+		// 线路：从 settings 迁移出来（旧配置合成一条，新配置原样用）
+		routesDraft:    st.MigrateRoutes(),
 		autoUpdate:     st.AutoUpdate,
 		updateMirror:   st.UpdateMirror,
 		skipAutoUpdate: *noAutoUpdate,
@@ -643,6 +665,12 @@ func (a *app) running() bool {
 	if a.fakeRun != nil {
 		return *a.fakeRun
 	}
+	// nil 检查是给**局部构造的 app**（单元测试、面板单测）用的：
+	// 那些场景只关心某几个字段，不该被迫装配一整个 Runner。
+	// 生产路径的 app 由 newApp 构造，runner 恒非 nil。
+	if a.runner == nil {
+		return false
+	}
 	return a.runner.Running()
 }
 
@@ -819,6 +847,52 @@ func (a *app) start() {
 		cfg.Proxy = strings.TrimSpace(a.proxyURL)
 	}
 	cfg.Insecure = a.insecure
+
+	// 多线路：有编辑过的线路列表就以它为准，否则沿用上面的单值逻辑
+	// （Normalize 会合成一条，行为与旧版本一致）。
+	//
+	// 一个必须处理的陷阱（自查发现）：MigrateRoutes 在 GUI 启动时
+	// 恒会产出一条线路，所以「routesDraft 为空」这条分支实际上走不到——
+	// 若直接把 routesDraft 塞进 cfg.Routes，上面按 netMode 算出来的
+	// LocalAddr/Proxy 就白算了（线路自己的字段是空，会把它们盖掉）。
+	// 解决：把「线路字段为空」视作「沿用 netMode 的实时探测结果」。
+	if len(a.routesDraft) > 0 {
+		rs := a.routesDraft.Normalize()
+		if err := rs.Validate(); err != nil {
+			a.routeErr = err
+			a.setNotice("线路配置有误："+err.Error(), true)
+			return
+		}
+		a.routeErr = nil
+		// 逐条补上 netMode 的运行时结果（只补空的，不覆盖用户显式填的）
+		for i := range rs {
+			switch {
+			case rs[i].Kind == route.KindDirect && rs[i].LocalAddr == "" &&
+				a.netMode == relayclient.NetworkDirect:
+				rs[i].LocalAddr = cfg.LocalAddr
+			case rs[i].Kind == route.KindProxy && rs[i].Proxy == "" &&
+				a.netMode == relayclient.NetworkProxy:
+				rs[i].Proxy = cfg.Proxy
+			}
+		}
+		// 补完 LocalAddr/Proxy 后重新校验（代理线路缺 URL 会在这一步报出来）
+		if err := rs.Validate(); err != nil {
+			a.routeErr = err
+			a.setNotice("线路配置有误："+err.Error(), true)
+			return
+		}
+		cfg.Routes = rs
+		// 刻意**不**把 cfg.Server 覆盖成 rs[0].Server（对抗审查 P2-6）。
+		//
+		// specsFor 判断「中继线路是否指向不同主机」用的就是 `rt.Server != c.Server`。
+		// 一旦把全局 Server 改成第一条线路的地址，第一条恰好是 relay 时判据
+		// 恒为假 → 该线路会继承为**原服务器**签的 SNI，去校验另一台机器的证书，
+		// 直接 x509 失败；而且 CLI 同配置无此问题（行为分叉本身是回归）。
+		// 「日志里只有一处上游」这个诉求由日志打印每条线路的 Addr 满足。
+	} else {
+		cfg.Routes = nil // 交给 Normalize 合成
+	}
+
 	if err := a.runner.SetConfig(cfg); err != nil {
 		a.setNotice(humanError(err), true)
 		return
@@ -944,6 +1018,9 @@ func (a *app) currentSettings() relayclient.Settings {
 		Listen:       strings.TrimSpace(a.listen),
 		LocalAddr:    strings.TrimSpace(a.localAddr),
 		Transport:    a.transport,
+		// 线路列表：用户编辑过的为准。为空时留空——落盘后旧字段仍然有效，
+		// 下次启动会走 MigrateRoutes 合成，语义与「没配过线路」一致。
+		Routes: a.routesDraft,
 		// 运行态由 Runner 的**实际**状态给出，不是某个「想让它跑」的标记：
 		// 启动失败时不能让文件写成 true，否则下次启动会再失败一次。
 		Running: a.running(),

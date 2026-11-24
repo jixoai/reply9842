@@ -47,6 +47,9 @@ func (a *app) view(c *ui.Context) {
 	// 破坏它——采样间隔不足一个心跳时会直接沿用上一次读数。
 	c.After(time.Second)
 	a.agg = a.sampleStats()
+	// 线路实时质量与统计同一个心跳：它也是"最近一分钟这条线怎么样"，
+	// 分开刷会让面板上的两个数字互相矛盾。
+	a.refreshRouteSnaps()
 
 	// 整个窗口套上 solid-glass 色板：控件（按钮/输入框/Select/滚动条）
 	// 从这里取 Surface/Border/Accent，不必逐个重画
@@ -64,7 +67,14 @@ func (a *app) view(c *ui.Context) {
 			// （用户把窗口拉大时，该变高的是图，不是空白）。设置 tab 用 Scroll——
 			// 它的内容高度固定，窗口太矮时宁可滚也不能把「开机自启」切掉。
 			if a.tab == tabSettings {
-				ui.Scroll(c).Grow(1).Children(func() {
+				// KeepScrollbars(true)：让「下面还有内容」这件事可见。
+				//
+				// 视觉复核的阻塞项：设置内容（尤其展开线路区后）超出 580×640
+				// 时，静态画面看不到滚动条，用户读到的信号是「卡片贴着页脚
+				// 方角收尾、最后一个下拉被削掉底边」，像页面坏了。
+				// mygo 默认只在悬停/拖拽时显示（macOS overlay 惯例），
+				// 但对一个「内容可能超出」的设置页，常显才是诚实的。
+				ui.Scroll(c).Grow(1).KeepScrollbars(true).Children(func() {
 					// 底边距与左右同为 16：卡片的大扩散阴影会往下吃掉 8-10px，
 					// 10 的底边距在截图里会读成「卡片贴着 footer，被裁了一点」。
 					ui.Column(c).Padding(16, 16, 16).Gap(10).Children(func() {
@@ -1339,7 +1349,7 @@ func (a *app) noticeLine(c *ui.Context, p *glass.Palette) {
 //
 // 现在用「组标题 + 组间加高间隙」表达分区：
 //
-//	连接  目标机器（域名或 IP）/ 证书域名（仅 IP 时）/ 网络 / 监听地址 / 传输方式
+//	连接  目标机器（域名或 IP）/ 证书域名（仅 IP 时）/ 网络 / 监听地址 / 传输方式 / 线路
 //	其他  开机自启 / 日志保留 / 显示区间 / 自动更新 / 更新镜像 / 软件更新
 //
 // 组标题本身只有一行 11px 文字（约 26px 含上下留白），比一张卡的装饰开销小一个
@@ -1372,6 +1382,15 @@ func (a *app) settingsPane(c *ui.Context, p *glass.Palette) {
 		a.configField(c, p, "监听地址", &a.listen, relayclient.DefaultListen, running)
 		a.configRule(c, p)
 		a.transportRow(c, p, running)
+		a.configRule(c, p)
+		// 多线路放在「连接」组**末尾**（视觉复核后调整）。
+		//
+		// 原位置是「网络」之后、「监听地址」之前。那让展开态的线路明细
+		// 把下面所有设置项一起推下去——包括页脚上方那条「运行中请先停止」
+		// 的提示与停止按钮，于是提示指向了屏幕外的控件。
+		// 移到组末尾后：展开只影响它自己后面（「其他」组），而「连接」组
+		// 的其余字段与提示行都在它上方，始终可见。
+		a.routesSection(c, p, running)
 
 		a.groupTitle(c, p, "其他", false)
 		a.autoStartRow(c, p)
@@ -1563,6 +1582,10 @@ func (a *app) networkRow(c *ui.Context, p *glass.Palette, disabled bool) {
 			a.transport = fixed
 			a.setNotice("代理模式不支持 QUIC，传输方式已改为「自动」（走 TCP）", false)
 		}
+		// 「网络」区是**快捷设置**：它必须真的作用到线路，否则界面说「已走代理」、
+		// 实际仍走直连——TUN 环境下用户会陷入「怎么都不通」的死循环。
+		// （对抗审查 P2-5：两个配置入口并存且无提示。）
+		a.syncNetModeToRoutes()
 	}
 
 	// 一行说明：三选一各自的含义不同，光看标签猜不出来。

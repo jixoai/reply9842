@@ -186,6 +186,8 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 | `-server-name` | 空 | 仅当目标填的是 **IP** 时才需要：证书上的域名（SAN 一般只有 DNS）|
 | `-local-addr` | 空 | 绑定出站源地址，绕过代理 TUN 劫持 |
 | `-transport` | `auto` | `auto` / `quic` / `tcp` |
+| `-route` | 空 | **新增一条线路**（可重复，顺序即优先级）：`名称:类型:server[:代理/源地址]`，类型 `direct`/`proxy`/`relay` |
+| `-routes-file` | 空 | 从 JSON 读线路列表（与 `settings.json` 的 `routes` 段同构）；与 `-route` 取并集 |
 | `-insecure` | `false` | 跳过证书校验（自签观察期）|
 | `-min-delta` | `16384` | 小于此值的请求体不做 delta |
 | `-history-mb` | `64` | 基线历史总字节预算（MB，约 35 条 1.8MB 请求）|
@@ -231,22 +233,45 @@ CLI 与 GUI 是同一套逻辑的两条外壳：托盘常驻、关窗不退出�
 SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v
 ```
 
-### 网络出口：直连 / 系统 / 代理
+### 多线路：直连 / 代理 / 中继，按「预计完成时间」择路
+
+一条线路不够。服务器在香港，直连通常最快，但偶尔丢包时段会整体劣化；此时
+代理或中继线路能兜底。三种线路可**任意混搭、数量不限**（`settings.json` 的
+`routes` 数组，或 CLI 的 `-route` / `-routes-file`）：
+
+| 类型 | 出站方式 | 典型用途 |
+|---|---|---|
+| `direct` | 绑源地址直连 server（绕 TUN） | 日常最快的那条 |
+| `proxy` | 先 CONNECT 到 `http/https/socks5` 代理，隧道内跑 TLS | 直连丢包时的兜底；可配多个 |
+| `relay` | 直连**另一台** server | 需要完全不依赖本机网络时 |
+
+**择路不看延迟，看「请求传完要多久」**。因为本地 Agent 必须等数据传完才开始
+工作——一条 RTT 50ms 但带宽 200 KB/s 的线路，传 2 MB 要 10 秒；而一条 RTT
+200ms 但 4 MB/s 的线路只要 0.7 秒。所以每条线路维护一个两参数吞吐模型
+`预计耗时 = 固定开销 + 字节/带宽`，用**真实请求的 (wire 字节, 隧道耗时)** 拟合，
+按本次请求的预估体积选预计耗时最小的那条。
+
+三条保护：
+
+- **自动降权，不熔断**：连续失败按比例放大其预计耗时（有上限），排到后面但
+  永不踢出候选——三条线同时瞬断时仍能选「最不差」的那条。
+- **主动探测**：从未成功过的线路每 30 秒被真实试一次（拿到样本即汇入评分）。
+  代价有界：每 30 秒至多 1 个探测请求。
+  - **跨 server 的代价**：delta 基线是 server 侧状态，不同 server 不共享。
+  跨 server 切换会偶发一次 `delta-miss` → 客户端全量重发（数据正确，只是多一次带宽）。
+  GUI 会在多 server 时显式标注这一点。
 
 代理软件的 TUN 全局模式会接管整个 IPv4 路由（macOS 实测
 `route get <服务器IP>` → `198.18.0.1 / utun5`），连隧道服务器的包也被导进代理；
 代理对 28443 这类非标端口没有正确规则，TLS 被切断——客户端只看到
-`tcp tls: EOF` 或 `quic dial: context deadline exceeded`。设置页「网络」三选一：
+`tcp tls: EOF`。`direct` 线路自动探测物理网卡 IP（跳过 utun/tun/docker/vmnet…）
+并绑成出站源地址来绕过它；探测失败或绑定后连不上时会退回系统路由一次。
 
-| 模式 | 行为 | 适合 |
-|---|---|---|
-| **直连** | 自动探测物理网卡 IP（跳过 utun/tun/docker/vmnet…）并绑成出站源地址 | 开着 TUN 全局代理，又不想改代理配置 |
-| 系统 | 什么都不做，跟随系统路由 | 没有 TUN 代理，或代理已给该地址加了直连规则 |
-| 代理 | 走 `http://` / `https://` / `socks5://` 代理（支持用户名密码） | 需要显式指定链路 |
+代理线路只承载 TCP（HTTP CONNECT 与 SOCKS5 都是 TCP 隧道，QUIC 没有标准承载
+方式），该线路上 QUIC 会被自动纠正掉。
 
-直连的探测失败或绑定后连不上时会自动退回系统路由一次——挑错网卡不至于让服务
-完全不可用。代理模式只承载 TCP：HTTP CONNECT 与 SOCKS5 都是 TCP 隧道，
-QUIC 没有标准承载方式，会在该模式下自动降级。
+旧配置（`network_mode` + `proxy_url` + `server` 那一组单值字段）在读取时自动
+合成一条等价线路，迁移幂等；旧字段在落盘时**保留不删**，旧版本回退仍能读到。
 
 ### 运行状态与自恢复
 
@@ -472,6 +497,20 @@ npm/                  纯启动器：镜像链 + 断点续传 + 校验，按需�
 site/                 官网（单文件 HTML + CSS + 两张真实 GUI 截图）
 tools/probe-proxy/    测上游各阶段耗时的透明流式代理（排障用，不参与构建）
 ```
+
+### 多线路示例
+
+```bash
+# 直连最快，代理兜底：三条线路同时可用，自动挑「传完最快」的那条
+relay-cli -route "直连:direct:magpie.aiweb.xin:28443" \
+          -route "代理甲:proxy:magpie.aiweb.xin:28443:http://127.0.0.1:7890" \
+          -route "代理乙:proxy:magpie.aiweb.xin:28443:socks5://127.0.0.1:1081"
+
+# 复杂配置（多条带认证的代理、中继）走 JSON
+relay-cli -routes-file routes.json
+```
+
+`status` 子命令会按线路列出请求数、错误数、平均耗时与上下行量。
 
 ## 已知限制
 

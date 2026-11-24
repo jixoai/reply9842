@@ -112,7 +112,17 @@ type Palette struct {
 	// 语义色
 	Success ui.Color
 	Danger  ui.Color
-	Warning ui.Color
+	// DangerText 危险色**文字**变体。
+	//
+	// 为什么不直接用 Danger（视觉复核抓到的对比度违规）：
+	// Danger #ed413b 用在按钮填充 #272727 上只有 3.86:1，低于本项目在
+	// 本文件上方明确声明的「三级文字 ≥4.5:1」政策。11.5px 正文不可豁免。
+	//
+	// 这里提亮到 #f2726c（5.26:1，卡片底上 6.06:1）：仍是明确的红，
+	// 但过得了对比度门槛。凡是「危险语义的小字/按钮文字」一律用它；
+	// Danger 本身留给填充色块（红底白字那种场景，对比度另有算法）。
+	DangerText ui.Color
+	Warning    ui.Color
 
 	// 图表系列色。三个角色语义固定，不可互换：
 	//   UpBar   上行实际发出的字节（蓝）——「成本」
@@ -193,9 +203,10 @@ func Dark() *Palette {
 		MeterTrack: ui.RGBA(255, 255, 255, 0.055),
 		MeterFill:  ui.RGBA(251, 251, 251, 0.92),
 
-		Success: ui.Hex("#54bf5c"), // oklch(0.72 0.17 145)
-		Danger:  ui.Hex("#ed413b"), // oklch(0.63 0.21 27)
-		Warning: ui.Hex("#f79c40"), // oklch(0.77 0.15 62)
+		Success:    ui.Hex("#54bf5c"), // oklch(0.72 0.17 145)
+		Danger:     ui.Hex("#ed413b"), // oklch(0.63 0.21 27)
+		DangerText: ui.Hex("#f2726c"), // 提亮一档：5.26:1 on #272727（过 4.5 门槛）
+		Warning:    ui.Hex("#f79c40"), // oklch(0.77 0.15 62)
 
 		// 图表系列（暗底）：蓝/绿/琥珀三色在 #0d0d0d 上的相对亮度接近，
 		// 谁也不抢谁的视线；饱和度都压到 0.15 上下，避免在玻璃卡上发荧光。
@@ -260,9 +271,10 @@ func Light() *Palette {
 		MeterTrack: ui.RGBA(41, 46, 56, 0.10),
 		MeterFill:  ui.RGBA(20, 20, 20, 0.86),
 
-		Success: ui.Hex("#2f9e57"), // 亮底上加深，保证对比度
-		Danger:  ui.Hex("#c9342f"),
-		Warning: ui.Hex("#b8730f"),
+		Success:    ui.Hex("#2f9e57"), // 亮底上加深，保证对比度
+		Danger:     ui.Hex("#c9342f"),
+		DangerText: ui.Hex("#b3261e"), // 亮色板上反向压暗，同样保 ≥4.5:1
+		Warning:    ui.Hex("#b8730f"),
 
 		// 图表系列（亮底）：全部压暗一档，否则白底上会「发光」且对比不足。
 		UpBar:   ui.Hex("#2f6fb5"), // oklch(0.55 0.14 250)

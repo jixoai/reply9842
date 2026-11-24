@@ -16,6 +16,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jixoai/reply9842/internal/route"
 	"github.com/jixoai/reply9842/internal/stats"
 )
 
@@ -110,6 +111,48 @@ type Settings struct {
 	// 明确的表态，不该在重启后被悄悄推翻。老配置文件没有这个字段时为零值
 	// false——即「没配过 = 不自动开始」，与之前的默认行为一致。
 	Running bool `json:"running"`
+
+	// Routes 线路列表（多线路配置的唯一真相源）。
+	//
+	// 与上面那组单值字段（network_mode / proxy_url / local_addr / server）的
+	// 关系是「新字段优先，旧字段仅用于迁移」：
+	//
+	//	Routes 非空 → 直接用它；旧字段不再参与（但**保留不删**，
+	//	              以便旧版本回退时仍能读到一份可用的配置）
+	//	Routes 为空 → 由 MigrateRoutes 从旧字段合成一条（见下）
+	//
+	// 为什么旧字段不删：用户可能在不同版本的 GUI 之间来回切换。删掉旧字段
+	// 会让旧版 GUI 一启动就看到「网络模式系统 + 空代理」——配置被静默重置
+	// 是比「多存几个冗余字段」严重得多的事故。
+	Routes route.Set `json:"routes,omitempty"`
+}
+
+// Equal 判断两份偏好是否等价。
+//
+// 为什么不直接用 ==：Settings 现在含 route.Set（切片），结构体不再可比较。
+// 判定语义刻意是「规范化后逐字段相等」——调用方（GUI 的脏检查、
+// 「重启后配置有没有丢」的测试）关心的是行为等价，不是字节等价。
+func (s Settings) Equal(o Settings) bool {
+	if s.RetainSec != o.RetainSec || s.WindowSec != o.WindowSec ||
+		s.AutoUpdate != o.AutoUpdate || s.UpdateMirror != o.UpdateMirror ||
+		s.NetworkMode != o.NetworkMode || s.ProxyURL != o.ProxyURL ||
+		s.Server != o.Server || s.ServerName != o.ServerName ||
+		s.Listen != o.Listen || s.LocalAddr != o.LocalAddr ||
+		s.Transport != o.Transport || s.Running != o.Running {
+		return false
+	}
+	if len(s.Routes) != len(o.Routes) {
+		return false
+	}
+	for i := range s.Routes {
+		a, b := s.Routes[i], o.Routes[i]
+		if a.ID != b.ID || a.Kind != b.Kind || a.Server != b.Server ||
+			a.Proxy != b.Proxy || a.LocalAddr != b.LocalAddr ||
+			a.Transport != b.Transport || a.IsEnabled() != b.IsEnabled() {
+			return false
+		}
+	}
+	return true
 }
 
 // DefaultSettings 默认偏好：保留一天、看最近 30 分钟、不自动更新、镜像留空
@@ -166,6 +209,53 @@ func (s Settings) ApplyTo(cfg *Config) {
 	case "auto", "quic", "tcp":
 		cfg.Transport = strings.ToLower(s.Transport)
 	}
+	// 线路列表优先（非空即覆盖）。空时不动 cfg.Routes——由 cfg.Normalize
+	// 用单值字段合成一条，这样「老配置 + 新代码」走的正是同一条兼容路径。
+	if len(s.Routes) > 0 {
+		cfg.Routes = append(route.Set(nil), s.Routes...)
+	}
+}
+
+// MigrateRoutes 从旧字段合成一条等价线路（幂等；Routes 非空时原样返回）。
+//
+// 迁移矩阵（对齐 openspec 的「旧配置必须无损迁移」）：
+//
+//	network_mode=direct          → kind=direct + localAddr
+//	network_mode=system          → kind=direct（不加源地址，交给系统路由）
+//	network_mode=proxy + proxyURL→ kind=proxy  + proxy 原样
+//	network_mode=proxy 但 URL 空 → kind=direct（回归可用路径，不造一条坏线路）
+//
+// 为什么要显式保留「system」与「direct」的区别：它们的 Forwarded 行为不同
+// （direct 会绑物理网卡绕 TUN，system 不绑）。合成时不能一律当 direct。
+func (s Settings) MigrateRoutes() route.Set {
+	if len(s.Routes) > 0 {
+		return s.Routes.Normalize()
+	}
+
+	r := route.Route{
+		ID:        "默认线路",
+		Server:    NormalizeTarget(s.Server),
+		Transport: s.Transport,
+	}
+	switch s.NetworkModeOr() {
+	case NetworkProxy:
+		if s.ProxyURL != "" {
+			r.Kind = route.KindProxy
+			r.Proxy = s.ProxyURL
+			break
+		}
+		// 代理模式却没填地址：这条配置本来就连不上，退化成直连而不是
+		// 造一条永远失败的空代理线路（否则用户升级后发现全线不可用）。
+		r.Kind = route.KindDirect
+		r.LocalAddr = s.LocalAddr
+	case NetworkDirect:
+		r.Kind = route.KindDirect
+		r.LocalAddr = s.LocalAddr
+	default: // system
+		r.Kind = route.KindDirect
+		// 不设 LocalAddr：system 的语义就是让内核选路由
+	}
+	return route.Set{r.Normalize()}
 }
 
 // Normalize 把越界或缺失的字段收敛到合法集合。
@@ -193,6 +283,12 @@ func (s *Settings) Normalize() {
 	// 真正构造 Updater 时校验。这里也**不**把空白串规整成某种「默认」标记——
 	// 空串本身就是「未配置」的表达，与 update.ResolveMirrors(nil) 的语义对得上。
 	s.UpdateMirror = strings.TrimSpace(s.UpdateMirror)
+	// 线路逐条规范化。注意这里**不**做迁移（空列表保持空）：
+	// 迁移的时机是「有旧字段可依据」，而 Normalize 不知道调用方想不想迁移。
+	// 迁移由 MigrateRoutes / ApplyTo 显式触发。
+	if len(s.Routes) > 0 {
+		s.Routes = s.Routes.Normalize()
+	}
 }
 
 // nearestOption 找与 d 最接近的档位；空表时原样返回

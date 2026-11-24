@@ -48,9 +48,24 @@ type PooledDialer struct {
 	timeout time.Duration
 	closed  bool
 
+	// dialFn 建连函数；nil 时用内嵌 Dialer 的 Dial。
+	//
+	// 存在的唯一理由是**可测试**：池的语义（复用/淘汰/丢弃/串台防护）需要
+	// 用可控的假连接来验证，而真实 Dial 需要证书 + 监听端口 + 时间。
+	// 生产路径永远为 nil（走 Dialer.Dial），行为与此前完全一致。
+	dialFn func(ctx context.Context) (*Conn, error)
+
 	// 统计：便于观测复用率，排查「为什么还是很慢」
 	hits   int64
 	misses int64
+}
+
+// dial 走注入的函数；未注入时退回真实 Dialer。
+func (p *PooledDialer) dial(ctx context.Context) (*Conn, error) {
+	if p.dialFn != nil {
+		return p.dialFn(ctx)
+	}
+	return p.Dial(ctx)
 }
 
 type idleConn struct {
@@ -108,7 +123,7 @@ func (p *PooledDialer) Get(ctx context.Context) (*Conn, error) {
 	}
 	p.misses++
 	p.mu.Unlock()
-	c, err := p.Dial(ctx)
+	c, err := p.dial(ctx)
 	if c != nil {
 		c.reused = false // 新建连接：调用方按「这次付了握手钱」记录
 	}

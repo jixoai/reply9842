@@ -1,0 +1,145 @@
+## Why
+
+一条线路不够可靠，也不够快。
+
+服务器在香港（118.26.39.57 / UCLOUD HK）。生产实测（2026-11-24，634 条 200 请求）：
+
+| 指标 | 实测 |
+|---|---|
+| `ms_wire`（隧道往返）p50 / p90 | 6,851 / 24,510 ms |
+| `ms_upstream`（服务端→上游 TTFB）p50 | 3,368 ms |
+| 由差值推出的「本机→香港」段 | **≈3.5 s** |
+
+也就是说：**请求总耗时里约一半花在「本机 → 香港」这一段**，而且 p90 是 p50 的 3.6 倍。
+当前只有单条线路（`settings.json` 里 `network_mode: direct`），线路一旦丢包，
+所有请求一起劣化，没有任何腾挪空间。
+
+按 wire 字节分桶看有效吞吐（这是 owner 明确要求的主指标）：
+
+| wire 体积 | n | ms_wire p50 | 有效吞吐 p50 |
+|---|---|---|---|
+| <2 KB | 12 | 1,482 | 739 KB/s |
+| 2–16 KB | 82 | 4,849 | 2,262 KB/s |
+| 16–64 KB | 364 | 6,284 | 5,438 KB/s |
+| 64–256 KB | 158 | 14,480 | 6,347 KB/s |
+| >256 KB | 18 | 27,003 | 13,572 KB/s |
+
+**关键洞察（owner 2026-11-24 亲自指出）**：真正决定体验的不是 RTT，而是
+「一个请求从发出到传输完成」的总耗时。因为本地 AI 必须**等数据传完**才开始工作。
+一条延迟低但带宽窄（比如 200 KB/s）的线路，很可能比一条延迟稍高但能跑 2 MB/s 的
+线路**总耗时更长**。所以择路必须以**有效吞吐 / 预计完成时间**为评分，不能以 RTT 为评分。
+
+当前架构（`internal/relayclient/runner.go`）：
+
+```
+Agent → :18899 → handler.ServeHTTP
+                   └─ h.pool.Get(ctx)          ← 单选：一个 Dialer、一个池
+                        └─ transport.Dialer{Addr, Proxy, LocalAddr, Mode}
+```
+
+`Config` / `Settings` 都是**单值**：`Server` 一个、`Proxy` 一个、`NetworkMode` 三选一。
+`internal/transport/pool.go` 是**单池**。要「多条线路同时可用、哪条快多用哪条」，
+必须把「选连接」从一个池的选择，升级为**跨线路的选择**。
+
+## What Changes
+
+### 1. 线路（Route）成为一等公民，三种类型可自由混搭
+
+owner 裁决（2026-11-24）：不是「直连 + 代理1 + 代理2」这种固定形状，而是
+**直连 / 代理 / 中继三种可任意混搭、数量不限**，用户完全自由配置。
+
+```
+Route = {
+  id        用户可见的名字，如 "直连" / "香港代理" / "备用中继"
+  kind      direct | proxy | relay
+  server    该线路连到哪台 relay-server（host:port）  ← 中继与直连差在这
+  proxy     仅 proxy 类型：http/https/socks5 URL
+  localAddr 仅 direct 类型：绑定源地址（绕 TUN）
+  transport auto|quic|tcp
+  enabled   启停开关
+}
+```
+
+三者的差别本质上只是「怎么把 TCP/UDP 打到 server」：
+
+| kind | 出站方式 | QUIC 可用 |
+|---|---|---|
+| `direct` | 绑源地址直连 server（绕 TUN） | 是 |
+| `proxy` | 先 CONNECT 到代理，隧道内跑 TLS | 否（CONNECT/SOCKS5 都是 TCP） |
+| `relay` | 直连**另一台** server（不受本地网络劣化影响） | 是 |
+
+`relay` 复用了 `direct` 的全部代码路径，唯一区别是 `server` 字段指向不同主机。
+**这是零成本的能力**：现有 `Dialer` 已经支持任意 `Addr`，不需要新协议。
+
+### 2. 按「预计完成时间」择路，而不是按延迟
+
+评分必须回答 owner 真正关心的问题：
+
+> 把这次请求的 N 字节，经这条线路送到服务器，大概要多久？
+
+所以每条线路维护一个**吞吐模型**（不是 RTT 模型）：
+
+- 每次成功请求记录一组 `(wire_bytes, 传输耗时)` 样本
+- 拟合「固定开销 + 字节/带宽」两参数模型：`预计耗时 ≈ a + bytes / bw`
+- 选路时对**本次请求的预期字节数**求预计耗时，取最小者
+- 这天然把「低延迟窄带宽」与「高延迟宽带宽」放在同一个尺子上比较
+
+这是 owner 那句话的直接实现：**延迟高但带宽好的线路会赢，因为完成时间更短**。
+
+### 3. 自动降权 + 仍保留兜底（owner 裁决）
+
+- 每次失败按固定比例降权，连续失败衰减更快（EWMA，非硬熔断）
+- 但**永不彻底排除**：所有线路都不可用时，仍会选「最不差」的那条去试
+- 理由（owner 原话）：存在三条线同时瞬断的可能，硬熔断会导致「全踢光 → 无路可用」
+
+### 4. 基线（delta 字典）与线路解耦
+
+**这是本变更最容易踩的坑，必须先说清。**
+
+协议事实（已核实）：
+- `internal/store` 是**全局 hash→body 纯 KV**，无 tenant 维度
+- `internal/idem.Key` 的作用域是 **caller key**，不是连接
+- **delta 基线是 server 侧状态**：`baseHash` 由客户端选中，字典由 server 的 store 提供
+
+推论：**同一时刻只有一台 server 持有你要的基线**。
+
+- 若多线路指向**同一台 server**（典型：直连 + 代理1 + 代理2 都到 magpie.aiweb.xin），
+  切换线路对 delta **完全无害** —— 这是本次最主要的用法。
+- 若线路指向**不同 server**（中继），基线不共享。跨 server 切换会得到
+  `FrameDeltaMiss`（服务端优雅回退，客户端重发全量），表现为「偶发一次大请求」。
+  **不会损坏数据**，但有带宽代价。
+
+因此：**允许不同 server，但必须显式暴露「跨 server 切换的代价」**，
+并在 GUI 里对「基线不共享」给出标注。不做静默处理。
+
+### 5. 面板与设置全部重做
+
+现有设置页是「网络三选一 + 一个代理地址框」。改成线路列表：
+每条显示实时质量（预计耗时 / 吞吐 / 成功率）、可启停、可增删；
+字段级编辑（server/代理地址）由 CLI `-route` 与 `settings.json` 承担
+（GUI 收敛为最高频的增删启停，避免把列表淹没在输入框里）。
+优先级由列表顺序表达，本轮不做拖拽排序（顺序可通过编辑 JSON 调整）。
+
+## 验收标准（可执行、可观测）
+
+| # | 标准 | 怎么验 |
+|---|---|---|
+| A1 | 三条线路（直连 + 两个代理）同时可用 | 起客户端，日志显示 3 条线路全部探测通过 |
+| A2 | 择路按预计完成时间而非 RTT | 注入「A 低延迟窄带宽 / B 高延迟宽带宽」，断言选 B |
+| A3 | 劣化时降权但不熔断 | 把 A 的失败率拉到 100%，断言仍会用 B 且流量不中断 |
+| A4 | 全部劣化时仍能兜底 | 所有线路注入错误，断言选「最不差」的一条并重试 |
+| A5 | 多线路同 server 时 delta 无损耗 | 三线路切同一 server，`enc` 统计里 `dcz`/`dcz2` 占比不下降 |
+| A6 | 跨 server 切换只触发可恢复的 miss | 切到不同 server，断言出现 `delta-miss` 后重发成功、数据正确 |
+| A7 | 面板能真实增删改线路并持久化 | GUI 加一条线路 → 重启 → 线路还在、且能连 |
+| A8 | 旧配置自动迁移，不丢用户设置 | 用现有 `settings.json`（单 server 单 proxy）启动，线路列表等价还原 |
+| A9 | 单线路时行为与今天完全一致 | 只有一条线路：既有全量测试全绿 + `TestSingleRouteSpecMatchesLegacyDialer` 逐字段等价护栏（建连参数与旧路径一致）。**说明**：`transport`/`enc` 分布的「不退化」需要基线快照对比机制，当前未建立——这条只验证到「配置等价」，行为等价由既有全量测试间接覆盖。 |
+| A10 | `-race` 干净 | `go test -race ./...` 全绿 |
+
+## 依据
+
+- `internal/relayclient/settings.go` 的 `NetworkMode` 三选一（`direct`/`system`/`proxy`）
+- `internal/relayclient/runner.go` 的 `Config.Proxy` 单值、`Start()` 单 `Dialer` 单 `PooledDialer`
+- `internal/transport/pool.go` 顶部注释明确「串行复用一条连接」
+- `internal/transport/proxydial.go` 明确「代理只承载 TCP，QUIC 不可用」
+- 生产 stats（`~/.reply9842/client-stats.json`，1387 请求）与 per-request jsonl 实测
+- owner 2026-11-24 裁决：线路可混搭三类；带宽（完成时间）优先于延迟；自动降权不熔断
