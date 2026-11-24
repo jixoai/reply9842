@@ -483,3 +483,20 @@ func TestExpandedRoutesReachability(t *testing.T) {
 	_ = first
 	t.Logf("展开态底部左缘序列: %v（内收=%v）", xs, inset)
 }
+
+// 演示数据必须包含一条停用线路（否则截图无法验证停用态的视觉表达）。
+//
+// 这条测试与夹具同文件：`demoRoutes` 只在这个 darwin-only 文件里定义
+// （截图需要真实渲染）。放在 routes_pane_test.go 里会让 Linux runner 上的
+// `go vet` 报 undefined: demoRoutes —— CI 的 vet 是全平台跑的。
+func TestDemoRoutesHasDisabledSample(t *testing.T) {
+	disabled := 0
+	for _, r := range demoRoutes() {
+		if !r.IsEnabled() {
+			disabled++
+		}
+	}
+	if disabled != 1 {
+		t.Fatalf("演示数据应有 1 条停用线路（供截图验证状态表达），实际 %d 条", disabled)
+	}
+}

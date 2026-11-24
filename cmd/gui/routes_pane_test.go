@@ -195,20 +195,6 @@ func TestEnabledCountMatchesState(t *testing.T) {
 	}
 }
 
-// 演示数据必须包含一条停用线路（否则截图无法验证停用态的视觉表达）
-func TestDemoRoutesHasDisabledSample(t *testing.T) {
-	rs := demoRoutes()
-	disabled := 0
-	for _, r := range rs {
-		if !r.IsEnabled() {
-			disabled++
-		}
-	}
-	if disabled != 1 {
-		t.Fatalf("演示数据应有 1 条停用线路（供截图验证状态表达），实际 %d 条", disabled)
-	}
-}
-
 // 中继线路同样需要源地址绑定：中继只是服务端再转发一跳，本机到中继这
 // 一跳仍是本机外连，TUN 全局模式照样劫持。曾只补 direct，实测 relay
 // 线路全程 tls: EOF、永不参与择路。
