@@ -186,7 +186,7 @@ ipconfig getifaddr en0          # macOS 取网卡 IP
 | `-server-name` | 空 | 仅当目标填的是 **IP** 时才需要：证书上的域名（SAN 一般只有 DNS）|
 | `-local-addr` | 空 | 绑定出站源地址，绕过代理 TUN 劫持 |
 | `-transport` | `auto` | `auto` / `quic` / `tcp` |
-| `-route` | 空 | **新增一条线路**（可重复，顺序即优先级）：`名称:类型:server[:代理/源地址]`，类型 `direct`/`proxy`/`relay` |
+| `-route` | 空 | **新增一条线路**（可重复，顺序即优先级）：`名称:类型:server[:代理或源地址[:证书域名]]`，类型 `direct`/`proxy`/`relay` |
 | `-routes-file` | 空 | 从 JSON 读线路列表（与 `settings.json` 的 `routes` 段同构）；与 `-route` 取并集 |
 | `-insecure` | `false` | 跳过证书校验（自签观察期）|
 | `-min-delta` | `16384` | 小于此值的请求体不做 delta |
@@ -243,7 +243,16 @@ SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v
 |---|---|---|
 | `direct` | 绑源地址直连 server（绕 TUN） | 日常最快的那条 |
 | `proxy` | 先 CONNECT 到 `http/https/socks5` 代理，隧道内跑 TLS | 直连丢包时的兜底；可配多个 |
-| `relay` | 直连**另一台** server | 需要完全不依赖本机网络时 |
+| `relay` | 直连**另一台** server（服务端再转发给上游） | 本机到香港这段劣化时，换一条到上海/其它机房的路径 |
+
+`relay` **不是**「不依赖本机网络」——中继只是让服务端再转发一跳，**本机到中继这
+一跳仍然是本机发起的外连**，TUN 全局代理照样会劫持它。所以中继线路同样需要绑
+源地址，规则与 `direct` 完全一致。
+
+中继还有一个必填项：**证书域名**（`server_name`）。中继通常指向另一台 IP，但
+复用同一张证书（证书 SAN 只有域名，没有 IP），不填就会
+`x509: cannot validate certificate for <ip> ... no IP SANs`。GUI 的线路「编辑」
+里有这一栏；CLI 的 `-routes-file` 用 JSON 的 `server_name` 字段。
 
 **择路不看延迟，看「请求传完要多久」**。因为本地 Agent 必须等数据传完才开始
 工作——一条 RTT 50ms 但带宽 200 KB/s 的线路，传 2 MB 要 10 秒；而一条 RTT
@@ -255,20 +264,73 @@ SITE_SHOTS_DIR=/tmp/site go test ./cmd/gui -run TestSiteShots -v
 
 - **自动降权，不熔断**：连续失败按比例放大其预计耗时（有上限），排到后面但
   永不踢出候选——三条线同时瞬断时仍能选「最不差」的那条。
-- **主动探测**：从未成功过的线路每 30 秒被真实试一次（拿到样本即汇入评分）。
-  代价有界：每 30 秒至多 1 个探测请求。
-  - **跨 server 的代价**：delta 基线是 server 侧状态，不同 server 不共享。
-  跨 server 切换会偶发一次 `delta-miss` → 客户端全量重发（数据正确，只是多一次带宽）。
-  GUI 会在多 server 时显式标注这一点。
+- **自动回升**：失败计数按 2 分钟半衰期做时间衰减，线路恢复后自动回到候选前列，
+  不需要重启客户端。
+- **主动探测**：从未成功过的线路按 `30s × 2^失败次数` 指数退避去真实试一次
+  （封顶 10 分钟），拿到样本即汇入评分。
+- **跨 server 的代价**：delta 基线是 **server 侧状态**，不同 server 不共享。
+  跨 server 切换会偶发一次 `delta-miss` → 客户端全量重发（数据正确，只是多一次
+  带宽）。GUI 会在多 server 时显式标注这一点。
 
 代理软件的 TUN 全局模式会接管整个 IPv4 路由（macOS 实测
 `route get <服务器IP>` → `198.18.0.1 / utun5`），连隧道服务器的包也被导进代理；
 代理对 28443 这类非标端口没有正确规则，TLS 被切断——客户端只看到
-`tcp tls: EOF`。`direct` 线路自动探测物理网卡 IP（跳过 utun/tun/docker/vmnet…）
-并绑成出站源地址来绕过它；探测失败或绑定后连不上时会退回系统路由一次。
+`tcp tls: EOF`。`direct` 与 `relay` 线路都会自动探测物理网卡 IP
+（跳过 utun/tun/docker/vmnet…）并绑成出站源地址来绕过它；探测失败或绑定后
+连不上时会退回系统路由一次。`proxy` 线路不绑源地址——CONNECT 由代理进程发起，
+绑本机网卡反而会和代理自己的路由选择打架。
 
 代理线路只承载 TCP（HTTP CONNECT 与 SOCKS5 都是 TCP 隧道，QUIC 没有标准承载
-方式），该线路上 QUIC 会被自动纠正掉。
+方式）。`proxy` + `transport=quic` 不是「稍后失败」的组合，会在配置校验阶段直接
+报错；GUI 里切到代理模式时会把传输方式自动改成「自动」（走 TCP）。
+
+### 线路配置的 JSON 形态
+
+`settings.json` 的 `routes` 段与 `-routes-file` 读的文件**同构**（顶层是数组）：
+
+```json
+[
+  {
+    "id": "香港",
+    "kind": "direct",
+    "server": "magpie.aiweb.xin:28443",
+    "server_name": "magpie.aiweb.xin",
+    "transport": "tcp",
+    "local_addr": "192.168.1.106"
+  },
+  {
+    "id": "上海",
+    "kind": "relay",
+    "server": "47.117.152.3:28443",
+    "server_name": "magpie.aiweb.xin",
+    "transport": "tcp",
+    "local_addr": "192.168.1.106"
+  },
+  {
+    "id": "代理甲",
+    "kind": "proxy",
+    "server": "magpie.aiweb.xin:28443",
+    "proxy": "http://127.0.0.1:7890"
+  }
+]
+```
+
+字段说明：
+
+| 字段 | 必填 | 说明 |
+|---|---|---|
+| `id` | 是 | 线路名，唯一；日志与面板都用它标识线路 |
+| `kind` | 是 | `direct` / `proxy` / `relay` |
+| `server` | 是 | `host:port`；只写 host 时由 Normalize 补默认端口 |
+| `server_name` | 目标为 IP 时必填 | TLS SNI（证书上的域名）。填 IP 会被拒绝——等于没填 |
+| `local_addr` | 否 | 绑定的出站源地址。`direct` 与 `relay` 可用，`proxy` 不可填 |
+| `proxy` | `kind=proxy` 必填 | `http://` / `https://` / `socks5://`；须带协议头 |
+| `transport` | 否 | `auto`（默认）/ `quic` / `tcp`；`proxy` 不可为 `quic` |
+| `enabled` | 否 | 省略视为启用 |
+
+`kind` 不只是标签，它决定哪些字段生效，填错会被校验拒绝（例如 direct 填了
+`proxy`、relay 填了 `proxy`）。这是刻意的：否则「以为在直连、实际走了代理」
+这种配置错误在日志里完全看不出来。
 
 旧配置（`network_mode` + `proxy_url` + `server` 那一组单值字段）在读取时自动
 合成一条等价线路，迁移幂等；旧字段在落盘时**保留不删**，旧版本回退仍能读到。
@@ -506,6 +568,10 @@ relay-cli -route "直连:direct:magpie.aiweb.xin:28443" \
           -route "代理甲:proxy:magpie.aiweb.xin:28443:http://127.0.0.1:7890" \
           -route "代理乙:proxy:magpie.aiweb.xin:28443:socks5://127.0.0.1:1081"
 
+# 中继兜底：第四段是源地址，第五段是证书域名（指向 IP 时**必须**给）
+relay-cli -route "香港:direct:magpie.aiweb.xin:28443:192.168.1.106" \
+          -route "上海:relay:47.117.152.3:28443:192.168.1.106:magpie.aiweb.xin"
+
 # 复杂配置（多条带认证的代理、中继）走 JSON
 relay-cli -routes-file routes.json
 ```
@@ -527,6 +593,13 @@ relay-cli -routes-file routes.json
 8. **Windows 缺进程级自恢复**。登录项写在 HKCU Run 里，没有 launchd 那种 KeepAlive
    语义：进程内 supervisor 与 `crash.log` 照常生效，但进程整体崩溃后要用户手动重开
    （后续可换计划任务 + 失败重启）。macOS 侧已由 `KeepAlive={SuccessfulExit=false}` 兜住。
+9. **跨 server 的 delta 基线不共享**。基线是服务端状态，中继与主服务器各存各的，
+   跨 server 切换必然偶发一次 `delta-miss` → 全量重发。数据正确，只多一次带宽
+   （约 20–35% 的该请求体积）。同 server 的多条线路（直连 + 多个代理）没有这个代价。
+10. **线路不支持拖拽排序**。列表顺序即优先级、会被持久化，但调整顺序要编辑
+    `settings.json` 的数组（GUI 只能增删启停与改字段）。
+11. **线路改动需重启生效**。运行中 `SetConfig` 被拒（与其它连接类字段一致），
+    GUI 里运行期间字段输入框是灰的。
 
 ## 规范参考
 

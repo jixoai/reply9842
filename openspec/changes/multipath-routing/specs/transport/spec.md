@@ -3,21 +3,29 @@
 ### Requirement: 线路是一等配置对象，支持 direct / proxy / relay 三类混搭
 
 客户端 SHALL 以「线路列表」而非单一出站配置表达网络出口。每条线路 MUST 至少包含
-`id`（用户可读名）、`kind`（`direct`|`proxy`|`relay`）、`server`（目标 relay-server 地址）。
-`kind=proxy` 时 MUST 提供合法的 `proxy` URL（`http`/`https`/`socks5`）；
-`kind=direct` MAY 提供 `localAddr`（绑定出站源地址以绕开 TUN）；
-`kind=relay` 的语义与 `direct` 相同，仅 `server` 指向不同主机。
+`id`（用户可读名）、`kind`（`direct`|`proxy`|`relay`）、`server`（目标 relay-server
+地址，`host:port`）。可选字段：
+
+| 字段 | 适用 kind | 语义 |
+|---|---|---|
+| `serverName` | 全部（**relay 指向 IP 时必填**） | TLS SNI。缺它则用 `server` 的 host 推导，IP 目标下必然 `x509: ... no IP SANs` |
+| `localAddr` | `direct` / `relay` | 绑定出站源地址以绕开 TUN。relay 同样需要：中继只是服务端再转发一跳，**本机到中继这一跳仍是本机外连** |
+| `proxy` | `proxy` | 合法 URL（`http`/`https`/`socks5`）。proxy 线路 MUST NOT 填 `localAddr`（CONNECT 由代理进程发起） |
+| `transport` | 全部 | `auto`\|`quic`\|`tcp`；proxy 线路 MUST NOT 为 `quic` |
+| `enabled` | 全部 | 缺省视为启用 |
+
+`kind=relay` 与 `direct` 使用同一套建连代码路径，差别是 `server` 指向**另一台主机**——
+因此它额外需要正确的 `serverName`（证书通常只签域名，不签中继机的 IP）。
 
 列表长度 MUST 支持 1..N（N≥3 必须有测试覆盖），顺序由用户决定并持久化。
 
-落地证据（现状）：`internal/relayclient/settings.go` 的 `NetworkMode` 只允许三选一、
-`ProxyURL` 是单串；`internal/relayclient/runner.go:344` 在 `Start()` 里构造**单个**
-`transport.Dialer`；`internal/transport/pool.go` 只有单池。本 Requirement 要求把这些
-单值形态替换为列表形态。
+落地证据：`internal/route/route.go`（类型、Normalize、Validate 与 kind 交叉校验）、
+`internal/transport/pools.go`（`DialerSpec` → 每线路一个独立 `PooledDialer`，
+粘性 prefer 状态不跨线路共享）。
 
 #### Scenario: 三类线路混搭共存
 
-- **WHEN** 用户配置了 ``{kind:direct}`` + ``{kind:proxy, proxy:socks5://...}`` + ``{kind:relay, server:other-host:28443}``
+- **WHEN** 用户配置了 `{kind:direct}` + `{kind:proxy, proxy:socks5://...}` + `{kind:relay, server:other-host:28443}`
 - **THEN** 三条线路都被客户端接受并各自建立可用连接，任一线路的配置错误只影响它自己
 
 #### Scenario: 代理线路不得声明 QUIC
@@ -41,9 +49,12 @@
 线路，最终传输完成时间可能反而更长」。RTT 类指标 MAY 参与固定开销 `a` 的估计，
 但 MUST NOT 单独成为排序依据。
 
-落地证据（现状）：`internal/stats/stats.go:60` 已有 `MsWire`（隧道往返）与
-`UpWire`/`DownWire`（隧道实际字节），本变更复用这些既有字段作为样本来源，
-新增 `Route` 维度。
+落地证据：`internal/route/estimate.go` 的 `Model` 在最近 3–24 条样本上做两参数
+OLS，得 `a`（固定开销 ms）与 `bw`（KB/s）；`Estimate(bytes) = a + bytes/bw`。
+样本来源是既有的 `MsWire`（隧道往返）与 `UpWire`/`DownWire`，新增 `Route` 维度后
+按线路分别拟合。择路的**输入体积**是 `estimateWireBytes()`——用 `basefind`
+预测的 delta 复用率换算**隧道实际传输量**，不是明文 body 长度（否则 delta 命中时
+会把 1.5 MB 估成 1.5 MB，实际只传 129 B，差 4 个数量级）。
 
 #### Scenario: 低延迟窄带宽输给高延迟宽带宽
 
@@ -75,8 +86,13 @@
 禁止硬熔断（把失败线路从候选集合彻底移除直至外部健康检查恢复）：
 owner 2026-11-24 裁决「三条线同时瞬断 → 全踢光 → 无路可用」是不可接受的风险。
 
-落地证据（现状）：今天没有任何降权逻辑；单池在连接失败时只做「丢弃并重连」
-（`internal/relayclient/runner.go:599`），没有跨线路视角。
+落地证据：`internal/route/pick.go` 的 `Picker` —— 惩罚乘子
+`1 + 0.5 × EffectiveFails()`，`failCap = 32`，失败间隔超过上限后不再加；
+`Model.EffectiveFails()` 用 `fails × 0.5^(elapsed/½life)`，`½life = 2 min`，
+所以惩罚会自然衰减、线路自动回升。探索通道按 `30s × 2^probeFailures`
+（封顶 10 min）放行未知/刚恢复的线路。`SelectExcluding` 保证**一次请求内
+每条线路最多试一次**——否则从未成功过的线路样本数恒为 0，会反复被
+「主动探测」选中，同一次请求反复打同一条死线路。
 
 #### Scenario: 单条线路持续失败不导致断流
 
@@ -123,7 +139,7 @@ owner 2026-11-24 裁决「三条线同时瞬断 → 全踢光 → 无路可用�
 ### Requirement: 线路质量必须可观测
 
 每条线路 SHALL 暴露可观测的质量指标，至少包含：预计完成时间、实测有效带宽、
-成功率、当前承载的请求量、是否在用。这些指标 MUST 同时出现在 per-request 日志
+成功率、本次运行内被选中承载的**累计次数**、是否在用。这些指标 MUST 同时出现在 per-request 日志
 （`client-*.jsonl`）与汇总统计中，并以 `route` 字段区分。
 
 禁止只在内存里维护评分而不落盘：用户排障时必须能从日志回溯「当时为什么选了这条」。
@@ -137,6 +153,40 @@ owner 2026-11-24 裁决「三条线同时瞬断 → 全踢光 → 无路可用�
 
 - **WHEN** 打开 GUI 设置页
 - **THEN** 每条线路显示其预计耗时 / 带宽 / 成功率 / 使用状态，且随请求实时更新
+
+### Requirement: 线路字段必须可在 GUI 里完整配置
+
+用户 SHALL 能在 GUI 内完成任意一条线路的全部必填字段配置，不得要求手改
+`settings.json` 或用 CLI 才能让一条线路变得可用。
+
+理由（实现后自查发现的死路）：中继线路的 `server_name`（证书域名）与
+`local_addr`（源地址）都是必填——缺 SNI 会 `x509: cannot validate
+certificate for <ip>`，缺源地址在 TUN 全局代理下会 `tcp tls: EOF`。
+若 GUI 只提供增删启停，用户新增中继线路后没有任何途径填这两项，等于
+「加了就废」。
+
+布局约束（经两轮视觉验收后定稿）：
+
+- 同一时刻 MUST 最多展开一条线路的字段区。
+- 列表本身在固定高度的内滚动容器内（`MaxHeight(4×41)`），保证展开列表不会把
+  后续设置项无限推下去。
+- 字段区 MUST 渲染在**该滚动容器之外**（列表下方），MUST NOT 放进容器内部。
+  实测教训：放进容器内时，在最后一行展开会被视口底边横向切断——第一个输入框
+  只剩半个（缺底边框、字形少 2px），用户看不到完整字段，也判断不出还有几项。
+- 字段区 MUST 有明确的归属表达（「正在编辑「名称」」标题 + 完成按钮），
+  MUST NOT 只靠行内按钮从「编辑」变「收起」来暗示归属。
+- 字段 MUST 与页面其它表单项同列（标签 84px + 输入框撑满）。
+
+#### Scenario: 新增中继线路并使其可用
+
+- **WHEN** 用户在设置页点「＋中继」，再点该行的「编辑」
+- **THEN** 出现服务器 / 证书域名 / 源地址三个输入框
+- **AND** 填完后该线路通过 `route.Validate`，无需编辑任何文件
+
+#### Scenario: 运行中不可改
+
+- **WHEN** 线路正在承载请求（Runner 运行中）
+- **THEN** 字段输入框置灰，并显示「运行中不可编辑，停止后可改」
 
 ### Requirement: 旧配置必须无损迁移
 

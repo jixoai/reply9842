@@ -2,7 +2,7 @@
 
 - [x] 1.1 新增 `internal/route/route.go`：定义 `Route{ID,Kind,Server,Proxy,LocalAddr,Transport,Enabled}` 与 `Kind` 三值枚举，含校验（proxy 必填 URL、kind=proxy 禁 quic、server 必填）
 - [x] 1.2 新增 `internal/route/estimate.go`：两参数吞吐模型 `est = a + bytes/bw`，`Observe(bytes, ms)` 与 `Estimate(bytes)`；样本不足时返回 `known=false`
-- [x] 1.3 新增 `internal/route/pick.go`：按 `Estimate` 选线；失败按 EWMA 降权；**保底**——所有线路 `known=false` 或全失败时返回「最不差」的一条
+- [x] 1.3 新增 `internal/route/pick.go`：按 `Estimate` 选线；失败按「离散惩罚乘子 × 时间衰减」降权（非 EWMA，见 10.2）；**保底**——所有线路 `known=false` 或全失败时返回「最不差」的一条
 - [x] 1.4 单测：低延迟窄带宽 vs 高延迟宽带宽的胜负翻转（16 KB 选 A、2 MB 选 B）
 - [x] 1.5 单测：A 100% 失败时仍选中 B；全失败时仍返回一条候选（不返回 nil）
 - [x] 1.6 单测（实测补）：探测代价有界（`TestProbeCostIsBounded`，已做突变测试验证其有效性）

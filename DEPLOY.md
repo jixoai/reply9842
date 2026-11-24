@@ -101,6 +101,84 @@ WantedBy=multi-user.target
 sudo systemctl enable --now reply9842-server
 ```
 
+## 二·五、中继机（多线路的第二条路径）
+
+客户端的「多线路」里，`relay` 类型指向**另一台** server：客户端连到中继，
+中继再把请求转发给真正的上游。用途是「本机到香港这一段劣化时换一条路径」——
+中继机通常放在网络条件不同的机房（如上海），与主服务器互为兜底。
+
+中继机与主服务器是**同一个二进制**，三处必须特别处理：
+
+### 1. 证书：复用主服务器的证书
+
+中继指向的是另一台 **IP**，但客户端仍用主服务器的域名做 SNI 校验，所以中继机上
+放的必须是**同一张证书**（`magpie.aiweb.xin`），不是为 IP 签的新证书。
+
+客户端侧对应要填 `server_name`（CLI 的 JSON 字段 / GUI 线路编辑区的「证书域名」）。
+不填的表现是 `x509: cannot validate certificate for <ip> ... no IP SANs`。
+
+### 2. 上游：可以指公网域名，不必是本机网关
+
+主服务器的 `-upstream` 指向本机 magpie 网关（`http://127.0.0.1:3425,...`）。
+中继机上通常**没有**那个网关，把上游指向公网域名即可：
+
+```bash
+-upstream https://magpie.aiweb.xin:443 -uphost magpie.aiweb.xin
+```
+
+**端口不能省**。写成 `-upstream https://magpie.aiweb.xin`（无 `:443`）时 Go 的
+dialer 会报 `dial tcp: address magpie.aiweb.xin: missing port in address`，
+客户端侧看到的是 502——而且日志里只有这一行，很容易误判成网络不通。
+
+### 3. 资源：按兜底定位给较小的预算
+
+中继是备用路径，不是主力，无需与主服务器同规格：
+
+```bash
+-cache-mb 64 -tmp-mb 128 -idem-mb 256
+```
+
+### 4. systemd unit（实测可用）
+
+```ini
+[Unit]
+Description=reply9842 relay (fallback route)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=admin
+WorkingDirectory=/opt/reply9842-2
+ExecStart=/opt/reply9842-2/reply9842-server \
+  -listen 0.0.0.0:28443 \
+  -upstream https://magpie.aiweb.xin:443 \
+  -uphost magpie.aiweb.xin \
+  -cert /opt/reply9842-2/certs/cert.pem \
+  -key /opt/reply9842-2/certs/key.pem \
+  -cache-mb 64 -tmp-mb 128 -idem-mb 256 \
+  -spool-dir /opt/reply9842-2/spool \
+  -log /opt/reply9842-2/log/server.jsonl \
+  -stats /opt/reply9842-2/log/stats.json
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target
+```
+
+注意：**换 unit 之前先停掉手起的进程**。`nohup` 起过的实例会继续占着
+28443，systemd 启动时只报 `listen: quic listen: bind: address already in use`
+然后进入 restart 循环，`systemctl status` 显示 `activating` 而不是 `failed`，
+很容易误判成「正在启动」。
+
+### 5. 客户端的代价：跨 server 的 delta 基线不共享
+
+delta 基线是 **server 侧状态**。中继与主服务器各存各的，跨 server 切换会偶发
+一次 `delta-miss` → 客户端全量重发。数据正确，只多一次带宽。客户端启动日志
+会明确打印这条提示。
+
 ## 三、npm
 
 ```bash

@@ -253,16 +253,21 @@ func TestAllRoutesDisabledRejected(t *testing.T) {
 	}
 }
 
-// 全局 -local-addr 必须继承到每条 direct 线路（用 -routes-file 时的真实缺陷）。
+// 全局 -local-addr 必须继承到每条非 proxy 线路（direct 与 relay）。
 //
-// 实测：`-routes-file + -local-addr` 组合曾连不上（502/EOF），根因是
-// normalizeRoutes 在 Routes 非空的分支里只继承 Server/Transport，漏了 LocalAddr。
+// 实测两处缺陷，本质是同一个错误判断——「relay 不依赖本机网络，所以不用绑
+// 源地址」。这个判断是错的：中继只是让服务端再转发一跳，本机到中继那一跳
+// 仍是本机发起的外连，TUN 全局代理照样劫持它。
+//   1. normalizeRoutes 在 Routes 非空的分支里漏继承 LocalAddr
+//      → `-routes-file + -local-addr` 连不上（502/EOF）
+//   2. 补继承后只认 direct，relay 仍拿不到 → 中继线路清一色 tls: EOF
 func TestGlobalLocalAddrInheritedByRoutes(t *testing.T) {
 	c := Config{
 		LocalAddr: "192.168.1.106",
 		Routes: route.Set{
 			{ID: "A", Kind: route.KindDirect, Server: "h:28443"},
 			{ID: "B", Kind: route.KindRelay, Server: "h2:28443"},
+			{ID: "C", Kind: route.KindProxy, Server: "h:28443", Proxy: "http://p:7890"},
 		},
 	}
 	c.Normalize()
@@ -270,9 +275,13 @@ func TestGlobalLocalAddrInheritedByRoutes(t *testing.T) {
 	if c.Routes[0].LocalAddr != "192.168.1.106" {
 		t.Fatalf("direct 线路应继承全局源地址，实际 %q", c.Routes[0].LocalAddr)
 	}
-	// relay 不该被强塞源地址（Validate 会拒绝 relay+localAddr）
-	if c.Routes[1].LocalAddr != "" {
-		t.Fatalf("relay 线路不该继承源地址，实际 %q", c.Routes[1].LocalAddr)
+	// relay 同样要继承：不绑就是 tls: EOF
+	if c.Routes[1].LocalAddr != "192.168.1.106" {
+		t.Fatalf("relay 线路应继承全局源地址（否则 TUN 下 tls: EOF），实际 %q", c.Routes[1].LocalAddr)
+	}
+	// proxy 不继承：CONNECT 由代理进程发起，绑本机网卡会和它的路由打架
+	if c.Routes[2].LocalAddr != "" {
+		t.Fatalf("proxy 线路不该继承源地址，实际 %q", c.Routes[2].LocalAddr)
 	}
 	if err := c.Routes.Validate(); err != nil {
 		t.Fatalf("继承后应合法：%v", err)

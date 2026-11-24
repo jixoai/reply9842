@@ -96,8 +96,14 @@ type Route struct {
 	// Proxy 仅 kind=proxy 生效：http/https/socks5 URL。
 	Proxy string `json:"proxy,omitempty"`
 
-	// LocalAddr 仅 kind=direct 生效：绑定出站源地址（如 "192.168.1.106"）。
-	// relay 不提供此字段的动作是有意的：中继线路的意义就是「不依赖本机网络」。
+	// LocalAddr 绑定的出站源地址（如 "192.168.1.106"），direct 与 relay 都适用。
+	//
+	// relay 为什么也要：中继只是让服务端再转发一跳，**本机到中继这一跳仍是
+	// 本机发起的外连**，TUN 全局代理照样会劫持它。实测不绑源地址就是清一色
+	// `tcp tls: EOF`。（曾经这里写着「relay 不提供此字段是有意的，它的意义
+	// 就是不依赖本机网络」——那个判断是错的。）
+	//
+	// proxy 不适用：CONNECT 由代理进程发起，绑本机网卡会和代理的路由冲突。
 	LocalAddr string `json:"local_addr,omitempty"`
 
 	// Transport auto | quic | tcp。空串按 DefaultTransport。
@@ -165,8 +171,6 @@ func (r Route) Normalize() Route {
 	// 而 Normalize 静默改掉会让那句错误在生产路径上永不可达——用户填了 quic
 	// 却不知道它被改过，排查时看到的是「我明明配了 quic」。改由 Validate
 	// 明确报错，用户在保存/启动时就看到原因。
-	// relay 不使用源地址：它的语义是「不依赖本机网络状况」。
-	// 静默清掉会让用户以为生效，所以这里只在 Validate 里报错，不清。
 	return r
 }
 

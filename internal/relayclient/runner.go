@@ -241,9 +241,17 @@ func (c *Config) normalizeRoutes() {
 		// 只在「Routes 为空、由单值字段合成」的路径里带上它，于是
 		// `-routes-file + -local-addr` 组合会连不上（实测 502/EOF）。
 		//
-		// 只在 direct 线路且用户没逐条指定时补——relay 线路不该绑源地址
-		// （它的语义就是「不依赖本机网络」，Validate 也会拒绝）。
-		if rs[i].LocalAddr == "" && c.LocalAddr != "" && rs[i].Kind == route.KindDirect {
+		// direct 与 relay 都要补，proxy 不补。
+		//
+		// relay 为什么也要（实测踩过）：中继只是让服务端再转发一跳，**本机到
+		// 中继这一跳仍是本机发起的外连**，TUN 全局代理照样劫持它，不绑源地址
+		// 就是清一色 `tcp tls: EOF`。早期这里写着「relay 的语义就是不依赖
+		// 本机网络所以不该绑」——那个判断是错的，已由 Validate 允许 relay 填
+		// local_addr 一并纠正。
+		//
+		// proxy 不补：CONNECT 由代理进程发起，绑本机网卡会和代理自己的路由
+		// 选择打架。
+		if rs[i].LocalAddr == "" && c.LocalAddr != "" && rs[i].Kind != route.KindProxy {
 			rs[i].LocalAddr = c.LocalAddr
 		}
 		// 代理地址同理：全局 -proxy 对「未指定代理的 proxy 线路」生效。

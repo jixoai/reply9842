@@ -38,9 +38,19 @@ func TestRouteFlagParse(t *testing.T) {
 				Proxy: "http://127.0.0.1:7890"},
 		},
 		{
-			name: "中继（另一台 server）",
-			in:   "备用:relay:118.26.39.57:28443",
-			want: route.Route{ID: "备用", Kind: route.KindRelay, Server: "118.26.39.57:28443"},
+			// 指向 IP 的中继必须给证书域名，否则运行时必然
+			// `x509: cannot validate certificate for <ip> ... no IP SANs`。
+			// 旧用例只写到 server（等于示范了一个必失败的配置），已修正。
+			name: "中继：服务器 + 源地址 + 证书域名",
+			in:   "备用:relay:47.117.152.3:28443:192.168.1.106:magpie.aiweb.xin",
+			want: route.Route{ID: "备用", Kind: route.KindRelay, Server: "47.117.152.3:28443",
+				LocalAddr: "192.168.1.106", ServerName: "magpie.aiweb.xin"},
+		},
+		{
+			name: "中继：只给源地址（证书域名留空）",
+			in:   "备用:relay:47.117.152.3:28443:192.168.1.106",
+			want: route.Route{ID: "备用", Kind: route.KindRelay, Server: "47.117.152.3:28443",
+				LocalAddr: "192.168.1.106"},
 		},
 		{
 			name: "直连带源地址",
@@ -59,7 +69,8 @@ func TestRouteFlagParse(t *testing.T) {
 			}
 			got := rl.routes[0]
 			if got.ID != tc.want.ID || got.Kind != tc.want.Kind || got.Server != tc.want.Server ||
-				got.Proxy != tc.want.Proxy || got.LocalAddr != tc.want.LocalAddr {
+				got.Proxy != tc.want.Proxy || got.LocalAddr != tc.want.LocalAddr ||
+				got.ServerName != tc.want.ServerName {
 				t.Fatalf("解析结果不符：\n  输入 %q\n  得到 %+v\n  期望 %+v", tc.in, got, tc.want)
 			}
 			// 解析出的线路必须能通过校验（否则用户会拿到一条启动即失败的配置）

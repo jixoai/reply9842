@@ -1,7 +1,8 @@
 // routes_flag.go — CLI 侧的线路参数解析
 //
 // 正交意图（2 个）：
-//  1. `-route` 可重复（顺序即优先级），格式 `名称:类型:server[:代理或源地址]`
+//  1. `-route` 可重复（顺序即优先级），格式
+//     `名称:类型:server[:代理或源地址[:证书域名]]`
 //  2. `-routes-file` 读一份 JSON（与 settings.json 的 routes 段同构），
 //     供复杂配置（多条代理、带认证的 URL）直接搬运
 //
@@ -38,13 +39,24 @@ func (rl *routeList) String() string {
 
 // Set 解析一次 -route 的取值。
 //
-// 格式：`名称:类型:server[:第四段]`
+// 格式：`名称:类型:server[:第四段[:第五段]]`
 //
 //	直连  港直连:direct:magpie.aiweb.xin:28443
 //	代理  港代理:proxy:magpie.aiweb.xin:28443:http://127.0.0.1:7890
-//	中继  备用:relay:118.26.39.57:28443
+//	中继  备用:relay:47.117.152.3:28443:192.168.1.106:magpie.aiweb.xin
+//	      └ 服务器 ─────────────┘ └ 源地址 ──┘ └ 证书域名 ─┘
 //
-// 第四段的语义按类型而定：proxy 是代理 URL，direct 是绑定的源地址。
+// 各段语义按类型而定：
+//
+//	kind   第四段        第五段
+//	proxy  代理 URL      无（URL 自身含冒号，吃下全部剩余）
+//	direct 绑定的源地址  无
+//	relay  绑定的源地址  证书域名（SNI）
+//
+// 中继指向 IP 时必须给第五段：证书 SAN 通常只有域名，用 IP 校验必然
+// `x509: cannot validate certificate for <ip> ... no IP SANs`。
+// （曾经这里直接拒收中继的第四段，理由写的是「中继不绑源地址」——错的：
+// 本机到中继那一跳仍是本机外连，TUN 全局代理照样劫持它。）
 //
 // 解析策略：**先按前两段切**（名称、类型都必不含冒号），剩下的整体作为
 // 「server 与可选第四段」再切。这样做是因为代理 URL 自身含冒号
@@ -107,13 +119,22 @@ func (rl *routeList) Set(v string) error {
 	if extra != "" {
 		switch r.Kind {
 		case route.KindProxy:
+			// 代理 URL 自身含冒号（http://host:port），吃下全部剩余，
+			// 不再按第五段切。
 			r.Proxy = extra
 		case route.KindDirect:
 			r.LocalAddr = extra
 		case route.KindRelay:
-			// relay 的第四段无意义（它没有代理，也不绑源地址）。
-			// 不静默忽略：直接报错，免得用户以为它生效了。
-			return fmt.Errorf("线路 %q 是中继类型，不支持第四段参数 %q（中继只用 server）", id, extra)
+			// 中继：第四段是源地址，第五段（可选）是证书域名。
+			// 只切一次——源地址是 IP/主机名，不含冒号；第五段吃剩余全部。
+			loc, sni, has := cutFirst(extra)
+			r.LocalAddr = loc
+			if has {
+				r.ServerName = strings.TrimSpace(sni)
+			}
+			if r.LocalAddr != "" {
+				r.LocalAddr = strings.TrimSpace(r.LocalAddr)
+			}
 		}
 	}
 
