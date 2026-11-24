@@ -40,9 +40,12 @@ func (a *app) routesSection(c *ui.Context, p *glass.Palette, running bool) {
 	ui.Row(c).Padding(6, 0).AlignItems(ui.Center).Gap(6).Children(func() {
 		ui.Text(c, "线路").FontSize(11).TextColor(p.MutedForeground).Width(40).Shrink(0)
 		ui.Text(c, summary).FontSize(11).TextColor(p.Tertiary).Grow(1).SingleLine()
+		// 用「折叠」而不是「收起」：行内的编辑按钮在编辑态也叫「收起」，
+		// 两者作用域完全不同（这个收整段分区、那个收编辑区），同名会误点。
+		// 三个动作三个词：折叠（分区）/ 收起（编辑区）/ 完成（编辑区底部）。
 		label := "展开"
 		if a.routesExpanded {
-			label = "收起"
+			label = "折叠"
 		}
 		if a.actionButton(c, p, "routes-toggle", label, false).Clicked() {
 			a.routesExpanded = !a.routesExpanded
