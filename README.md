@@ -128,9 +128,9 @@ Agent 完全无感：只是把 `base_url` 指向 `http://127.0.0.1:18899`。
 ### 1. 服务端（部署在能直连上游的那台机器）
 
 ```bash
-go build -o relay-server ./cmd/server
+go build -o reply9842-server ./cmd/server
 
-./relay-server \
+./reply9842-server \
   -listen 0.0.0.0:28443 \
   -upstream http://127.0.0.1:3425 \
   -uphost magpie.aiweb.xin \
@@ -148,11 +148,13 @@ QUIC 与 TCP/TLS 共用同一个端口。
 go build -o relay-cli ./cmd/cli
 
 ./relay-cli \
-  -listen 127.0.0.1:18899 \
-  -server 47.82.76.102:28443 \
-  -server-name magpie.aiweb.xin \
+  -listen    127.0.0.1:18899 \
+  -server    magpie.aiweb.xin:28443 \
   -transport auto
 ```
+
+> **用域名连就不必填 `-server-name`**：SNI 就是那个域名本身。只有目标是 **IP**
+> 时才需要额外给 `-server-name`（证书上的域名）。
 
 然后把 Agent 的 `base_url` 指向 `http://127.0.0.1:18899`。其余不变。
 

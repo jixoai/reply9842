@@ -33,9 +33,16 @@ CLI SHALL 支持 `serve` / `status` / `version` / `help` 四个子命令，且�
 serve 的 flag SHALL 全部映射到 `relayclient.Config`，默认值来自 `relayclient` 包内的
 常量（CLI flag 默认值与 GUI 输入框初值同源，避免「文档写的默认」与「代码跑的默认」漂移）。
 
-参数集合：`-listen`(127.0.0.1:18899) `-server`(47.82.76.102:28443) `-server-name`
-`-local-addr` `-transport`(auto) `-insecure` `-min-delta`(16384) `-history-mb`(64)
-`-capture-dir` `-capture-n`(30) `-max-resume`(3) `-log` `-stats`。
+参数集合：`-listen`(127.0.0.1:18899) `-server`(magpie.aiweb.xin:28443)
+`-server-name` `-local-addr` `-transport`(auto) `-insecure` `-min-delta`(16384)
+`-history-mb`(64) `-capture-dir` `-capture-n`(30) `-max-resume`(3) `-log` `-stats`
+`-route` `-routes-file`。
+
+多线路相关（2026-11-24 新增）：
+`-route` 可重复，格式 `名称:类型:server[:代理或源地址[:证书域名]]`；
+`-routes-file` 读与 `settings.json` 的 `routes` 段同构的 JSON 数组；两者取并集。
+`-local-addr` / `-proxy` 作为**全局默认值**，继承给未逐条指定该字段的线路
+（direct 与 relay 继承源地址，proxy 继承代理 URL，proxy 线路不继承源地址）。
 
 落地证据：`cmd/cli/main.go:79`（`newServeFlags`）、
 `internal/relayclient/runner.go:41`（默认值常量块）、

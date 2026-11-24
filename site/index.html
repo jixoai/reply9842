@@ -282,12 +282,12 @@
 
           <div class="code-grid">
             <div class="code">
-              <div class="code-head"><span>服务端 · 紧邻上游</span><span>relay-server</span></div>
+              <div class="code-head"><span>服务端 · 紧邻上游</span><span>reply9842-server</span></div>
               <pre><u># 编译</u>
-go build -o relay-server ./cmd/relay-server
+go build -o reply9842-server ./cmd/server
 
 <u># 启动：QUIC 与 TCP/TLS 共用 28443</u>
-./relay-server \
+./reply9842-server \
   -listen   <b>0.0.0.0:28443</b> \
   -upstream <b>http://127.0.0.1:3425</b> \
   -uphost   magpie.aiweb.xin \
@@ -296,16 +296,21 @@ go build -o relay-server ./cmd/relay-server
             </div>
 
             <div class="code">
-              <div class="code-head"><span>客户端 · 与 Agent 同机</span><span>relay-client</span></div>
+              <div class="code-head"><span>客户端 · 与 Agent 同机</span><span>relay-cli</span></div>
               <pre><u># 编译</u>
-go build -o relay-client ./cmd/relay-client
+go build -o relay-cli ./cmd/cli
 
-<u># 启动</u>
-./relay-client \
-  -listen      <b>127.0.0.1:18899</b> \
-  -server      47.82.76.102:28443 \
-  -server-name magpie.aiweb.xin \
-  -transport   auto</pre>
+<u># 单线路</u>
+./relay-cli \
+  -listen    <b>127.0.0.1:18899</b> \
+  -server    magpie.aiweb.xin:28443 \
+  -transport auto
+
+<u># 多线路：直连 + 中继同时可用，自动挑「传完最快」那条</u>
+<u># 中继第四段是绑定的源地址（留空＝不绑），第五段是证书域名</u>
+./relay-cli \
+  -route <b>"香港:direct:magpie.aiweb.xin:28443"</b> \
+  -route <b>"上海:relay:47.117.152.3:28443::magpie.aiweb.xin"</b></pre>
             </div>
           </div>
 

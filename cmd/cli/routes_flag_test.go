@@ -53,6 +53,14 @@ func TestRouteFlagParse(t *testing.T) {
 				LocalAddr: "192.168.1.106"},
 		},
 		{
+			// 不想绑源地址（比如本机没开 TUN）但要给证书域名时，第四段留空。
+			// 语法上就是连续两个冒号——官网示例用的正是这个写法，必须有测试守着。
+			name: "中继：源地址留空，只有证书域名",
+			in:   "备用:relay:47.117.152.3:28443::magpie.aiweb.xin",
+			want: route.Route{ID: "备用", Kind: route.KindRelay, Server: "47.117.152.3:28443",
+				ServerName: "magpie.aiweb.xin"},
+		},
+		{
 			name: "直连带源地址",
 			in:   "绑网卡:direct:magpie.aiweb.xin:28443:192.168.1.106",
 			want: route.Route{ID: "绑网卡", Kind: route.KindDirect, Server: "magpie.aiweb.xin:28443",

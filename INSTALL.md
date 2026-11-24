@@ -176,10 +176,10 @@ Windows 不裁切任何东西，所以 `.ico` 的圆角由 `make_ico.py` 在栅�
 
 ```bash
 # 启动转发（Agent 把 base_url 指到 http://127.0.0.1:18899）
-relay-cli -listen 127.0.0.1:18899 -server 47.82.76.102:28443
+relay-cli -listen 127.0.0.1:18899 -server magpie.aiweb.xin:28443
 
 # 或等价地写明子命令
-relay-cli serve -listen 127.0.0.1:18899 -server 47.82.76.102:28443
+relay-cli serve -listen 127.0.0.1:18899 -server magpie.aiweb.xin:28443
 
 # 另开一个终端看统计
 relay-cli status
@@ -197,7 +197,7 @@ relay-cli version
 relay-gui                  # 打开窗口，点「启动」
 relay-gui -autostart       # 打开窗口并立即开始转发
 relay-gui -light           # 亮色玻璃（默认深色）
-relay-gui -listen 127.0.0.1:19000 -server 47.82.76.102:28443   # 覆盖初值
+relay-gui -listen 127.0.0.1:19000 -server magpie.aiweb.xin:28443   # 覆盖初值
 ```
 
 窗口里能做的事：
