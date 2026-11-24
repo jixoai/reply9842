@@ -351,7 +351,9 @@ jobs:
             ```bash
             npx reply9842@${{ github.ref_name }}          # 本地转发客户端
             npx reply9842-gui@${{ github.ref_name }}      # 图形界面
-            npx reply9842-server@${{ github.ref_name }}   # 服务端
+            npx -y -p reply9842@${{ github.ref_name }} reply9842-server   # 服务端
+            # 注意：reply9842-server 是 reply9842 包里的 bin，不是独立包，
+            # 所以必须用 -p 指定包名；写成 npx reply9842-server 会 404。
 
             npm i -g reply9842@${{ github.ref_name }}     # 或全局安装
             ```

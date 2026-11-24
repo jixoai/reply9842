@@ -181,8 +181,19 @@ delta 基线是 **server 侧状态**。中继与主服务器各存各的，跨 s
 
 ## 三、npm
 
+`reply9842` 是**一个** npm 包，内含三个 bin：`reply9842` / `reply9842-gui` /
+`reply9842-server`。**没有**一个叫 `reply9842-server` 的独立包，所以
+`npx reply9842-server` 会 404——必须用 `-p` 指定包名再点名 bin：
+
 ```bash
-npx reply9842-server -listen 0.0.0.0:8443 -cert ... -key ...
+# 服务端
+npx -y -p reply9842 reply9842-server -listen 0.0.0.0:8443 -cert ... -key ...
+
+# 客户端 CLI
+npx -y -p reply9842 reply9842 -listen 127.0.0.1:18899 -server magpie.aiweb.xin:28443
+
+# 固定版本（生产建议）
+npx -y -p reply9842@0.4.0 reply9842-server ...
 ```
 
 npm 包只含启动器，首次运行自动下载对应平台的二进制（见 [npm 说明](./npm/README.md)）。
